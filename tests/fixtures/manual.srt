@@ -1,0 +1,12 @@
+1
+00:00:00,000 --> 00:00:03,000
+Hello and welcome to the show.
+Today we cover three ideas.
+
+2
+00:00:03,000 --> 00:00:06,500
+The first idea is about caching &amp; speed.
+
+3
+00:00:06,500 --> 00:00:10,000
+The second idea is about correctness.
