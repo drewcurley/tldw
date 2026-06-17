@@ -66,6 +66,14 @@ def test_video_validator_clamps_out_of_range():
     assert v.ranges == [(0, 9)]  # clamped into [0, n-1]
 
 
+def test_video_prompt_demands_sentence_boundaries():
+    from youtube_tldw.summarize import _VIDEO_PROMPT
+    p = _VIDEO_PROMPT.lower()
+    assert "complete sentence" in p
+    assert "mid-sentence" in p
+    assert "first word" in p and "final word" in p
+
+
 def test_format_cues_listing():
     listing = format_cues_for_selection(_cues(2))
     assert listing.splitlines()[0].startswith("[0] (00:00:00.000) word0")

@@ -6,7 +6,7 @@ Selecting by cue index inherently snaps cuts to speech boundaries.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import TldrError
 from .transcript import Cue
@@ -16,10 +16,18 @@ from .transcript import Cue
 class Span:
     start_ms: int
     end_ms: int
+    # Original (pre-padding) source start, for the on-screen timestamp. Excluded
+    # from equality so existing comparisons stay valid.
+    label_ms: int | None = field(default=None, compare=False)
 
     @property
     def duration_ms(self) -> int:
         return self.end_ms - self.start_ms
+
+    @property
+    def display_start_ms(self) -> int:
+        """Source start to show the viewer (pre-padding when padded)."""
+        return self.label_ms if self.label_ms is not None else self.start_ms
 
 
 def spans_from_cue_ranges(
@@ -50,17 +58,48 @@ def spans_from_cue_ranges(
 
 
 def merge_spans(spans: list[Span]) -> list[Span]:
-    """Sort by start and merge overlapping/adjacent spans into fresh Span objects."""
+    """Sort by start and merge overlapping/adjacent spans into fresh Span objects.
+
+    The merged span keeps the EARLIEST original display start of its group.
+    """
     ordered = sorted((s for s in spans if s.duration_ms > 0), key=lambda s: s.start_ms)
     if not ordered:
         return []
-    merged: list[Span] = [Span(ordered[0].start_ms, ordered[0].end_ms)]
+    first = ordered[0]
+    merged: list[Span] = [Span(first.start_ms, first.end_ms, label_ms=first.display_start_ms)]
     for s in ordered[1:]:
         if s.start_ms <= merged[-1].end_ms:  # overlap or adjacent
             merged[-1].end_ms = max(merged[-1].end_ms, s.end_ms)
+            merged[-1].label_ms = min(merged[-1].label_ms, s.display_start_ms)
         else:
-            merged.append(Span(s.start_ms, s.end_ms))
+            merged.append(Span(s.start_ms, s.end_ms, label_ms=s.display_start_ms))
     return merged
+
+
+def pad_spans(
+    spans: list[Span], cues: list[Cue], pad_ms: int, duration_ms: int
+) -> list[Span]:
+    """Extend each span outward ONLY into real inter-cue silence (up to pad_ms).
+
+    Protects the audio crossfade from clipping words: the dissolve lands on the
+    natural pause around a sentence, never on adjacent speech. Records the original
+    start as the display label, then merges. No-op where speech is continuous.
+    """
+    if pad_ms <= 0 or not cues:
+        return merge_spans([Span(s.start_ms, s.end_ms, label_ms=s.display_start_ms)
+                            for s in spans])
+    ends = sorted(c.end_ms for c in cues)
+    starts = sorted(c.start_ms for c in cues)
+    padded: list[Span] = []
+    for s in spans:
+        prev_end = max((e for e in ends if e <= s.start_ms), default=0)
+        head = min(pad_ms, max(0, s.start_ms - prev_end))
+        next_start = min((st for st in starts if st >= s.end_ms), default=duration_ms)
+        tail = min(pad_ms, max(0, next_start - s.end_ms))
+        padded.append(Span(max(0, s.start_ms - head),
+                           min(duration_ms, s.end_ms + tail),
+                           label_ms=s.display_start_ms))
+    return merge_spans(padded)
 
 
 def enforce_max_length(

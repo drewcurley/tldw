@@ -7,6 +7,7 @@ from youtube_tldw.spans import (
     build_xfade_filter,
     enforce_max_length,
     merge_spans,
+    pad_spans,
     rendered_duration_ms,
     spans_from_cue_ranges,
     xfade_offsets_ms,
@@ -126,3 +127,46 @@ def test_merge_spans_returns_fresh_objects():
     merged = merge_spans([original])
     merged[0].end_ms = 9999
     assert original.end_ms == 1000  # not mutated
+
+
+def test_span_display_start():
+    assert Span(5000, 8000).display_start_ms == 5000
+    assert Span(5000, 8000, label_ms=4400).display_start_ms == 4400
+
+
+def test_merge_spans_keeps_earliest_label():
+    merged = merge_spans([Span(1000, 2000, label_ms=1200),
+                          Span(2000, 3000, label_ms=2100)])
+    assert len(merged) == 1
+    assert merged[0].display_start_ms == 1200
+
+
+def test_pad_spans_into_gaps_records_original_start():
+    cues = [Cue(0, 1000, "a"), Cue(1000, 2000, "b"),
+            Cue(5000, 6000, "c"), Cue(9000, 10000, "d")]
+    out = pad_spans([Span(5000, 6000)], cues, 600, 20000)
+    # gap before (2000->5000) and after (6000->9000) both > 600 => pad full 600
+    assert out[0].start_ms == 4400 and out[0].end_ms == 6600
+    assert out[0].display_start_ms == 5000  # timestamp still points at the sentence
+
+
+def test_pad_spans_noop_when_speech_is_continuous():
+    cues = [Cue(0, 1000, "a"), Cue(1000, 2000, "b"), Cue(2000, 3000, "c")]
+    out = pad_spans([Span(1000, 2000)], cues, 600, 10000)
+    assert out[0].start_ms == 1000 and out[0].end_ms == 2000  # no silence -> no pad
+
+
+def test_pad_spans_clamps_and_caps_to_gap():
+    cues = [Cue(0, 500, "a"), Cue(5000, 6000, "c")]
+    out = pad_spans([Span(0, 500)], cues, 600, 6000)
+    assert out[0].start_ms == 0          # cannot pad below 0
+    assert out[0].end_ms == 1100         # 500 + min(600, gap 4500) = 1100
+
+
+def test_select_then_pad_autocaption_contiguous_is_clean():
+    # Contiguous (auto-caption) cues: padding is a no-op; the prompt is the fix.
+    cues = _cues(10)
+    spans = spans_from_cue_ranges([(2, 3)], cues, min_clip_ms=0)
+    out = pad_spans(spans, cues, 600, 10000)
+    assert out[0].start_ms == 2000 and out[0].end_ms == 4000
+    assert out[0].display_start_ms == 2000

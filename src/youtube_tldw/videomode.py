@@ -174,7 +174,7 @@ def recut(
     ts_on = polish is not None and polish.timestamps
     clips = [
         _extract_clip(source, s, workdir, i,
-                      ts_text=format_clock(s.start_ms) if ts_on else None)
+                      ts_text=format_clock(s.display_start_ms) if ts_on else None)
         for i, s in enumerate(spans)
     ]
     durations = [probe_duration_ms(c) for c in clips]

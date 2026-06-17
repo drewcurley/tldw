@@ -17,6 +17,7 @@ from .urls import canonical_video_id
 DEFAULT_OUTPUT = Path.home() / "Downloads" / "youtube-tldw" / "tldws"
 XFADE_MS = 400
 MIN_CLIP_MS = 1200
+BOUNDARY_PAD_MS = 600  # pad cuts into real silence so crossfades don't clip words
 DEFAULT_INTRO_S = 6
 CLAUDE_TIMEOUT = 600.0
 
@@ -143,6 +144,9 @@ def _run_video(args, video_id: str, max_ms, workdir: Path) -> Path:
         cues, meta.channel, meta.title, args.ratio, max_ms, timeout=CLAUDE_TIMEOUT
     )
     chosen = spans.spans_from_cue_ranges(selection.ranges, cues, min_clip_ms=MIN_CLIP_MS)
+    # Pad cut boundaries into real silence so the crossfade dissolves over the
+    # natural pause around each sentence instead of clipping words.
+    chosen = spans.pad_spans(chosen, cues, BOUNDARY_PAD_MS, meta.duration_ms)
     # --max-length is a hard cap; an explicit --ratio also acts as a deterministic
     # cap (an "override"). When --ratio is omitted, only the AI's choice applies.
     # Note: the cap bounds the KEY segments; intro + end card are additive.

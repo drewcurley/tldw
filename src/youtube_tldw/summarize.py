@@ -49,8 +49,22 @@ recut. Input (on stdin): metadata then the transcript as numbered cues, one per 
 line, formatted `[index] (timestamp) text`.
 
 Pick the cue ranges that together preserve every key point as a much shorter cut.
-Select whole ranges of consecutive cues (so the audio stays coherent). Keep them
-in chronological order. Prefer fewer, longer ranges over many tiny ones.
+Select whole ranges of consecutive cues. Keep them in chronological order. Prefer
+fewer, longer ranges over many tiny ones.
+
+COHERENCE — THE MOST IMPORTANT RULE:
+Every segment MUST begin at the start of a complete sentence/thought and MUST end at
+the end of a complete sentence/thought. NEVER start or end a segment mid-sentence,
+mid-clause, or mid-word — that destroys the meaning. Concretely:
+- Set first_cue to the cue containing the FIRST word of the opening sentence.
+- Set last_cue to the cue containing the FINAL word of the closing sentence.
+- If a key point spans several sentences, include ALL of them so the thought is
+  complete and self-contained.
+- The transcript may be auto-generated: lowercase, no punctuation, and cues split
+  mid-phrase. Do NOT trust cue boundaries as sentence boundaries — use meaning,
+  grammar, and natural pauses to find where sentences actually begin and end.
+- When in doubt, extend the range to include the whole thought. A slightly longer
+  but coherent segment is REQUIRED; a shorter but choppy/mid-thought cut is WRONG.
 
 {ratio_clause}
 {maxlen_clause}
