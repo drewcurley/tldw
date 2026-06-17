@@ -74,6 +74,14 @@ def test_video_prompt_demands_sentence_boundaries():
     assert "first word" in p and "final word" in p
 
 
+def test_text_prompts_forbid_abbreviations():
+    from youtube_tldw.summarize import _TEXT_PROMPT, _TEXT_REDUCE_PROMPT
+    for p in (_TEXT_PROMPT, _TEXT_REDUCE_PROMPT):
+        low = p.lower()
+        assert "abbreviation" in low
+        assert "world war two" in low  # the explicit example
+
+
 def test_format_cues_listing():
     listing = format_cues_for_selection(_cues(2))
     assert listing.splitlines()[0].startswith("[0] (00:00:00.000) word0")

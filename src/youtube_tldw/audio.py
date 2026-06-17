@@ -21,6 +21,25 @@ VOICE_DIR = Path.home() / ".cache" / "youtube-tldw" / "voices"
 _MD = re.compile(r"[*_`#>]+")
 _MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 
+# Safety net for unambiguous abbreviations/symbols TTS mangles, in case one slips
+# past the prompt. Context-ambiguous ones (Dr., St., No.) are left to the model.
+_SPEAK_FIXES = [
+    (re.compile(r"\bWWII\b"), "World War Two"),
+    (re.compile(r"\bWWI\b"), "World War One"),
+    (re.compile(r"\bvs\.?\b", re.I), "versus"),
+    (re.compile(r"\betc\.?\b", re.I), "et cetera"),
+    (re.compile(r"\be\.g\.", re.I), "for example"),
+    (re.compile(r"\bi\.e\.", re.I), "that is"),
+    (re.compile(r"&"), " and "),
+    (re.compile(r"%"), " percent"),
+]
+
+
+def _speakify(text: str) -> str:
+    for pat, rep in _SPEAK_FIXES:
+        text = pat.sub(rep, text)
+    return re.sub(r"\s+", " ", text).strip()
+
 
 def require_piper() -> None:
     if importlib.util.find_spec("piper") is None:
@@ -82,4 +101,4 @@ def build_spoken_script(meta: VideoMeta, result: TextResult) -> str:
         parts += [f"{_strip_markdown(p)}." for p in result.key_points]
     parts.append("Summary.")
     parts.append(_strip_markdown(result.summary))
-    return " ".join(p for p in parts if p.strip())
+    return _speakify(" ".join(p for p in parts if p.strip()))

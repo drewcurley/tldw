@@ -23,6 +23,13 @@ Input (on stdin): video metadata then the full transcript.
 
 {ratio_clause}
 
+WRITE FOR THE EAR — the summary may be read aloud by text-to-speech, which mangles
+shorthand. In BOTH key_points and summary, spell everything out in full words; do
+NOT use abbreviations, acronyms, initialisms, or symbols. For example: "Senator" not
+"Sen.", "Lieutenant Governor" not "Lt. Gov.", "World War Two" not "WWII", "United
+States" not "U.S.", "Doctor" not "Dr.", "versus" not "vs.", "percent" not "%", "and"
+not "&", "number" not "No.". Expand units and counts into natural spoken words.
+
 Return ONLY a JSON object, no prose, no markdown fences, with this schema:
 {{
   "key_points": ["concise bullet", ...],   // the essential takeaways, in order
@@ -35,6 +42,10 @@ _TEXT_REDUCE_PROMPT = """You are combining ordered partial summaries of one vide
 into a single TL;DW. Input (on stdin): the partial summaries in order.
 
 {ratio_clause}
+
+WRITE FOR THE EAR — the result may be read aloud. Spell everything out in full; use
+no abbreviations, acronyms, initialisms, or symbols (e.g. "Senator" not "Sen.",
+"World War Two" not "WWII", "percent" not "%", "and" not "&").
 
 Return ONLY a JSON object with this schema:
 {{

@@ -20,6 +20,17 @@ def test_build_spoken_script_strips_markdown():
     assert "http" not in s  # URL stripped from link
 
 
+def test_spoken_script_expands_unambiguous_abbreviations():
+    meta = VideoMeta("id12345abcd", "History", "Chan", 1000, {}, {})
+    r = TextResult(["Allies won WWII"], "Turnout was 60% vs. last year & rising.",
+                   0.2, "x")
+    s = audio.build_spoken_script(meta, r)
+    assert "World War Two" in s and "WWII" not in s
+    assert "versus" in s and "vs." not in s
+    assert "percent" in s and "%" not in s
+    assert "&" not in s and " and " in s
+
+
 def test_extract_audio_command(monkeypatch, tmp_path):
     cap = {}
     monkeypatch.setattr(
