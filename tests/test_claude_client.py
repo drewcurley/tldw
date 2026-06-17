@@ -2,8 +2,8 @@ import json
 
 import pytest
 
-from youtube_tldr import TldrError, claude_client
-from youtube_tldr.proc import ProcResult
+from youtube_tldw import TldrError, claude_client
+from youtube_tldw.proc import ProcResult
 
 
 def _envelope(result_text: str, is_error=False):

@@ -1,4 +1,4 @@
-"""youtube-tldr: turn a YouTube video into a succinct text or video TL;DR."""
+"""youtube-tldw: turn a YouTube video into a succinct text or video TL;DW."""
 
 __version__ = "0.1.0"
 

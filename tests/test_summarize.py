@@ -1,14 +1,14 @@
 import pytest
 
-from youtube_tldr import summarize
-from youtube_tldr.summarize import (
+from youtube_tldw import summarize
+from youtube_tldw.summarize import (
     TextResult,
     VideoSelection,
     _make_video_validator,
     _validate_text,
     format_cues_for_selection,
 )
-from youtube_tldr.transcript import Cue
+from youtube_tldw.transcript import Cue
 
 
 def _cues(n):

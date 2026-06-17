@@ -83,3 +83,13 @@ def read_time_label(word_count: int, wpm: int = 200) -> str:
     """Estimated reading time label for text mode, e.g. '3m' (min 1m)."""
     minutes = max(1, round(word_count / max(1, wpm)))
     return f"{minutes}m"
+
+
+def format_clock(ms: int) -> str:
+    """Milliseconds -> clock timestamp like '0:12', '12:34', '1:02:03'."""
+    total_s = ms // 1000
+    h, rem = divmod(total_s, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"

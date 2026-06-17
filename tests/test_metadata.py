@@ -2,9 +2,9 @@ import json
 
 import pytest
 
-from youtube_tldr import TldrError, metadata
-from youtube_tldr.metadata import VideoMeta, choose_track
-from youtube_tldr.proc import ProcResult
+from youtube_tldw import TldrError, metadata
+from youtube_tldw.metadata import VideoMeta, choose_track
+from youtube_tldw.proc import ProcResult
 
 VID = "dQw4w9WgXcQ"
 

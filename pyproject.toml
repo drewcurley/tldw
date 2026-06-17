@@ -3,17 +3,18 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "youtube-tldr"
+name = "youtube-tldw"
 version = "0.1.0"
-description = "Summarize a YouTube video into a text or video TL;DR using a Claude Max subscription."
+description = "Summarize a YouTube video into a text or video TL;DW using a Claude Max subscription."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["pillow>=10.3,<12"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+tts = ["piper-tts>=1.2"]   # text-mode --render-audio (local neural voices)
 
 [project.scripts]
-tldr = "youtube_tldr.cli:main"
+tldw = "youtube_tldw.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

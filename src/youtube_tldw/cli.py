@@ -1,4 +1,4 @@
-"""Command-line entrypoint and orchestration for youtube-tldr."""
+"""Command-line entrypoint and orchestration for youtube-tldw."""
 
 from __future__ import annotations
 
@@ -10,24 +10,31 @@ from pathlib import Path
 
 from . import TldrError, __version__
 from . import metadata as md
-from . import naming, proc, spans, summarize, textmode, transcript, videomode
+from . import audio, naming, proc, spans, summarize, textmode, transcript, videomode
 from .timing import format_length, parse_duration
 from .urls import canonical_video_id
 
-DEFAULT_OUTPUT = Path.home() / "Downloads" / "youtube-tldr" / "tldrs"
+DEFAULT_OUTPUT = Path.home() / "Downloads" / "youtube-tldw" / "tldws"
 XFADE_MS = 400
 MIN_CLIP_MS = 1200
+DEFAULT_INTRO_S = 6
 CLAUDE_TIMEOUT = 600.0
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="tldr",
-        description="Summarize a YouTube video into a text or video TL;DR "
+        prog="tldw",
+        description="Summarize a YouTube video into a text or video TL;DW "
         "using your Claude Max subscription.",
     )
-    p.add_argument("url", help="YouTube video URL (watch / youtu.be / shorts)")
-    p.add_argument("--mode", required=True, choices=["text", "video"])
+    p.add_argument("url", help="YouTube URL (watch / youtu.be / shorts) or bare video id")
+    p.add_argument("--mode", choices=["text", "video"], default="video",
+                   help="text | video (default: video)")
+    p.add_argument("--render-audio", action="store_true",
+                   help="also save an mp3: video → the recut audio; text → spoken "
+                        "summary via local neural TTS")
+    p.add_argument("--voice", choices=["female", "male"], default="female",
+                   help="(text --render-audio) TTS voice (default female)")
     p.add_argument("--ratio", type=float, default=None,
                    help="Target fraction of original length (0 < r <= 1). "
                         "Omit to let the AI choose.")
@@ -39,6 +46,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="(video) burn recut-aligned captions into the video")
     p.add_argument("--keep-source", action="store_true",
                    help="(video) keep the downloaded source video too")
+    intro = p.add_mutually_exclusive_group()
+    intro.add_argument("--keep-intro", type=int, metavar="SECONDS", default=None,
+                       help=f"(video) keep the first SECONDS as an intro "
+                            f"(default {DEFAULT_INTRO_S}s; polish is on by default)")
+    intro.add_argument("--no-intro", action="store_true",
+                       help="(video) don't preserve the intro")
+    p.add_argument("--no-badge", action="store_true",
+                   help="(video) no 'TL;DW' corner badge")
+    p.add_argument("--no-banner", action="store_true",
+                   help="(video) no 'TL;DW version' intro banner")
+    p.add_argument("--no-end-card", action="store_true",
+                   help="(video) no fade-to-black 'Made with youtube-tldw' end card")
+    p.add_argument("--no-timestamps", action="store_true",
+                   help="(video) don't fade in the source timestamp at each cut")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT,
                    help=f"Base output dir (default {DEFAULT_OUTPUT})")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -56,6 +77,14 @@ def _validate_args(args: argparse.Namespace) -> int | None:
 
 def _ratio_cap(ratio: float | None, duration_ms: int) -> int | None:
     return int(ratio * duration_ms) if ratio else None
+
+
+def _intro_seconds(args: argparse.Namespace) -> int:
+    if args.no_intro:
+        return 0
+    if args.keep_intro is not None:
+        return max(0, args.keep_intro)
+    return DEFAULT_INTRO_S
 
 
 def _get_cues(video_id: str, lang: str, workdir: Path) -> tuple[md.VideoMeta, list]:
@@ -87,7 +116,24 @@ def _run_text(args, video_id: str, workdir: Path) -> Path:
     print("\n" + "=" * 70 + "\n")
     print(markdown)
     print("=" * 70)
+    if args.render_audio:
+        print(f"Synthesizing speech ({args.voice} voice)…")
+        tmp_mp3 = workdir / "speech.mp3"
+        audio.synthesize_speech(
+            audio.build_spoken_script(meta, result), tmp_mp3, args.voice, workdir
+        )
+        _save_audio(args, meta, tmp_mp3)
     return out_path
+
+
+def _save_audio(args, meta: md.VideoMeta, tmp_mp3: Path) -> None:
+    length = format_length(videomode.probe_duration_ms(tmp_mp3))
+    fname = naming.build_filename(meta.channel, meta.title, length, "mp3")
+    dest = naming.avoid_overwrite(
+        naming.resolve_output_path(args.output_dir, "audio", fname)
+    )
+    shutil.move(str(tmp_mp3), str(dest))
+    print(f"Saved audio: {dest}")
 
 
 def _run_video(args, video_id: str, max_ms, workdir: Path) -> Path:
@@ -99,10 +145,31 @@ def _run_video(args, video_id: str, max_ms, workdir: Path) -> Path:
     chosen = spans.spans_from_cue_ranges(selection.ranges, cues, min_clip_ms=MIN_CLIP_MS)
     # --max-length is a hard cap; an explicit --ratio also acts as a deterministic
     # cap (an "override"). When --ratio is omitted, only the AI's choice applies.
+    # Note: the cap bounds the KEY segments; intro + end card are additive.
     caps = [c for c in (max_ms, _ratio_cap(args.ratio, meta.duration_ms)) if c]
     chosen = spans.enforce_max_length(chosen, min(caps) if caps else None, XFADE_MS)
+
+    intro_s = _intro_seconds(args)
+    if intro_s > 0:
+        intro = spans.Span(0, min(intro_s * 1000, meta.duration_ms))
+        chosen = spans.merge_spans([intro] + chosen)
+
+    polish = videomode.Polish(
+        badge=not args.no_badge,
+        banner_intro_s=float(intro_s) if (intro_s > 0 and not args.no_banner) else None,
+        end_card=not args.no_end_card,
+        timestamps=not args.no_timestamps,
+        source_url=md.watch_url(video_id),
+    )
     est = spans.rendered_duration_ms(chosen, XFADE_MS)
-    print(f"Selected {len(chosen)} segment(s), ~{format_length(est)} before render.")
+    print(f"Selected {len(chosen)} segment(s), ~{format_length(est)} of source "
+          f"before polish.")
+    if polish.any_enabled:
+        bits = [b for b, on in (("intro", intro_s > 0), ("badge", polish.badge),
+                                ("timestamps", polish.timestamps),
+                                ("end-card", polish.end_card)) if on]
+        print(f"Polish on ({', '.join(bits)}); disable with "
+              f"--no-intro/--no-badge/--no-end-card.")
 
     caption_style = videomode.caption_style_for(args.burn_captions)
     if caption_style == "soft":
@@ -116,8 +183,12 @@ def _run_video(args, video_id: str, max_ms, workdir: Path) -> Path:
     tmp_out = workdir / "tldr_output.mp4"
     rendered_ms = videomode.recut(
         source, chosen, cues, tmp_out, workdir,
-        xfade_ms=XFADE_MS, caption_style=caption_style,
+        xfade_ms=XFADE_MS, caption_style=caption_style, polish=polish,
     )
+    if max_ms is not None and rendered_ms > max_ms:
+        print(f"Note: final {format_length(rendered_ms)} exceeds --max-length "
+              f"{format_length(max_ms)} because the intro/end card are additive "
+              f"(the cap bounds the key segments).")
 
     filename = naming.build_filename(
         meta.channel, meta.title, format_length(rendered_ms), "mp4"
@@ -136,15 +207,22 @@ def _run_video(args, video_id: str, max_ms, workdir: Path) -> Path:
         shutil.move(str(source), str(kept))
         print(f"Kept source video: {kept}")
     print(f"Final length: {format_length(rendered_ms)}")
+    if args.render_audio:
+        print("Extracting audio…")
+        tmp_mp3 = workdir / "audio.mp3"
+        audio.extract_audio(out_path, tmp_mp3)
+        _save_audio(args, meta, tmp_mp3)
     return out_path
 
 
 def run(args: argparse.Namespace) -> int:
     max_ms = _validate_args(args)
     proc.require("claude", "yt-dlp", "ffmpeg", "ffprobe")
+    if args.render_audio and args.mode == "text":
+        audio.require_piper()  # fail fast before any Claude work
     video_id = canonical_video_id(args.url)
 
-    workdir = Path(tempfile.mkdtemp(prefix="youtube-tldr-"))
+    workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-"))
     try:
         if args.mode == "text":
             out_path = _run_text(args, video_id, workdir)

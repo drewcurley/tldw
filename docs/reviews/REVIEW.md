@@ -1,8 +1,8 @@
-# Review Artifact — youtube-tldr (feat/youtube-tldr)
+# Review Artifact — youtube-tldw (feat/youtube-tldw)
 
 ## Status: PASS WITH ITEMS (all blockers resolved; non-blocking items noted)
 
-A CLI that turns a YouTube URL into a text or video TL;DR using the Claude Max
+A CLI that turns a YouTube URL into a text or video TL;DW using the Claude Max
 subscription (`claude -p`). Full design + review history in `PLAN.md`.
 
 ## Review cycle

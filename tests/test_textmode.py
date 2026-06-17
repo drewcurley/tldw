@@ -1,6 +1,6 @@
-from youtube_tldr import textmode
-from youtube_tldr.metadata import VideoMeta
-from youtube_tldr.summarize import TextResult
+from youtube_tldw import textmode
+from youtube_tldw.metadata import VideoMeta
+from youtube_tldw.summarize import TextResult
 
 
 def _meta():
@@ -10,7 +10,7 @@ def _meta():
 def test_render_full():
     r = TextResult(["point one", "point two"], "The body.", 0.2, "because dense")
     md = textmode.render_markdown(_meta(), r)
-    assert "# TL;DR — My Video" in md
+    assert "# TL;DW — My Video" in md
     assert "**Channel:** My Channel" in md
     assert "- point one" in md
     assert "The body." in md

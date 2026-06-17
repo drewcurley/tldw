@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from youtube_tldr import TldrError
-from youtube_tldr.naming import (
+from youtube_tldw import TldrError
+from youtube_tldw.naming import (
     avoid_overwrite,
     build_filename,
     resolve_output_path,
@@ -21,7 +21,7 @@ def test_strips_path_separators_and_traversal():
 def test_strips_template_breakers():
     # ' - ' joiner and ';' literal must not survive in a field
     assert " - " not in sanitize_field("Foo - Bar")
-    assert ";" not in sanitize_field("tl;dr hijack")
+    assert ";" not in sanitize_field("tl;dw hijack")
 
 
 def test_drops_control_and_emoji():
@@ -39,13 +39,18 @@ def test_empty_becomes_untitled():
 
 def test_build_filename_shape():
     name = build_filename("My Channel", "Cool Video", "3m42s", "mp4")
-    assert name == "My Channel - Cool Video - tl;dr - 3m42s.mp4"
+    assert name == "My Channel - Cool Video - tl;dw - 3m42s.mp4"
 
 
 def test_resolve_contains_path(tmp_path):
     p = resolve_output_path(tmp_path, "video", "a.mp4")
     assert p.parent == (tmp_path / "video").resolve()
     assert p.is_relative_to(tmp_path.resolve())
+
+
+def test_resolve_audio_subdir(tmp_path):
+    p = resolve_output_path(tmp_path, "audio", "a.mp3")
+    assert p.parent == (tmp_path / "audio").resolve()
 
 
 def test_resolve_rejects_escape(tmp_path):

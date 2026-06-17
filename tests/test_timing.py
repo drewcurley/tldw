@@ -1,7 +1,8 @@
 import pytest
 
-from youtube_tldr import TldrError
-from youtube_tldr.timing import (
+from youtube_tldw import TldrError
+from youtube_tldw.timing import (
+    format_clock,
     format_length,
     parse_cue_ts,
     parse_duration,
@@ -62,3 +63,12 @@ def test_format_length(ms, label):
 def test_read_time_label():
     assert read_time_label(400) == "2m"
     assert read_time_label(10) == "1m"  # floor of 1
+
+
+@pytest.mark.parametrize(
+    "ms,clock",
+    [(0, "0:00"), (12_000, "0:12"), (72_000, "1:12"), (754_000, "12:34"),
+     (3_723_000, "1:02:03")],
+)
+def test_format_clock(ms, clock):
+    assert format_clock(ms) == clock

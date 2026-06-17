@@ -1,7 +1,7 @@
 import pytest
 
-from youtube_tldr import TldrError
-from youtube_tldr.urls import canonical_video_id
+from youtube_tldw import TldrError
+from youtube_tldw.urls import canonical_video_id
 
 VID = "dQw4w9WgXcQ"
 
@@ -16,10 +16,17 @@ VID = "dQw4w9WgXcQ"
         f"https://www.youtube.com/shorts/{VID}",
         f"https://www.youtube.com/embed/{VID}",
         f"https://www.youtube.com/live/{VID}",
+        VID,                 # bare 11-char video id
+        f"  {VID}  ",        # bare id with surrounding whitespace
     ],
 )
 def test_accepts_valid(url):
     assert canonical_video_id(url) == VID
+
+
+def test_real_example_inputs():
+    assert canonical_video_id("https://www.youtube.com/watch?v=86QbFlOHuTs") == "86QbFlOHuTs"
+    assert canonical_video_id("86QbFlOHuTs") == "86QbFlOHuTs"
 
 
 @pytest.mark.parametrize(

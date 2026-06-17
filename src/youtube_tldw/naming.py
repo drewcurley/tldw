@@ -1,7 +1,7 @@
 """Output path construction with sanitization and path-containment guarantees.
 
-Filename template: '{channel} - {video} - tl;dr - {length}.{ext}'
-The ' - ' joiner and 'tl;dr' literal are structural, so we strip ' - ' runs and
+Filename template: '{channel} - {video} - tl;dw - {length}.{ext}'
+The ' - ' joiner and 'tl;dw' literal are structural, so we strip ' - ' runs and
 ';' from the channel/title fields to keep the template parseable.
 """
 
@@ -33,7 +33,7 @@ def sanitize_field(value: str, *, max_bytes: int = 80) -> str:
         ch for ch in value if not unicodedata.category(ch).startswith(("C", "So"))
     )
     cleaned = _ILLEGAL.sub(" ", cleaned)
-    cleaned = cleaned.replace(";", " ")          # protect the 'tl;dr' literal
+    cleaned = cleaned.replace(";", " ")          # protect the 'tl;dw' literal
     cleaned = cleaned.replace(" - ", " ")        # protect the ' - ' joiner
     cleaned = _WS.sub(" ", cleaned).strip(" .")  # no leading/trailing dot/space
     cleaned = _truncate_bytes(cleaned, max_bytes).strip(" .")
@@ -52,17 +52,17 @@ def _truncate_bytes(text: str, max_bytes: int) -> str:
 def build_filename(channel: str, title: str, length_label: str, ext: str) -> str:
     channel_s = sanitize_field(channel, max_bytes=60)
     title_s = sanitize_field(title, max_bytes=120)
-    return f"{channel_s} - {title_s} - tl;dr - {length_label}.{ext}"
+    return f"{channel_s} - {title_s} - tl;dw - {length_label}.{ext}"
 
 
 def resolve_output_path(
     base_dir: Path, mode: str, filename: str
 ) -> Path:
-    """Place `filename` under base_dir/<text|video>/ and assert it stays inside.
+    """Place `filename` under base_dir/<text|video|audio>/ and assert it stays inside.
 
     Guards against any traversal that survived sanitization.
     """
-    subdir = "video" if mode == "video" else "text"
+    subdir = {"video": "video", "audio": "audio"}.get(mode, "text")
     out_dir = (base_dir / subdir).resolve()
     candidate = (out_dir / filename).resolve()
     if not candidate.is_relative_to(out_dir):

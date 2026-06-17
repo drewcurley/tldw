@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from youtube_tldr import TldrError
-from youtube_tldr.transcript import full_text, parse_subtitles, word_count
+from youtube_tldw import TldrError
+from youtube_tldw.transcript import full_text, parse_subtitles, word_count
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

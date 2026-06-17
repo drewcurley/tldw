@@ -44,17 +44,23 @@ def spans_from_cue_ranges(
     spans = [s for s in spans if s.duration_ms > 0]
     if not spans:
         raise TldrError("Claude selected no usable segments.")
-    spans.sort(key=lambda s: s.start_ms)
+    merged = merge_spans(spans)
+    kept = [s for s in merged if s.duration_ms >= min_clip_ms]
+    return kept or [max(merged, key=lambda s: s.duration_ms)]
 
-    merged: list[Span] = [spans[0]]
-    for s in spans[1:]:
+
+def merge_spans(spans: list[Span]) -> list[Span]:
+    """Sort by start and merge overlapping/adjacent spans into fresh Span objects."""
+    ordered = sorted((s for s in spans if s.duration_ms > 0), key=lambda s: s.start_ms)
+    if not ordered:
+        return []
+    merged: list[Span] = [Span(ordered[0].start_ms, ordered[0].end_ms)]
+    for s in ordered[1:]:
         if s.start_ms <= merged[-1].end_ms:  # overlap or adjacent
             merged[-1].end_ms = max(merged[-1].end_ms, s.end_ms)
         else:
-            merged.append(s)
-
-    kept = [s for s in merged if s.duration_ms >= min_clip_ms]
-    return kept or [max(merged, key=lambda s: s.duration_ms)]
+            merged.append(Span(s.start_ms, s.end_ms))
+    return merged
 
 
 def enforce_max_length(
@@ -93,6 +99,40 @@ def xfade_offsets_ms(clip_durations_ms: list[int], xfade_ms: int) -> list[int]:
         running += clip_durations_ms[i - 1]
         offsets.append(running - i * xfade_ms)
     return offsets
+
+
+def build_xfade_chain(
+    clip_durations_ms: list[int], joins: list[tuple[int, str]]
+) -> tuple[str, str, str]:
+    """Chain xfade/acrossfade with per-join (duration_ms, transition).
+
+    `joins` has length N-1. Offsets are cumulative:
+    L0 = d0; L_{i+1} = L_i + d_{i+1} - t_i; offset_i = L_i - t_i.
+    Returns (filtergraph, video_label, audio_label).
+    """
+    n = len(clip_durations_ms)
+    if n < 2:
+        raise ValueError("build_xfade_chain requires >= 2 clips")
+    if len(joins) != n - 1:
+        raise ValueError("joins must have length len(clips)-1")
+
+    parts: list[str] = []
+    vprev, aprev = "[0:v]", "[0:a]"
+    running = clip_durations_ms[0]
+    for i in range(1, n):
+        dur_ms, transition = joins[i - 1]
+        d = dur_ms / 1000.0
+        offset = (running - dur_ms) / 1000.0
+        vout = f"[v{i}]" if i < n - 1 else "[vout]"
+        aout = f"[a{i}]" if i < n - 1 else "[aout]"
+        parts.append(
+            f"{vprev}[{i}:v]xfade=transition={transition}:"
+            f"duration={d:.3f}:offset={offset:.3f}{vout}"
+        )
+        parts.append(f"{aprev}[{i}:a]acrossfade=d={d:.3f}:c1=tri:c2=tri{aout}")
+        vprev, aprev = vout, aout
+        running = running + clip_durations_ms[i] - dur_ms
+    return ";".join(parts), "[vout]", "[aout]"
 
 
 def build_xfade_filter(

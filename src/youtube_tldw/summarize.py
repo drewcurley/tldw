@@ -16,7 +16,7 @@ from .transcript import Cue
 # generous; beyond it we map-reduce (text) / chunk-select (video).
 SINGLE_PASS_CHARS = 350_000
 
-_TEXT_PROMPT = """You are an expert at distilling video transcripts into a TL;DR \
+_TEXT_PROMPT = """You are an expert at distilling video transcripts into a TL;DW \
 that preserves every key point while cutting all filler.
 
 Input (on stdin): video metadata then the full transcript.
@@ -32,7 +32,7 @@ Return ONLY a JSON object, no prose, no markdown fences, with this schema:
 }}"""
 
 _TEXT_REDUCE_PROMPT = """You are combining ordered partial summaries of one video \
-into a single TL;DR. Input (on stdin): the partial summaries in order.
+into a single TL;DW. Input (on stdin): the partial summaries in order.
 
 {ratio_clause}
 
@@ -44,7 +44,7 @@ Return ONLY a JSON object with this schema:
   "rationale": "one sentence"
 }}"""
 
-_VIDEO_PROMPT = """You are selecting the segments of a video to KEEP for a TL;DR \
+_VIDEO_PROMPT = """You are selecting the segments of a video to KEEP for a TL;DW \
 recut. Input (on stdin): metadata then the transcript as numbered cues, one per \
 line, formatted `[index] (timestamp) text`.
 

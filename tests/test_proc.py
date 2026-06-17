@@ -2,7 +2,7 @@ import subprocess
 
 import pytest
 
-from youtube_tldr import TldrError, proc
+from youtube_tldw import TldrError, proc
 
 
 def test_success_returns_stdout():

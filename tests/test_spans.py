@@ -1,15 +1,17 @@
 import pytest
 
-from youtube_tldr import TldrError
-from youtube_tldr.spans import (
+from youtube_tldw import TldrError
+from youtube_tldw.spans import (
     Span,
+    build_xfade_chain,
     build_xfade_filter,
     enforce_max_length,
+    merge_spans,
     rendered_duration_ms,
     spans_from_cue_ranges,
     xfade_offsets_ms,
 )
-from youtube_tldr.transcript import Cue
+from youtube_tldw.transcript import Cue
 
 
 def _cues(n, step=1000):
@@ -89,3 +91,38 @@ def test_build_xfade_filter_structure():
 def test_build_xfade_requires_two():
     with pytest.raises(ValueError):
         build_xfade_filter([5000], 400)
+
+
+def test_build_xfade_chain_mixed_joins():
+    # content xfade 400 then fade-to-black 600 to an end card.
+    durs = [3000, 2000, 2500]
+    joins = [(400, "fade"), (600, "fadeblack")]
+    graph, v, a = build_xfade_chain(durs, joins)
+    assert v == "[vout]" and a == "[aout]"
+    assert "transition=fade:" in graph and "transition=fadeblack:" in graph
+    # offset0 = 3000-400 = 2600ms; offset1 = (3000+2000-400)-600 = 4000ms
+    assert "offset=2.600" in graph and "offset=4.000" in graph
+
+
+def test_build_xfade_chain_validates_lengths():
+    with pytest.raises(ValueError):
+        build_xfade_chain([3000], [])
+    with pytest.raises(ValueError):
+        build_xfade_chain([3000, 2000], [(400, "fade"), (600, "fadeblack")])
+
+
+def test_merge_spans_overlap_and_adjacent():
+    merged = merge_spans([Span(6000, 10000), Span(0, 4000), Span(4000, 6000)])
+    assert merged == [Span(0, 10000)]
+
+
+def test_merge_spans_disjoint_preserved():
+    merged = merge_spans([Span(0, 2000), Span(5000, 7000)])
+    assert merged == [Span(0, 2000), Span(5000, 7000)]
+
+
+def test_merge_spans_returns_fresh_objects():
+    original = Span(0, 1000)
+    merged = merge_spans([original])
+    merged[0].end_ms = 9999
+    assert original.end_ms == 1000  # not mutated

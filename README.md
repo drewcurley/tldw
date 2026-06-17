@@ -1,6 +1,6 @@
-# youtube-tldr
+# youtube-tldw
 
-Turn a YouTube video into a succinct **TL;DR** — either as Markdown text or as a
+Turn a YouTube video into a succinct **TL;DW** — either as Markdown text or as a
 recut MP4 of just the key moments — using your **Claude Max subscription** (no API
 keys, no per-token billing).
 
@@ -11,7 +11,7 @@ keys, no per-token billing).
    "rolling" cues).
 3. Sends it to Claude via headless `claude -p`, which decides how aggressively to
    compress based on the content.
-4. **text mode** → prints the TL;DR and saves a `.md`.
+4. **text mode** → prints the TL;DW and saves a `.md`.
    **video mode** → Claude picks the key cue ranges, `ffmpeg` cuts them from the
    source and stitches them with crossfades (a deliberate visual signal that
    content was skipped), and saves an `.mp4`.
@@ -34,34 +34,68 @@ pip install -e .
 ## Usage
 
 ```bash
-# Text TL;DR (AI decides the length)
-tldr "https://youtu.be/VIDEO_ID" --mode text
+# Text TL;DW (AI decides the length)
+tldw "https://youtu.be/VIDEO_ID" --mode text
 
-# Video TL;DR, capped at 5 minutes, with burned-in captions
-tldr "https://youtu.be/VIDEO_ID" --mode video --max-length 5m --burn-captions
+# Video TL;DW, capped at 5 minutes, with burned-in captions
+tldw "https://youtu.be/VIDEO_ID" --mode video --max-length 5m --burn-captions
 
 # Force a target compression and keep the original download
-tldr "https://youtu.be/VIDEO_ID" --mode video --ratio 0.2 --keep-source
+tldw "https://youtu.be/VIDEO_ID" --mode video --ratio 0.2 --keep-source
 ```
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
-| `--mode {text,video}` | Required. |
+| `--mode {text,video}` | Defaults to `video`. |
+| `--render-audio` | Also save an mp3: video → the recut audio; text → spoken summary (TTS). |
+| `--voice {female,male}` | Voice for text-mode TTS (default `female`). |
 | `--ratio FLOAT` | Target fraction of original length (`0 < r <= 1`). Omit to let the AI choose. |
 | `--max-length DUR` | Hard cap (`5m`, `90s`, `1m30s`). **Wins over `--ratio`.** |
 | `--lang CODE` | Preferred subtitle language (default `en`). |
 | `--burn-captions` | (video) burn recut-aligned captions into the output. |
 | `--keep-source` | (video) keep the full downloaded source too. |
-| `--output-dir PATH` | Base output dir (default `~/Downloads/youtube-tldr/tldrs`). |
+| `--keep-intro N` | (video) keep the first N seconds as an intro (default 6s). |
+| `--no-intro` | (video) don't preserve the intro. |
+| `--no-badge` | (video) no "TL;DW" corner badge. |
+| `--no-banner` | (video) no "TL;DW version" intro banner. |
+| `--no-end-card` | (video) no fade-to-black "Made with youtube-tldw" end card. |
+| `--output-dir PATH` | Base output dir (default `~/Downloads/youtube-tldw/tldws`). |
+
+### Video polish (on by default)
+
+Video TL;DWs are "finished" automatically so they don't look abruptly chopped:
+- **Intro preserved** — the first ~6s of the source is kept as the opener.
+- **TL;DW marks** — a "TL;DW version" banner over the intro + a persistent "TL;DW"
+  corner badge for the rest.
+- **Graceful ending** — the last segment fades to black, then a "Made with
+  youtube-tldw" end card fades in/out.
+
+Disable any piece with the `--no-*` flags above. Text is rendered with Pillow and
+composited by ffmpeg (works even without libass/libfreetype). Note: `--max-length`
+caps the key segments; the intro and end card are additive, so the final file can be
+a few seconds longer (the printed filename always reflects the true rendered length).
+
+The URL argument also accepts a **bare 11-character video id** (e.g. `tldw 86QbFlOHuTs`).
+
+## Audio (`--render-audio`)
+
+- **video mode** → extracts the recut video's audio to an mp3.
+- **text mode** → synthesizes the summary to natural speech using **Piper** (local
+  neural TTS, no API keys). `--voice female|male`. Voice models download once on
+  first use into `~/.cache/youtube-tldw/voices/`.
+
+Text-mode TTS needs Piper installed: `pipx inject youtube-tldw piper-tts`
+(or `pip install -e ".[tts]"` for a dev checkout).
 
 ## Output
 
 ```
-~/Downloads/youtube-tldr/tldrs/
-  text/   {channel} - {video} - tl;dr - {read-time}.md
-  video/  {channel} - {video} - tl;dr - {length}.mp4
+~/Downloads/youtube-tldw/tldws/
+  text/   {channel} - {video} - tl;dw - {read-time}.md
+  video/  {channel} - {video} - tl;dw - {length}.mp4
+  audio/  {channel} - {video} - tl;dw - {length}.mp3
 ```
 
 ## Development

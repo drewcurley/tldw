@@ -1,4 +1,4 @@
-"""Render the text TL;DR to Markdown and write the .md file."""
+"""Render the text TL;DW to Markdown and write the .md file."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from .timing import format_length, read_time_label
 
 def render_markdown(meta: VideoMeta, result: TextResult) -> str:
     lines = [
-        f"# TL;DR — {meta.title}",
+        f"# TL;DW — {meta.title}",
         "",
         f"**Channel:** {meta.channel}  ",
         f"**Source:** {watch_url(meta.video_id)}  ",

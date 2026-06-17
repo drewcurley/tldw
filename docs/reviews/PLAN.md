@@ -1,31 +1,31 @@
-# youtube-tldr — Implementation Plan
+# youtube-tldw — Implementation Plan
 
 ## Goal
 A personal CLI that takes a YouTube URL, uses the user's Claude Max subscription
-(via headless `claude -p`) to analyze the transcript, and produces a TL;DR in one
+(via headless `claude -p`) to analyze the transcript, and produces a TL;DW in one
 of two modes:
-- **text**: print the TL;DR and save a Markdown file.
+- **text**: print the TL;DW and save a Markdown file.
 - **video**: download with yt-dlp, have Claude select the key transcript spans,
   recut the source with ffmpeg into a shorter video with crossfades between clips,
   save an MP4.
 
 ## Locked requirements
 - Claude access: headless `claude -p` (Max subscription, no API keys).
-- Interface: CLI with flags. `tldr <url> --mode text|video [options]`.
+- Interface: CLI with flags. `tldw <url> --mode text|video [options]`.
 - Compression: **AI-determined dynamically** from content density; `--ratio FLOAT`
   override; `--max-length` duration cap.
 - text mode: print + save `.md`.
 - video mode: transcript-with-timestamps → Claude picks spans → ffmpeg cut + concat
   with **crossfades** (explicit visible cuts).
 - Captions: `--burn-captions` optional.
-- Output dir: `~/Downloads/youtube-tldr/tldrs/{video|text}/`.
-- Naming: `{channel} - {video} - tl;dr - {new_length}.{md|mp4}` (sanitized).
+- Output dir: `~/Downloads/youtube-tldw/tldws/{video|text}/`.
+- Naming: `{channel} - {video} - tl;dw - {new_length}.{md|mp4}` (sanitized).
 - Defaults: delete downloaded source after recut (`--keep-source` to retain);
   abort cleanly when no transcript; `{new_length}` formatted like `3m42s`.
 
 ## Architecture (Python, single package)
 ```
-youtube_tldr/
+youtube_tldw/
   __init__.py
   cli.py            # argparse, flag wiring, orchestration
   metadata.py       # yt-dlp: fetch channel/title/duration, pick subtitle track
@@ -63,14 +63,14 @@ tests/              # pytest, ffmpeg/claude/yt-dlp mocked
 
 ## CLI surface
 ```
-tldr <url>
+tldw <url>
   --mode {text,video}     (required)
   --ratio FLOAT           (optional; 0 < r <= 1; e.g. 0.25 = ~25% of original)
   --max-length DURATION   (optional; e.g. 5m, 90s; HARD cap, wins over --ratio)
   --lang CODE             (optional; preferred subtitle language, default en)
   --burn-captions         (video only; default off)
   --keep-source           (video only; default off)
-  --output-dir PATH       (optional; default ~/Downloads/youtube-tldr/tldrs;
+  --output-dir PATH       (optional; default ~/Downloads/youtube-tldw/tldws;
                            {video|text} subdirs are ALWAYS appended under it)
 ```
 (`--model` cut from v1 — scope; the Max default model is used.)
@@ -100,7 +100,7 @@ tldr <url>
   chars, decode then drop emojis/non-printables, reject `.`/`..`, collapse
   whitespace, cap to a **byte** budget (≤255 incl. extension). After building the
   path, `Path.resolve()` and assert `is_relative_to(output_dir.resolve())` before
-  any write. Separators in the template (` - `, `tl;dr`): sanitizer strips/escapes
+  any write. Separators in the template (` - `, `tl;dw`): sanitizer strips/escapes
   ` - ` and `;` from channel/title so the template stays parseable. Hostile-title
   unit tests required.
 - **B4 — URL allowlist.** Validate scheme `https`, host in

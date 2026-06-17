@@ -20,10 +20,20 @@ _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
 def canonical_video_id(url: str) -> str:
-    """Validate `url` and extract the YouTube video id, or raise TldrError."""
+    """Validate `url` and extract the YouTube video id, or raise TldrError.
+
+    Accepts a full https YouTube URL (watch/youtu.be/shorts/embed/live) or a
+    bare 11-character video id.
+    """
     if not isinstance(url, str) or not url.strip():
         raise TldrError("No URL provided.")
-    parsed = urlparse(url.strip())
+    text = url.strip()
+
+    # Bare video id, e.g. "86QbFlOHuTs".
+    if _VIDEO_ID.match(text):
+        return text
+
+    parsed = urlparse(text)
 
     if parsed.scheme != "https":
         raise TldrError("URL must start with https://")
