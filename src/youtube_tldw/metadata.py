@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import TldrError
+from . import NoTranscriptError, TldrError
 from .proc import run
 
 _OUTPUT_TMPL = "%(id)s.%(ext)s"  # static; never built from untrusted input
@@ -68,7 +68,7 @@ def choose_track(meta: VideoMeta, lang: str) -> tuple[str, bool]:
         return next(iter(meta.subtitles)), False
     if meta.auto_captions:
         return next(iter(meta.auto_captions)), True
-    raise TldrError(
+    raise NoTranscriptError(
         "This video has no subtitles or auto-captions, so there's nothing to "
         "summarize. (Try a different video.)"
     )

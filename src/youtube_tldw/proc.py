@@ -11,7 +11,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
-from . import TldrError
+from . import TldrError, TldrTimeoutError
 
 
 @dataclass
@@ -56,7 +56,7 @@ def run(
             cwd=cwd,
         )
     except subprocess.TimeoutExpired as exc:
-        raise TldrError(f"`{argv[0]}` timed out after {timeout}s.") from exc
+        raise TldrTimeoutError(f"`{argv[0]}` timed out after {timeout}s.") from exc
     except FileNotFoundError as exc:
         raise TldrError(f"`{argv[0]}` is not installed or not on PATH.") from exc
 

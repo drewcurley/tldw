@@ -1,0 +1,222 @@
+"""`tldw serve` — a tiny localhost HTTP API for the browser extension (text only).
+
+Stdlib only. Security posture (see docs/reviews/PLAN-extension.md):
+- loopback bind only; bearer token (hmac.compare_digest); CORS fails closed
+  (chrome-extension origins or a pinned origin, never web/null/`*`);
+- url goes through the youtube allowlist before any subprocess;
+- bounded concurrency (non-blocking semaphore -> 429); small body cap;
+- single-pass transcripts only (map-reduce-sized -> 413) so a click never hangs.
+"""
+
+from __future__ import annotations
+
+import hmac
+import json
+import re
+import secrets
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from . import (
+    BadUrlError,
+    ClaudeError,
+    NoTranscriptError,
+    TldrError,
+    TldrTimeoutError,
+    TranscriptTooLongError,
+    __version__,
+)
+from . import metadata as md
+from . import core, textmode
+from .summarize import SINGLE_PASS_CHARS
+from .timing import format_length
+
+MAX_BODY_BYTES = 16 * 1024
+MAX_CONCURRENCY = 2
+REQUEST_TIMEOUT = 120.0  # per-request claude budget (shorter than the CLI's)
+_LANG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,15}$")
+
+# Typed error -> HTTP status.
+_STATUS = {
+    BadUrlError: 400,
+    NoTranscriptError: 422,
+    TranscriptTooLongError: 413,
+    ClaudeError: 502,
+    TldrTimeoutError: 504,
+}
+
+
+def _origin_allowed(origin: str | None, pinned: str | None) -> bool:
+    """Fail closed: only a pinned origin, or (default) any chrome-extension origin.
+    Never allow missing/null/web origins."""
+    if not origin:
+        return False
+    if pinned:
+        return hmac.compare_digest(origin, pinned)
+    return origin.startswith("chrome-extension://")
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "tldw"
+    protocol_version = "HTTP/1.0"  # close per response; avoids keep-alive pitfalls
+
+    # --- helpers -------------------------------------------------------------
+    def _cors_headers(self) -> None:
+        origin = self.headers.get("Origin")
+        if _origin_allowed(origin, self.server.allow_origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Headers", "authorization,content-type")
+            self.send_header("Access-Control-Allow-Methods", "POST,GET,OPTIONS")
+            self.send_header("Access-Control-Max-Age", "600")
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authorized(self) -> bool:
+        header = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not header.startswith(prefix):
+            return False
+        return hmac.compare_digest(header[len(prefix):], self.server.token)
+
+    def log_message(self, *args) -> None:  # don't log request lines (may carry data)
+        pass
+
+    # --- routes --------------------------------------------------------------
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self._cors_headers()
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        if self.path.split("?")[0] == "/health":
+            self._send_json(200, {"ok": True, "name": "tldw", "version": __version__})
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        if self.path.split("?")[0] != "/summarize":
+            self._send_json(404, {"error": "not found"})
+            return
+        if not self._authorized():
+            self._send_json(401, {"error": "missing or invalid token"})
+            return
+        body = self._read_body()
+        if body is None:
+            return  # _read_body already responded
+        acquired = self.server.sem.acquire(blocking=False)
+        if not acquired:
+            self._send_json(429, {"error": "busy, try again shortly"})
+            return
+        try:
+            self._handle_summarize(body)
+        finally:
+            self.server.sem.release()
+
+    def _read_body(self) -> dict | None:
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            self._send_json(400, {"error": "chunked transfer not supported"})
+            return None
+        ctype = self.headers.get("Content-Type", "")
+        if not ctype.startswith("application/json"):
+            self._send_json(415, {"error": "expected application/json"})
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._send_json(411, {"error": "Content-Length required"})
+            return None
+        if length <= 0 or length > MAX_BODY_BYTES:
+            self._send_json(413, {"error": "request body too large"})
+            return None
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._send_json(400, {"error": "invalid JSON"})
+            return None
+
+    def _handle_summarize(self, body: dict) -> None:
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            self._send_json(400, {"error": "missing 'url'"})
+            return
+        ratio = body.get("ratio")
+        if ratio is not None:
+            try:
+                ratio = float(ratio)
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": "ratio must be a number"})
+                return
+            if not (0 < ratio <= 1):
+                self._send_json(400, {"error": "ratio must be in (0, 1]"})
+                return
+        lang = body.get("lang", "en")
+        if not isinstance(lang, str) or not _LANG_RE.match(lang):
+            self._send_json(400, {"error": "invalid lang"})
+            return
+        try:
+            summary = core.summarize_url(
+                body["url"], ratio, lang,
+                timeout=REQUEST_TIMEOUT, max_chars=SINGLE_PASS_CHARS,
+            )
+        except TldrError as exc:
+            status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
+            self._send_json(status, {"error": str(exc)})
+            return
+        self._send_json(200, _to_payload(summary))
+
+
+def _to_payload(summary: core.Summary) -> dict:
+    meta, result = summary.meta, summary.result
+    return {
+        "video_id": meta.video_id,
+        "title": meta.title,
+        "channel": meta.channel,
+        "source_url": md.watch_url(meta.video_id),
+        "original_length": format_length(meta.duration_ms),
+        "length_label": textmode.length_label(result),
+        "key_points": result.key_points,
+        "summary_md": result.summary,
+        "rationale": result.rationale,
+    }
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, addr, token: str, allow_origin: str | None):
+        super().__init__(addr, _Handler)
+        self.token = token
+        self.allow_origin = allow_origin
+        self.sem = threading.Semaphore(MAX_CONCURRENCY)
+
+
+def serve(host: str = "127.0.0.1", port: int = 8765,
+          token: str | None = None, allow_origin: str | None = None) -> None:
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        raise TldrError(
+            "Refusing to bind a non-loopback host. Hosting for others needs TLS and "
+            "API billing — see docs/reviews/PLAN-extension.md."
+        )
+    token = token or secrets.token_urlsafe(32)
+    httpd = _Server((host, port), token, allow_origin)
+    print(f"tldw serve listening on http://{host}:{port}")
+    print(f"  token: {token}")
+    print("  paste this token into the extension's options. Ctrl-C to stop.")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping…")
+    finally:
+        # serve_forever() has already unwound here, so only close the socket
+        # (calling shutdown() from this thread would deadlock).
+        httpd.server_close()

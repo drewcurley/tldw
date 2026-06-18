@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 from urllib.parse import parse_qs, urlparse
 
-from . import TldrError
+from . import BadUrlError
 
 _ALLOWED_HOSTS = {
     "youtube.com",
@@ -26,7 +26,7 @@ def canonical_video_id(url: str) -> str:
     bare 11-character video id.
     """
     if not isinstance(url, str) or not url.strip():
-        raise TldrError("No URL provided.")
+        raise BadUrlError("No URL provided.")
     text = url.strip()
 
     # Bare video id, e.g. "86QbFlOHuTs".
@@ -36,10 +36,10 @@ def canonical_video_id(url: str) -> str:
     parsed = urlparse(text)
 
     if parsed.scheme != "https":
-        raise TldrError("URL must start with https://")
+        raise BadUrlError("URL must start with https://")
     host = (parsed.hostname or "").lower()
     if host not in _ALLOWED_HOSTS:
-        raise TldrError(
+        raise BadUrlError(
             f"Unsupported host {host!r}. Only youtube.com / youtu.be URLs are allowed."
         )
 
@@ -50,11 +50,11 @@ def canonical_video_id(url: str) -> str:
     elif parsed.path.startswith(("/shorts/", "/embed/", "/live/", "/v/")):
         vid = parsed.path.split("/")[2]
     else:
-        raise TldrError(
+        raise BadUrlError(
             "Could not find a video id in the URL. "
             "Use a normal watch / youtu.be / shorts link (not a playlist)."
         )
 
     if not _VIDEO_ID.match(vid):
-        raise TldrError("That doesn't look like a single YouTube video URL.")
+        raise BadUrlError("That doesn't look like a single YouTube video URL.")
     return vid

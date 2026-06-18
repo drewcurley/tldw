@@ -12,7 +12,7 @@ import html
 import re
 from dataclasses import dataclass
 
-from . import TldrError
+from . import NoTranscriptError, TldrError
 from .timing import parse_cue_ts
 
 _ARROW = "-->"
@@ -59,7 +59,7 @@ def parse_subtitles(content: str) -> list[Cue]:
     """Parse subtitle text into ordered, de-duplicated, non-overlapping cues."""
     blocks = _raw_blocks(content)
     if not blocks:
-        raise TldrError("Subtitle file contained no readable cues.")
+        raise NoTranscriptError("Subtitle file contained no readable cues.")
 
     is_auto = bool(_HAS_INLINE.search(content))
     cues: list[Cue] = []
@@ -93,7 +93,7 @@ def _normalize(cues: list[Cue]) -> list[Cue]:
     """Sort, fix inverted spans, and remove overlaps so cuts never collide."""
     cues = [c for c in cues if c.text and c.end_ms > c.start_ms]
     if not cues:
-        raise TldrError("Subtitle file produced no usable text.")
+        raise NoTranscriptError("Subtitle file produced no usable text.")
     cues.sort(key=lambda c: (c.start_ms, c.end_ms))
     for i in range(1, len(cues)):
         if cues[i].start_ms < cues[i - 1].end_ms:

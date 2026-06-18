@@ -239,7 +239,33 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _serve_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="tldw serve",
+                                description="Run the local HTTP API for the browser extension.")
+    p.add_argument("--host", default="127.0.0.1", help="loopback only (default 127.0.0.1)")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--token", default=None, help="bearer token (or set TLDW_TOKEN)")
+    p.add_argument("--allow-origin", default=None,
+                   help="pin one extension origin; default allows any chrome-extension://")
+    return p
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    # Dispatch `serve` before argparse so `tldw <url>` stays unchanged.
+    if argv and argv[0] == "serve":
+        import os
+        from . import server
+        sargs = _serve_parser().parse_args(argv[1:])
+        try:
+            server.serve(sargs.host, sargs.port,
+                         sargs.token or os.environ.get("TLDW_TOKEN"),
+                         sargs.allow_origin)
+            return 0
+        except TldrError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
     args = build_parser().parse_args(argv)
     try:
         return run(args)

@@ -12,7 +12,7 @@ import json
 import re
 from typing import Callable
 
-from . import TldrError
+from . import ClaudeError, TldrError, TldrTimeoutError
 from .proc import run
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -23,19 +23,19 @@ def _extract_result_text(stdout: str) -> str:
     """Pull the model's text out of the `claude --output-format json` envelope."""
     stdout = stdout.strip()
     if not stdout:
-        raise TldrError(
+        raise ClaudeError(
             "Claude returned no output. Are you logged in? Try `claude` once "
             "interactively to confirm your Max session."
         )
     try:
         envelope = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise TldrError("Could not parse Claude's response envelope.") from exc
+        raise ClaudeError("Could not parse Claude's response envelope.") from exc
     if envelope.get("is_error"):
-        raise TldrError(f"Claude reported an error: {envelope.get('subtype')}")
+        raise ClaudeError(f"Claude reported an error: {envelope.get('subtype')}")
     result = envelope.get("result")
     if not isinstance(result, str) or not result.strip():
-        raise TldrError("Claude returned an empty result.")
+        raise ClaudeError("Claude returned an empty result.")
     return result
 
 
@@ -73,12 +73,17 @@ def ask_json(
                 "the requested schema. Reply with ONLY the raw JSON object, no "
                 "prose, no markdown fences."
             )
-        result = run(argv, stdin=payload, timeout=timeout)
+        try:
+            result = run(argv, stdin=payload, timeout=timeout)
+        except TldrTimeoutError:
+            raise  # surfaces as 504, not swallowed by the retry
+        except TldrError as exc:
+            raise ClaudeError(str(exc)) from exc  # non-zero exit etc. -> 502
         try:
             data = _parse_inner_json(_extract_result_text(result.stdout))
             return validate(data)
         except (ValueError, json.JSONDecodeError, TldrError) as exc:
             last_err = exc
-    raise TldrError(
+    raise ClaudeError(
         f"Claude did not return valid structured output after a retry: {last_err}"
     )
