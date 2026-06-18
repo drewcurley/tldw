@@ -32,6 +32,18 @@ def test_summarize_url_rejects_too_long(monkeypatch):
         core.summarize_url("u", max_chars=50)
 
 
+def test_select_segments(monkeypatch):
+    from youtube_tldw.summarize import VideoSelection
+    _patch(monkeypatch, cues=[Cue(0, 2000, "a"), Cue(2000, 4000, "b"),
+                              Cue(4000, 6000, "c")])
+    monkeypatch.setattr(core.summarize, "select_video_segments",
+                        lambda *a, **k: VideoSelection([(0, 1)], None, "r"))
+    meta, segs = core.select_segments("https://youtu.be/dQw4w9WgXcQ")
+    assert segs and set(segs[0]) == {"start", "end", "label"}
+    assert segs[0]["start"] < segs[0]["end"]
+    assert isinstance(segs[0]["label"], str)
+
+
 def test_summarize_url_cleans_tempdir(monkeypatch, tmp_path):
     _patch(monkeypatch)
     monkeypatch.setattr(core.summarize, "summarize_text",

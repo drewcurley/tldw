@@ -51,6 +51,7 @@ chrome.runtime.onConnect.addListener((port) => {
     if (!msg) return;
     if (msg.type === "summarize") handleSummarize(port, msg);
     else if (msg.type === "speak") handleSpeak(port, msg);
+    else if (msg.type === "getSegments") handleSegments(port, msg);
     // "ping" is ignored; receiving it just keeps the worker alive
   });
 });
@@ -206,6 +207,68 @@ function speakError(status, detail) {
   if (status === 503) return detail || "Audio isn't available — Piper TTS isn't installed on the server.";
   if (status === 504) return "Audio generation timed out. Try again.";
   return detail || ("Audio failed (server error " + status + ").");
+}
+
+async function handleSegments(port, msg) {
+  const { url } = msg;
+  const { serverUrl, token } = await getSettings();
+  if (!token) {
+    safePost(port, { type: "segError",
+      error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
+    return;
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CLIENT_TIMEOUT_MS);
+  let gotTerminal = false;
+  try {
+    const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/segments/stream", {
+      method: "POST", signal: ctrl.signal,
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({ url }),
+    });
+    if (!resp.ok) {
+      let detail = "";
+      try { detail = (await resp.json()).error || ""; } catch (_) {}
+      safePost(port, { type: "segError", error: httpError(resp.status, detail) });
+      return;
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch (_) { continue; }
+        if (ev.type === "progress") {
+          safePost(port, { type: "segProgress", message: ev.message, percent: ev.percent });
+        } else if (ev.type === "segments") {
+          gotTerminal = true;
+          safePost(port, { type: "segments", segments: ev.segments, title: ev.title });
+        } else if (ev.type === "error") {
+          gotTerminal = true;
+          safePost(port, { type: "segError", error: httpError(ev.status, ev.error) });
+        }
+      }
+    }
+    if (!gotTerminal) {
+      safePost(port, { type: "segError", error: "The segment stream ended unexpectedly. Try again." });
+    }
+  } catch (e) {
+    if (e.name === "AbortError") {
+      safePost(port, { type: "segError", error: "Finding key moments timed out. Try again." });
+    } else {
+      safePost(port, { type: "segError", error: "Can't reach the tldw server. Is it running?  tldw serve" });
+    }
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function safePost(port, msg) {

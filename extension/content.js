@@ -18,10 +18,13 @@
   let requestActive = false;
   const CREEP_CEILING = 96;  // never park at 99; result snaps it to done
 
-  // Audio (text-to-speech) state.
+  // Audio (text-to-speech) + segment-skip state. `busy` guards either operation.
   let audioPort = null, audioPing = null, audioSafety = null;
-  let audioActive = false;
+  let segPort = null, segPing = null, segSafety = null;
+  let busy = false;
   let lastPayload = null;
+  // Skip-playback engine state.
+  let skipVideo = null, skipSegs = null, skipIdx = 0, skipHandler = null;
   // Curated voices (kept in sync with server audio.VOICES; server validates anyway).
   const VOICE_OPTIONS = [
     { id: "amy", label: "Amy — female (US)" },
@@ -159,6 +162,8 @@
   function close() {
     clearTimers();
     teardownAudio();                  // tear down any in-flight TTS request + ping
+    teardownSeg();                    // and any in-flight segment fetch (NOT the
+                                      // skip engine, which runs after the modal closes)
     requestActive = false;            // suppress late port errors after a manual close
     if (port) { try { port.disconnect(); } catch (_) {} port = null; }
     document.removeEventListener("keydown", onKey, true);
@@ -265,6 +270,7 @@
         <a href="${esc(p.source_url)}" target="_blank" rel="noopener noreferrer">original</a></div>
       <h1 style="margin-bottom:10px">${esc(p.title)}</h1>
       <div class="audiorow">
+        <button class="playkey" aria-label="Play just the key moments in the YouTube player">⏭ Play key moments</button>
         <button class="listen" aria-label="Generate spoken audio of this summary">🔊 Listen to summary</button>
         <select class="voice" aria-label="Voice"></select>
         <svg class="circ" viewBox="0 0 36 36" width="20" height="20" aria-hidden="true">
@@ -286,6 +292,7 @@
     };
     setupVoiceSelect();
     root.querySelector(".listen").onclick = requestAudio;
+    root.querySelector(".playkey").onclick = requestSegments;
   }
 
   function setupVoiceSelect() {
@@ -300,8 +307,8 @@
   }
 
   function requestAudio() {
-    if (audioActive || !lastPayload) return;            // re-entrancy guard
-    audioActive = true;
+    if (busy || !lastPayload) return;            // re-entrancy guard
+    busy = true;
     const btn = root.querySelector(".listen");
     const sel = root.querySelector(".voice");
     const status = root.querySelector(".audiostatus");
@@ -312,18 +319,18 @@
     audioPort = chrome.runtime.connect({ name: "tldw" });
     audioPing = setInterval(() => { try { audioPort.postMessage({ type: "ping" }); } catch (_) {} }, 20000);
     audioPort.onMessage.addListener((m) => {
-      if (!audioActive) return;
+      if (!busy) return;
       if (m.type === "speakProgress") { updateAudioStatus(m.message, m.percent); return; }
       if (m.type === "audio") { teardownAudio(); finishAudioUI(); renderAudio(m.dataUrl); }
       else if (m.type === "speakError") { teardownAudio(); finishAudioUI(); showAudioError(m.error); }
     });
     audioPort.onDisconnect.addListener(() => {
-      if (!audioActive) return;
+      if (!busy) return;
       teardownAudio(); finishAudioUI();
       showAudioError("Lost connection to the worker. Try again.");
     });
     audioSafety = setTimeout(() => {
-      if (!audioActive) return;
+      if (!busy) return;
       teardownAudio(); finishAudioUI();
       showAudioError("Audio is taking too long. Make sure `tldw serve` is running.");
     }, 185000);
@@ -334,7 +341,7 @@
   }
 
   function teardownAudio() {
-    audioActive = false;
+    busy = false;
     if (audioPing) { clearInterval(audioPing); audioPing = null; }
     if (audioSafety) { clearTimeout(audioSafety); audioSafety = null; }
     if (audioPort) { try { audioPort.disconnect(); } catch (_) {} audioPort = null; }
@@ -347,13 +354,150 @@
   }
 
   function finishAudioUI() {
-    const btn = root && root.querySelector(".listen");
+    const listen = root && root.querySelector(".listen");
+    const play = root && root.querySelector(".playkey");
     const sel = root && root.querySelector(".voice");
     const status = root && root.querySelector(".audiostatus");
-    if (btn) btn.disabled = false;
+    if (listen) listen.disabled = false;
+    if (play) play.disabled = false;
     if (sel) sel.disabled = false;
     if (status) status.textContent = "";
     hideCircle();
+  }
+
+  // --- Play key moments: fetch segment timestamps, then skip the YouTube player ---
+
+  function requestSegments() {
+    if (busy) return;
+    busy = true;
+    const listen = root.querySelector(".listen");
+    const play = root.querySelector(".playkey");
+    const sel = root.querySelector(".voice");
+    const status = root.querySelector(".audiostatus");
+    status.classList.remove("audioerr");
+    if (listen) listen.disabled = true;
+    if (play) play.disabled = true;
+    if (sel) sel.disabled = true;
+    status.textContent = "Finding key moments…";
+    setCircle(null);
+    segPort = chrome.runtime.connect({ name: "tldw" });
+    segPing = setInterval(() => { try { segPort.postMessage({ type: "ping" }); } catch (_) {} }, 20000);
+    segPort.onMessage.addListener((m) => {
+      if (!busy) return;
+      if (m.type === "segProgress") { updateAudioStatus(m.message, m.percent); return; }
+      if (m.type === "segments") { teardownSeg(); finishAudioUI(); startSkip(m.segments); }
+      else if (m.type === "segError") { teardownSeg(); finishAudioUI(); showAudioError(m.error); }
+    });
+    segPort.onDisconnect.addListener(() => {
+      if (!busy) return;
+      teardownSeg(); finishAudioUI();
+      showAudioError("Lost connection to the worker. Try again.");
+    });
+    segSafety = setTimeout(() => {
+      if (!busy) return;
+      teardownSeg(); finishAudioUI();
+      showAudioError("Finding key moments is taking too long. Is `tldw serve` running?");
+    }, 90000);
+    segPort.postMessage({
+      type: "getSegments",
+      url: (lastPayload && lastPayload.source_url) || location.href,
+    });
+  }
+
+  function teardownSeg() {
+    busy = false;
+    if (segPing) { clearInterval(segPing); segPing = null; }
+    if (segSafety) { clearTimeout(segSafety); segSafety = null; }
+    if (segPort) { try { segPort.disconnect(); } catch (_) {} segPort = null; }
+  }
+
+  function startSkip(segments) {
+    const video = document.querySelector("video.html5-main-video")
+      || document.querySelector("video");
+    if (!video || !segments || !segments.length) {
+      showAudioError("Couldn't find the YouTube player to control.");
+      return;
+    }
+    stopSkip();                                   // clear any prior session
+    skipVideo = video;
+    skipSegs = segments.slice().sort((a, b) => a.start - b.start);
+    skipIdx = 0;
+    close();                                       // close the modal so you can watch
+    skipHandler = onSkipTick;
+    video.addEventListener("timeupdate", skipHandler);
+    showPill();
+    try { video.currentTime = skipSegs[0].start; video.play(); } catch (_) {}
+    updatePill();
+  }
+
+  function onSkipTick() {
+    if (!skipVideo || !skipSegs) return;
+    const seg = skipSegs[skipIdx];
+    if (!seg) return;
+    if (skipVideo.currentTime >= seg.end - 0.05) {  // reached this segment's end
+      if (skipIdx + 1 < skipSegs.length) {
+        skipIdx += 1;
+        try { skipVideo.currentTime = skipSegs[skipIdx].start; } catch (_) {}
+        updatePill();
+      } else {
+        try { skipVideo.pause(); } catch (_) {}
+        finishSkip();
+      }
+    }
+  }
+
+  function stopSkip() {
+    if (skipVideo && skipHandler) skipVideo.removeEventListener("timeupdate", skipHandler);
+    skipHandler = skipVideo = skipSegs = null;
+    skipIdx = 0;
+    removePill();
+  }
+
+  function finishSkip() {
+    if (skipVideo && skipHandler) skipVideo.removeEventListener("timeupdate", skipHandler);
+    skipHandler = skipVideo = skipSegs = null;
+    skipIdx = 0;
+    const pill = document.getElementById("tldw-pill");
+    if (pill) {
+      const label = pill.querySelector(".pill-label");
+      if (label) label.textContent = "✓ Key moments done";
+      setTimeout(removePill, 4000);
+    }
+  }
+
+  function showPill() {
+    removePill();
+    const pill = document.createElement("div");
+    pill.id = "tldw-pill";
+    pill.style.cssText =
+      "position:fixed;z-index:2147483647;bottom:84px;left:50%;transform:translateX(-50%);" +
+      "background:#1e1f24;color:#e9e9ea;font:14px system-ui,-apple-system,sans-serif;" +
+      "padding:8px 14px;border-radius:999px;box-shadow:0 6px 24px rgba(0,0,0,.45);" +
+      "display:flex;align-items:center;gap:12px;";
+    const label = document.createElement("span");
+    label.className = "pill-label";
+    const stop = document.createElement("button");
+    stop.textContent = "✕";
+    stop.setAttribute("aria-label", "Stop skipping");
+    stop.style.cssText = "all:unset;cursor:pointer;padding:0 4px;color:#e9e9ea;";
+    stop.onclick = stopSkip;
+    pill.appendChild(label);
+    pill.appendChild(stop);
+    (document.fullscreenElement || document.body).appendChild(pill);
+  }
+
+  function updatePill() {
+    const pill = document.getElementById("tldw-pill");
+    if (!pill || !skipSegs) return;
+    const seg = skipSegs[skipIdx];
+    const label = pill.querySelector(".pill-label");
+    if (label) label.textContent =
+      `⏭ Key moment ${skipIdx + 1}/${skipSegs.length} · ${seg.label}`;
+  }
+
+  function removePill() {
+    const pill = document.getElementById("tldw-pill");
+    if (pill && pill.parentNode) pill.parentNode.removeChild(pill);
   }
 
   function setCircle(percent) {

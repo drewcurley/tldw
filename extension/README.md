@@ -27,6 +27,10 @@ appears in a modal on the page.
 - **🔊 Listen to summary** synthesizes the summary to speech (local Piper TTS) and
   plays it in the modal. Pick a voice (US/UK, male/female) right there or set a
   default in options. First use of a voice downloads its model (~once).
+- **⏭ Play key moments** finds the key segments (transcript + Claude — no download,
+  no recut) and **auto-skips the YouTube player through just those moments**, in full
+  quality in your own player. A floating pill shows progress (e.g. "Key moment 2/5")
+  with a ✕ to stop.
 
 ## How it stays local & safe
 

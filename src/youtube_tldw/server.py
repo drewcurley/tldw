@@ -35,7 +35,7 @@ from . import (
 from . import metadata as md
 from . import audio, core, textmode
 from .summarize import SINGLE_PASS_CHARS
-from .timing import format_length
+from .timing import format_length, parse_duration
 
 MAX_BODY_BYTES = 16 * 1024
 MAX_SPEAK_BYTES = 64 * 1024   # /speak carries the summary text
@@ -141,7 +141,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
         speak = path in ("/speak", "/speak/stream")
-        if path not in ("/summarize", "/summarize/stream") and not speak:
+        if path not in ("/summarize", "/summarize/stream", "/segments/stream") and not speak:
             self._send_json(404, {"error": "not found"})
             return
         if not self._authorized():
@@ -164,6 +164,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._run_speak(body, stream=True)
             elif path == "/summarize/stream":
                 self._run_stream(*parsed)
+            elif path == "/segments/stream":
+                self._run_segments(*parsed, body)
             else:
                 self._run_buffered(*parsed)
         finally:
@@ -282,6 +284,47 @@ class _Handler(BaseHTTPRequestHandler):
         script = audio.build_spoken_script(body["title"], body["channel"], kp,
                                            body["summary"])
         return script, voice
+
+    def _run_segments(self, url, ratio, lang, body: dict) -> None:
+        """Stream progress, then the key source time-spans for in-player skipping."""
+        max_ms = None
+        ml = body.get("max_length")
+        if isinstance(ml, str) and ml.strip():
+            try:
+                max_ms = parse_duration(ml)
+            except TldrError:
+                pass  # ignore an unparseable cap rather than failing the request
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self._cors_headers()
+        self.end_headers()
+        start = time.monotonic()
+        tlog = self._logger(start)
+
+        def emit(obj):
+            self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
+            self.wfile.flush()
+
+        def progress(m, pct=None):
+            tlog(m)
+            emit({"type": "progress", "message": m, "percent": pct})
+
+        try:
+            meta, segments = core.select_segments(
+                url, ratio, lang, max_length_ms=max_ms,
+                timeout=REQUEST_TIMEOUT, on_progress=progress)
+        except TldrError as exc:
+            status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
+            print(f"  segments failed ({status}) in {time.monotonic()-start:.1f}s: {exc}",
+                  flush=True)
+            emit({"type": "error", "status": status, "error": str(exc)})
+            return
+        print(f"  {len(segments)} key segments for '{meta.title}' "
+              f"in {time.monotonic()-start:.1f}s", flush=True)
+        emit({"type": "segments", "segments": segments, "title": meta.title,
+              "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
 
     def _run_speak(self, body: dict, *, stream: bool) -> None:
         parsed = self._validate_speak(body)

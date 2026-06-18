@@ -182,6 +182,25 @@ def test_summarize_stream_error_is_in_band(srv, monkeypatch):
     assert events[-1] == {"type": "error", "status": 422, "error": "no captions"}
 
 
+def test_segments_stream(srv, monkeypatch):
+    _, port = srv
+
+    def fake_seg(url, ratio, lang, *, max_length_ms=None, timeout=None, on_progress=None):
+        if on_progress:
+            on_progress("selecting the key moments…", 22)
+        meta = VideoMeta("dQw4w9WgXcQ", "Cool Title", "Chan", 600_000, {}, {})
+        return meta, [{"start": 1.0, "end": 3.5, "label": "0:01"},
+                      {"start": 12.0, "end": 18.0, "label": "0:12"}]
+
+    monkeypatch.setattr(server.core, "select_segments", fake_seg)
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"},
+                          _auth(), path="/segments/stream")
+    assert [e["type"] for e in events] == ["progress", "segments"]
+    final = events[-1]
+    assert final["title"] == "Cool Title"
+    assert final["segments"][0] == {"start": 1.0, "end": 3.5, "label": "0:01"}
+
+
 def test_voices_endpoint_no_auth(srv):
     _, port = srv
     status, payload, _ = _req(port, "GET", "/voices")
