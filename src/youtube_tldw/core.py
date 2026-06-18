@@ -8,6 +8,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from . import TranscriptTooLongError
 from . import metadata as md
@@ -30,20 +31,29 @@ def summarize_url(
     *,
     timeout: float = 300.0,
     max_chars: int | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> Summary:
     """Fetch a video's transcript and summarize it. Raises the typed TldrError
     subclasses (BadUrl/NoTranscript/TranscriptTooLong/Claude/Timeout).
 
     `max_chars`: if set, reject transcripts that would trigger map-reduce (the
     browser flow uses this so a click never blocks for minutes).
+    `on_progress`: optional callback for human-readable step messages.
     """
+    log = on_progress or (lambda _m: None)
     video_id = canonical_video_id(url)  # BadUrlError
+    log(f"video {video_id}: fetching metadata…")
     workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-core-"))
     try:
         meta = md.fetch_metadata(video_id)
         lang_key, is_auto = md.choose_track(meta, lang)  # NoTranscriptError
+        kind = "auto-captions" if is_auto else "subtitles"
+        log(f"“{meta.title}” by {meta.channel} ({format_dur(meta.duration_ms)}) "
+            f"— using {kind} ({lang_key})")
         content = md.download_subtitle(video_id, lang_key, is_auto, workdir)
         cues = transcript.parse_subtitles(content)  # NoTranscriptError
+        words = sum(len(c.text.split()) for c in cues)
+        log(f"parsed {len(cues)} cues, {words} words")
         if max_chars is not None:
             chars = sum(len(c.text) + 1 for c in cues)
             if chars > max_chars:
@@ -51,9 +61,15 @@ def summarize_url(
                     "This transcript is too long for the browser flow; "
                     "use the `tldw` CLI for very long videos."
                 )
+        log("summarizing with Claude (this can take 30-90s for a long video)…")
         result = summarize.summarize_text(
             cues, meta.channel, meta.title, ratio, timeout=timeout
         )
         return Summary(meta, result, len(cues))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def format_dur(ms: int) -> str:
+    from .timing import format_length
+    return format_length(ms)

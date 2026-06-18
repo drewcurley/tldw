@@ -12,6 +12,7 @@
   let stageTimer = null;
   let port = null;
   let safetyTimer = null;
+  let pingTimer = null;
   let requestActive = false;
 
   const esc = (s) =>
@@ -108,8 +109,7 @@
   }
 
   function close() {
-    if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
-    if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
+    clearTimers();
     requestActive = false;            // suppress late port errors after a manual close
     if (port) { try { port.disconnect(); } catch (_) {} port = null; }
     document.removeEventListener("keydown", onKey, true);
@@ -134,6 +134,11 @@
       showError("Lost connection to the extension worker. Click TL;DW to try again.");
     });
     port.postMessage({ type: "summarize", url, videoId });
+    // Heartbeat: the page never suspends, so pinging every 20s keeps the MV3 service
+    // worker alive through a long (60s+) summarize that would otherwise be killed.
+    pingTimer = setInterval(() => {
+      try { port.postMessage({ type: "ping" }); } catch (_) {}
+    }, 20000);
     safetyTimer = setTimeout(() => {
       if (!requestActive) return;
       requestActive = false;
@@ -153,6 +158,7 @@
   function clearTimers() {
     if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
     if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
   }
 
   function showError(msg) {

@@ -187,10 +187,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid lang"})
             return
         start = time.monotonic()
+        progress = lambda m: print(f"  [{time.monotonic()-start:5.1f}s] {m}", flush=True)
         try:
             summary = core.summarize_url(
                 body["url"], ratio, lang,
                 timeout=REQUEST_TIMEOUT, max_chars=SINGLE_PASS_CHARS,
+                on_progress=progress,
             )
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
