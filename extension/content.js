@@ -109,6 +109,15 @@
         .audiostatus { font-size: 12px; color: #888; }
         .audiostatus.audioerr { color: #c0392b; }
         .audioslot audio { width: 100%; margin-bottom: 12px; }
+        .circ { flex: 0 0 auto; }
+        .circ.indet { animation: circspin 0.9s linear infinite; }
+        .circ-bg { fill: none; stroke: rgba(128,128,128,.25); stroke-width: 4; }
+        .circ-fg { fill: none; stroke: #c00; stroke-width: 4; stroke-linecap: round;
+          transform: rotate(-90deg); transform-origin: 50% 50%;
+          stroke-dasharray: 97.4; stroke-dashoffset: 97.4;
+          transition: stroke-dashoffset .4s ease; }
+        .circ.indet .circ-fg { stroke-dasharray: 24 74; stroke-dashoffset: 0; transition: none; }
+        @keyframes circspin { to { transform: rotate(360deg); } }
       </style>
       <div class="backdrop" part="backdrop">
         <div class="panel" role="dialog" aria-modal="true" aria-labelledby="tldw-h" tabindex="-1">
@@ -257,6 +266,10 @@
       <div class="audiorow">
         <button class="listen" aria-label="Generate spoken audio of this summary">🔊 Listen to summary</button>
         <select class="voice" aria-label="Voice"></select>
+        <svg class="circ" viewBox="0 0 36 36" width="20" height="20" aria-hidden="true" hidden>
+          <circle class="circ-bg" cx="18" cy="18" r="15.5"></circle>
+          <circle class="circ-fg" cx="18" cy="18" r="15.5"></circle>
+        </svg>
         <span class="audiostatus" aria-live="polite"></span>
       </div>
       <div class="audioslot"></div>
@@ -294,11 +307,12 @@
     status.classList.remove("audioerr");
     btn.disabled = true; if (sel) sel.disabled = true;
     status.textContent = "Starting…";
+    setCircle(null);                                    // indeterminate until first %
     audioPort = chrome.runtime.connect({ name: "tldw" });
     audioPing = setInterval(() => { try { audioPort.postMessage({ type: "ping" }); } catch (_) {} }, 20000);
     audioPort.onMessage.addListener((m) => {
       if (!audioActive) return;
-      if (m.type === "speakProgress") { updateAudioStatus(m.message); return; }  // not terminal
+      if (m.type === "speakProgress") { updateAudioStatus(m.message, m.percent); return; }
       if (m.type === "audio") { teardownAudio(); finishAudioUI(); renderAudio(m.dataUrl); }
       else if (m.type === "speakError") { teardownAudio(); finishAudioUI(); showAudioError(m.error); }
     });
@@ -325,9 +339,10 @@
     if (audioPort) { try { audioPort.disconnect(); } catch (_) {} audioPort = null; }
   }
 
-  function updateAudioStatus(msg) {
+  function updateAudioStatus(msg, percent) {
     const status = root && root.querySelector(".audiostatus");
     if (status) { status.classList.remove("audioerr"); status.textContent = msg; }
+    setCircle(typeof percent === "number" ? percent : null);
   }
 
   function finishAudioUI() {
@@ -337,6 +352,27 @@
     if (btn) btn.disabled = false;
     if (sel) sel.disabled = false;
     if (status) status.textContent = "";
+    hideCircle();
+  }
+
+  function setCircle(percent) {
+    const svg = root && root.querySelector(".circ");
+    const fg = root && root.querySelector(".circ-fg");
+    if (!svg || !fg) return;
+    svg.hidden = false;
+    if (typeof percent === "number") {
+      svg.classList.remove("indet");
+      const C = 97.4;  // 2π·15.5
+      const p = Math.max(0, Math.min(100, percent));
+      fg.style.strokeDashoffset = (C * (1 - p / 100)).toFixed(1);
+    } else {
+      svg.classList.add("indet");  // spin while we have no real percentage
+    }
+  }
+
+  function hideCircle() {
+    const svg = root && root.querySelector(".circ");
+    if (svg) { svg.hidden = true; svg.classList.remove("indet"); }
   }
 
   function renderAudio(dataUrl) {

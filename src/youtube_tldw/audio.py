@@ -7,11 +7,28 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+import threading
 import time
+import wave
 from pathlib import Path
 
 from . import TldrError
 from .proc import run
+
+_voice_cache = {}            # model path -> loaded PiperVoice (load is ~1-2s)
+_voice_lock = threading.Lock()
+_SENT = re.compile(r"[.!?]+(?:\s|$)")
+
+
+def _load_voice(model_path: Path):
+    key = str(model_path)
+    with _voice_lock:
+        voice = _voice_cache.get(key)
+        if voice is None:
+            from piper import PiperVoice  # lazy: avoid onnxruntime import until needed
+            voice = PiperVoice.load(key)
+            _voice_cache[key] = voice
+        return voice
 
 # Curated natural Piper voices (all verified in piper's voices.json), downloaded on
 # first use. id -> (model, label). The model is a server-side constant — the caller's
@@ -131,16 +148,29 @@ def synthesize_speech(
     text: str, out_mp3: Path, voice_id: str, workdir: Path, *, timeout: float = 120,
     on_progress=None,
 ) -> None:
-    """Synthesize `text` to speech with Piper, then encode to mp3."""
-    log = on_progress or (lambda _m: None)
+    """Synthesize `text` to speech with Piper (in-process, for per-sentence progress),
+    then encode to mp3. on_progress is called (message, percent|None)."""
+    log = on_progress or (lambda _m, _p=None: None)
     require_piper()
-    log("preparing voice…")
+    log("preparing voice…", None)
     model = ensure_voice(voice_id, on_progress=on_progress)
+    log("loading voice…", None)
+    voice = _load_voice(VOICE_DIR / f"{model}.onnx")
+
+    n = max(1, len([s for s in _SENT.split(text) if s.strip()]))  # sentence count
+    log("synthesizing speech…", 0)
+    frames, sr, sw, ch = [], 22050, 2, 1
+    for i, chunk in enumerate(voice.synthesize(text)):   # one chunk per sentence
+        frames.append(chunk.audio_int16_bytes)
+        sr, sw, ch = chunk.sample_rate, chunk.sample_width, chunk.sample_channels
+        done = min(1.0, (i + 1) / n)
+        log(f"synthesizing speech… {round(done * 100)}%", min(95, round(done * 95)))
+
     wav = workdir / "speech.wav"
-    log("synthesizing speech…")
-    run([sys.executable, "-m", "piper", "-m", model, "--data-dir", str(VOICE_DIR),
-         "-f", str(wav)], stdin=text, timeout=timeout)
-    log("encoding mp3…")
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(ch); w.setsampwidth(sw); w.setframerate(sr)
+        w.writeframes(b"".join(frames))
+    log("encoding mp3…", 97)
     run(["ffmpeg", "-y", "-i", str(wav), "-c:a", "libmp3lame", "-q:a", "2",
          str(out_mp3)], timeout=timeout)
     if not out_mp3.exists():

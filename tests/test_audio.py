@@ -61,27 +61,37 @@ def test_extract_audio_missing_raises(monkeypatch, tmp_path):
         audio.extract_audio(tmp_path / "v.mp4", tmp_path / "a.mp3")
 
 
-def test_synthesize_speech_uses_piper_then_ffmpeg(monkeypatch, tmp_path):
-    calls = []
+class _FakeChunk:
+    audio_int16_bytes = b"\x00\x00"
+    sample_rate = 22050
+    sample_width = 2
+    sample_channels = 1
 
-    def fake_run(argv, **kw):
-        calls.append((argv, kw.get("stdin")))
-        if "-f" in argv:  # piper writes the wav
-            Path(argv[argv.index("-f") + 1]).write_bytes(b"\x00")
-        if argv[0] == "ffmpeg":  # ffmpeg writes the mp3
-            Path(argv[-1]).write_bytes(b"\x00")
 
-    monkeypatch.setattr(audio, "run", fake_run)
+class _FakeVoice:
+    def synthesize(self, text):
+        return [_FakeChunk(), _FakeChunk(), _FakeChunk()]
+
+
+def test_synthesize_speech_inprocess_with_progress(monkeypatch, tmp_path):
     monkeypatch.setattr(audio, "require_piper", lambda: None)
     monkeypatch.setattr(audio, "ensure_voice", lambda v, **k: "en_US-amy-medium")
+    monkeypatch.setattr(audio, "_load_voice", lambda p: _FakeVoice())
+    ff = []
+    monkeypatch.setattr(audio, "run",
+                        lambda argv, **kw: (ff.append(argv), Path(argv[-1]).write_bytes(b"\x00")))
+    prog = []
     out = tmp_path / "out.mp3"
-    audio.synthesize_speech("hello world", out, "female", tmp_path)
+    audio.synthesize_speech("One. Two. Three.", out, "amy", tmp_path,
+                            on_progress=lambda m, p=None: prog.append((m, p)))
 
-    piper_argv, stdin = calls[0]
-    assert "piper" in piper_argv and "-m" in piper_argv
-    assert stdin == "hello world"           # text piped, never argv
-    assert calls[1][0][0] == "ffmpeg" and "libmp3lame" in calls[1][0]
+    assert (tmp_path / "speech.wav").exists()          # wav assembled from chunks
+    assert ff and ff[0][0] == "ffmpeg" and "libmp3lame" in ff[0]
     assert out.exists()
+    # per-sentence synth percentages reported, increasing, capped at 95
+    synth = [p for m, p in prog if "synthesizing" in m and isinstance(p, int)]
+    assert synth and synth == sorted(synth) and synth[-1] <= 95
+    assert any(p is None for m, p in prog)             # preparing/loading are indeterminate
 
 
 def test_ensure_voice_downloads_when_missing(monkeypatch, tmp_path):

@@ -304,11 +304,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
                 self.wfile.flush()
 
-            def progress(m):
+            def progress(m, pct=None):
                 tlog(m)
-                emit({"type": "progress", "message": m})
+                emit({"type": "progress", "message": m, "percent": pct})
         else:
-            def progress(m):
+            def progress(m, pct=None):
                 tlog(m)
 
         try:

@@ -172,7 +172,7 @@ async function handleSpeak(port, msg) {
         let ev;
         try { ev = JSON.parse(line); } catch (_) { continue; }
         if (ev.type === "progress") {
-          safePost(port, { type: "speakProgress", message: ev.message });
+          safePost(port, { type: "speakProgress", message: ev.message, percent: ev.percent });
         } else if (ev.type === "audio") {
           gotTerminal = true;
           const dataUrl = "data:audio/mpeg;base64," + ev.mp3_base64;
