@@ -40,20 +40,20 @@ def summarize_url(
     browser flow uses this so a click never blocks for minutes).
     `on_progress`: optional callback for human-readable step messages.
     """
-    log = on_progress or (lambda _m: None)
+    log = on_progress or (lambda _m, _p=None: None)
     video_id = canonical_video_id(url)  # BadUrlError
-    log(f"video {video_id}: fetching metadata…")
+    log(f"video {video_id}: fetching metadata…", 3)
     workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-core-"))
     try:
         meta = md.fetch_metadata(video_id)
         lang_key, is_auto = md.choose_track(meta, lang)  # NoTranscriptError
         kind = "auto-captions" if is_auto else "subtitles"
         log(f"“{meta.title}” by {meta.channel} ({format_dur(meta.duration_ms)}) "
-            f"— using {kind} ({lang_key})")
+            f"— using {kind} ({lang_key})", 7)
         content = md.download_subtitle(video_id, lang_key, is_auto, workdir)
         cues = transcript.parse_subtitles(content)  # NoTranscriptError
         words = sum(len(c.text.split()) for c in cues)
-        log(f"parsed {len(cues)} cues, {words} words")
+        log(f"parsed {len(cues)} cues, {words} words", 13)
         if max_chars is not None:
             chars = sum(len(c.text) + 1 for c in cues)
             if chars > max_chars:
@@ -61,7 +61,9 @@ def summarize_url(
                     "This transcript is too long for the browser flow; "
                     "use the `tldw` CLI for very long videos."
                 )
-        log("summarizing with Claude (this can take 30-90s for a long video)…")
+        # The long step owns ~80% of the bar: it starts at 15% and the client eases
+        # it forward toward ~96% until the result lands.
+        log("summarizing with Claude (this can take 30-90s for a long video)…", 15)
         result = summarize.summarize_text(
             cues, meta.channel, meta.title, ratio, timeout=timeout
         )

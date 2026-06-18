@@ -13,7 +13,10 @@
   let port = null;
   let safetyTimer = null;
   let pingTimer = null;
+  let creepTimer = null;
+  let progressPct = 0;
   let requestActive = false;
+  const CREEP_CEILING = 96;  // never park at 99; result snaps it to done
 
   const esc = (s) =>
     String(s).replace(/[&<>"']/g, (c) =>
@@ -70,11 +73,11 @@
           display: inline-block; vertical-align: middle; margin-right: 8px; }
         @keyframes spin { to { transform: rotate(360deg); } }
         .status { font-size: 15px; padding: 26px 4px; }
-        .bar { height: 4px; background: rgba(128,128,128,.2); border-radius: 2px;
+        .bar { height: 7px; background: rgba(128,128,128,.2); border-radius: 4px;
           overflow: hidden; margin-top: 18px; }
-        .bar .fill { height: 100%; width: 35%; background: #c00; border-radius: 2px;
-          animation: slide 1.1s linear infinite; }
-        @keyframes slide { from { margin-left: -35%; } to { margin-left: 100%; } }
+        .bar .fill { height: 100%; width: 0%; background: #c00; border-radius: 4px;
+          transition: width .5s ease; }
+        .pct { font-size: 12px; color: #888; margin-top: 6px; text-align: right; }
         .err { color: #c0392b; } .err code { background: rgba(128,128,128,.15);
           padding: 1px 6px; border-radius: 5px; }
       </style>
@@ -129,7 +132,7 @@
     port = chrome.runtime.connect({ name: "tldw" });
     port.onMessage.addListener((m) => {
       if (!requestActive) return;
-      if (m.type === "progress") { updateProgress(m.message); return; }  // not terminal
+      if (m.type === "progress") { updateProgress(m.message, m.percent); return; }
       requestActive = false;
       if (m.type === "result") showResult(m.payload, m.cached);
       else if (m.type === "error") showError(m.error);
@@ -154,22 +157,50 @@
 
   function showLoading() {
     const c = mount();
+    progressPct = 0;
     c.innerHTML = `
       <div class="status">
         <div><span class="spinner"></span><span class="msg">Starting…</span></div>
         <div class="bar"><div class="fill"></div></div>
+        <div class="pct">0%</div>
       </div>`;
   }
 
-  function updateProgress(msg) {
+  function updateProgress(msg, pct) {
     const el = root && root.querySelector(".status .msg");
     if (el) el.textContent = msg;
+    if (typeof pct === "number") setProgress(pct);
+  }
+
+  function setProgress(target) {
+    progressPct = Math.max(progressPct, target);
+    applyWidth();
+    startCreep();  // keep inching forward toward the ceiling during long steps
+  }
+
+  function applyWidth() {
+    if (!root) return;
+    const fill = root.querySelector(".bar .fill");
+    const pct = root.querySelector(".pct");
+    if (fill) fill.style.width = progressPct.toFixed(1) + "%";
+    if (pct) pct.textContent = Math.round(progressPct) + "%";
+  }
+
+  function startCreep() {
+    if (creepTimer) return;
+    creepTimer = setInterval(() => {
+      if (progressPct < CREEP_CEILING) {
+        progressPct += (CREEP_CEILING - progressPct) * 0.045;  // ease-out, never stalls
+        applyWidth();
+      }
+    }, 600);
   }
 
   function clearTimers() {
     if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
     if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    if (creepTimer) { clearInterval(creepTimer); creepTimer = null; }
   }
 
   function showError(msg) {

@@ -89,7 +89,7 @@ chrome.runtime.onConnect.addListener((port) => {
           let ev;
           try { ev = JSON.parse(line); } catch (_) { continue; }
           if (ev.type === "progress") {
-            safePost(port, { type: "progress", message: ev.message });
+            safePost(port, { type: "progress", message: ev.message, percent: ev.percent });
           } else if (ev.type === "result") {
             gotTerminal = true;
             if (videoId) cache.set(videoId, ev);

@@ -192,7 +192,7 @@ class _Handler(BaseHTTPRequestHandler):
         return body["url"], ratio, lang
 
     def _logger(self, start: float):
-        return lambda m: print(f"  [{time.monotonic()-start:5.1f}s] {m}", flush=True)
+        return lambda m, pct=None: print(f"  [{time.monotonic()-start:5.1f}s] {m}", flush=True)
 
     def _run_buffered(self, url, ratio, lang) -> None:
         start = time.monotonic()
@@ -223,9 +223,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
             self.wfile.flush()
 
-        def progress(m):
+        def progress(m, pct=None):
             tlog(m)
-            emit({"type": "progress", "message": m})
+            emit({"type": "progress", "message": m, "percent": pct})
 
         try:
             summary = core.summarize_url(
