@@ -19,6 +19,7 @@ import shlex
 from typing import Callable
 
 from . import ClaudeError, TldrError, TldrTimeoutError
+from . import config
 from .proc import run
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -54,8 +55,11 @@ def _raw_extract(stdout: str) -> str:
 
 
 def _backend() -> tuple[list[str], Callable[[str], str]]:
-    """(argv, extractor) for the configured backend. argv reads the prompt on stdin."""
-    cmd = os.environ.get("TLDW_LLM_CMD", "").strip()
+    """(argv, extractor) for the configured backend. argv reads the prompt on stdin.
+
+    Backend resolution: TLDW_LLM_CMD env > `tldw config` llm_cmd > the `claude` CLI.
+    """
+    cmd = (os.environ.get("TLDW_LLM_CMD") or config.get("llm_cmd") or "").strip()
     if cmd:
         return shlex.split(cmd), _raw_extract
     return ["claude", "-p", "--output-format", "json"], _extract_result_text

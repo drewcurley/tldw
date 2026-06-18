@@ -65,6 +65,7 @@ def test_empty_result_raises(monkeypatch):
 
 def test_default_backend_is_claude_envelope(monkeypatch):
     monkeypatch.delenv("TLDW_LLM_CMD", raising=False)
+    monkeypatch.setattr(claude_client.config, "get", lambda *a, **k: None)
     captured = {}
 
     def fake_run(argv, **kw):
@@ -77,6 +78,22 @@ def test_default_backend_is_claude_envelope(monkeypatch):
     assert out == {"ok": 2}
     assert captured["argv"][0] == "claude" and "--output-format" in captured["argv"]
     assert "PROMPT" in captured["stdin"] and "DATA" in captured["stdin"]  # both on stdin
+
+
+def test_config_backend_used_when_no_env(monkeypatch):
+    monkeypatch.delenv("TLDW_LLM_CMD", raising=False)
+    monkeypatch.setattr(claude_client.config, "get",
+                        lambda k, d=None: "mycli --json" if k == "llm_cmd" else d)
+    captured = {}
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        return ProcResult(0, '{"ok": 9}', "")
+
+    monkeypatch.setattr(claude_client, "run", fake_run)
+    out = claude_client.ask_json("P", "D", validate=lambda d: d)
+    assert out == {"ok": 9}
+    assert captured["argv"] == ["mycli", "--json"]   # config backend, raw stdout
 
 
 def test_custom_backend_raw_stdout(monkeypatch):

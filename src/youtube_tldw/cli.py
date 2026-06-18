@@ -247,7 +247,7 @@ def run(args: argparse.Namespace) -> int:
     if args.llm_cmd:
         os.environ["TLDW_LLM_CMD"] = args.llm_cmd
     required = ["yt-dlp", "ffmpeg", "ffprobe"]
-    if not (args.llm_cmd or os.environ.get("TLDW_LLM_CMD")):
+    if not (args.llm_cmd or os.environ.get("TLDW_LLM_CMD") or config.get("llm_cmd")):
         required.append("claude")  # only needed for the default backend
     proc.require(*required)
     if args.render_audio and args.mode == "text":
@@ -291,6 +291,8 @@ def _run_config(args: list[str]) -> int:
         else:
             print("(no config set)")
         print(f"effective output-dir: {_default_output_dir()}")
+        backend = os.environ.get("TLDW_LLM_CMD") or config.get("llm_cmd")
+        print(f"effective model: {backend or 'claude CLI (default)'}")
         return 0
     if args[0] == "set" and len(args) >= 3:
         key = keymap.get(args[1], args[1].replace("-", "_"))

@@ -1,38 +1,37 @@
 # youtube-tldw
 
 Turn a YouTube video into a succinct **TL;DW** — either as Markdown text or as a
-recut MP4 of just the key moments — using the **`claude` CLI** (works with any Claude
-plan — Pro/Max/Team — or an Anthropic API key; no per-token billing on a subscription).
-You can also point it at **another model** (OpenAI, Gemini, local/Ollama) — see
-[Using other models](#using-other-models).
+recut MP4 of just the key moments.
+
+**Use any model you like** → [Choose your model](#choose-your-model):
+
+- **Local** (Ollama / any local server) — fully offline, no keys, no cost
+- **OpenAI / Gemini / Mistral / …** via one setting
+- **Claude** via the `claude` CLI (any Claude plan or API key) — the zero-config default
 
 ## How it works
 
 1. Validates the URL and pulls metadata + the best subtitle track with `yt-dlp`.
 2. Parses and de-duplicates the transcript (handles YouTube auto-caption
    "rolling" cues).
-3. Sends it to Claude via headless `claude -p`, which decides how aggressively to
-   compress based on the content.
+3. Sends it to **your model**, which decides how aggressively to compress.
 4. **text mode** → prints the TL;DW and saves a `.md`.
-   **video mode** → Claude picks the key cue ranges, `ffmpeg` cuts them from the
+   **video mode** → the model picks the key cue ranges, `ffmpeg` cuts them from the
    source and stitches them with crossfades (a deliberate visual signal that
    content was skipped), and saves an `.mp4`.
 
 ## Requirements
 
 - **Python 3.11+**
-- **`claude` CLI** — logged into any Claude plan (Pro/Max/Team) or with
-  `ANTHROPIC_API_KEY` set. Install from
-  [claude.com/claude-code](https://www.claude.com/product/claude-code) (or
-  `npm i -g @anthropic-ai/claude-code`), then run `claude` once to log in.
-  *(Or use a different model via [Using other models](#using-other-models) — then
-  `claude` isn't needed.)*
+- **A model backend** — see [Choose your model](#choose-your-model). The simplest are
+  a local model (Ollama) or any provider via the `llm` CLI; Claude is the default if
+  you have the `claude` CLI.
 - **`yt-dlp`** and **`ffmpeg`/`ffprobe`** on your `PATH`:
   - macOS: `brew install yt-dlp ffmpeg`
   - Linux: e.g. `sudo apt install ffmpeg` + `pipx install yt-dlp`
 
 Developed and tested on macOS; Linux should work the same. (The browser extension is
-Chromium-based — see [Browser extension](#browser-extension-text-only).)
+Chromium/Firefox — see [Browser extension](#browser-extension).)
 
 ## Install
 
@@ -48,6 +47,41 @@ pipx inject youtube-tldw piper-tts      # optional: text-to-speech voices
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[tts]"
 ```
+
+## Choose your model
+
+The summarizer just shells out to a command that **reads the prompt on stdin and prints
+the model's text on stdout** — so you can point it at anything. Set it once with
+`tldw config set llm-cmd "<command>"` (persists), or per run with `--llm-cmd`, or via the
+`TLDW_LLM_CMD` env var.
+
+**Local — fully offline, no keys, no cost** ([Ollama](https://ollama.com)):
+```bash
+ollama pull llama3.1
+tldw config set llm-cmd "ollama run llama3.1"
+```
+
+**OpenAI / Gemini / Mistral / Anthropic / 100+ others** via the
+[`llm`](https://llm.datasette.io) CLI:
+```bash
+pipx install llm
+llm keys set openai                       # paste your key (or: llm install llm-gemini && llm keys set gemini)
+tldw config set llm-cmd "llm -m gpt-4o"   # or "llm -m gemini-1.5-pro", "llm -m mistral-large", …
+```
+
+**Claude (default)** — if the [`claude` CLI](https://www.claude.com/product/claude-code)
+is installed and logged in (any Claude plan, or `ANTHROPIC_API_KEY`), it's used
+automatically with no config. `npm i -g @anthropic-ai/claude-code` then run `claude` once
+to log in.
+
+```bash
+tldw config get        # shows the effective model
+```
+
+Resolution order: `--llm-cmd` > `TLDW_LLM_CMD` > `tldw config` > the `claude` CLI. Text
+summaries work well on most models; the **video** cue-selection needs reliable structured
+JSON, where larger models (Claude, GPT-4o, etc.) are more consistent than small local ones.
+The backend is **operator config only** — never set by the browser extension / an HTTP request.
 
 ## Usage
 
@@ -142,32 +176,14 @@ tldw serve            # prints a bearer token (saved + reused); binds 127.0.0.1:
 Then load `extension/` unpacked and paste the token into the extension options — full
 steps in [`extension/README.md`](extension/README.md).
 
-**Browser support:** it's a Chromium MV3 extension — works in **Chrome, Edge, Brave,
-Arc, Opera, Vivaldi** (load unpacked via `chrome://extensions` → Developer mode). Firefox
-and Safari aren't supported yet (Firefox needs a small manifest port; Safari needs an
-Xcode wrapper).
+**Browser support:** MV3 extension for **Chrome, Edge, Brave, Arc, Opera, Vivaldi**
+(load `extension/` unpacked) and **Firefox** (run `extension/build-firefox.sh`, then
+load via `about:debugging`). Safari isn't supported (it needs an Xcode wrapper).
 
 The server is loopback-only, token-protected, and accepts only `chrome-extension://`
-origins; nothing leaves your machine beyond the usual `yt-dlp` + `claude` calls. This is
+origins; nothing leaves your machine beyond the usual `yt-dlp` + model calls. This is
 **local-only by design** — to share it, others install it on their own machine and use
-their own Claude plan (no hosted/shared server).
-
-## Using other models
-
-By default the summarizer shells out to the `claude` CLI (whatever it's logged into:
-Claude Pro/Max/Team, or `ANTHROPIC_API_KEY`). To use a different model, set a backend
-command that **reads the prompt on stdin and prints the model's text on stdout**:
-
-```bash
-# any run, or `tldw serve`, accepts --llm-cmd (or set TLDW_LLM_CMD)
-tldw <url> --mode text --llm-cmd "llm -m gpt-4o"        # Simon Willison's llm CLI
-tldw <url> --mode text --llm-cmd "ollama run llama3.1"  # fully local
-TLDW_LLM_CMD="llm -m gemini-1.5-pro" tldw serve
-```
-
-The backend is **operator config only** (never set by an extension/HTTP request).
-Text summaries port cleanly to most models; the **video** cue-selection needs reliable
-structured JSON, where smaller/local models may be less consistent than Claude.
+their own model (no hosted/shared server).
 
 ## Development
 
@@ -176,7 +192,8 @@ pip install -e ".[dev]"
 pytest
 ```
 
-All external tools (`claude`, `yt-dlp`, `ffmpeg`) run through a single
+All external tools (the model backend, `yt-dlp`, `ffmpeg`) run through a single
 `subprocess` chokepoint with `shell=False`; untrusted data (titles, transcripts,
-URLs) only ever travels as discrete argv elements or on stdin. See
-`docs/reviews/` for the design + review history.
+URLs) only ever travels as discrete argv elements or on stdin. The model backend
+command is operator config, never request-controlled. See `docs/reviews/` for the
+design + review history.
