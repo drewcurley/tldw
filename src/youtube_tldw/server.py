@@ -10,6 +10,7 @@ Stdlib only. Security posture (see docs/reviews/PLAN-extension.md):
 
 from __future__ import annotations
 
+import base64
 import hmac
 import json
 import os
@@ -139,16 +140,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
-        if path not in ("/summarize", "/summarize/stream", "/speak"):
+        speak = path in ("/speak", "/speak/stream")
+        if path not in ("/summarize", "/summarize/stream") and not speak:
             self._send_json(404, {"error": "not found"})
             return
         if not self._authorized():
             self._send_json(401, {"error": "missing or invalid token"})
             return
-        body = self._read_body(MAX_SPEAK_BYTES if path == "/speak" else MAX_BODY_BYTES)
+        body = self._read_body(MAX_SPEAK_BYTES if speak else MAX_BODY_BYTES)
         if body is None:
             return  # _read_body already responded
-        if path != "/speak":
+        if not speak:
             parsed = self._validate(body)
             if parsed is None:
                 return
@@ -157,7 +159,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             if path == "/speak":
-                self._run_speak(body)
+                self._run_speak(body, stream=False)
+            elif path == "/speak/stream":
+                self._run_speak(body, stream=True)
             elif path == "/summarize/stream":
                 self._run_stream(*parsed)
             else:
@@ -257,44 +261,77 @@ class _Handler(BaseHTTPRequestHandler):
         print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s", flush=True)
         emit({"type": "result", **_to_payload(summary)})
 
-    def _run_speak(self, body: dict) -> None:
-        """Synthesize the summary text to an mp3 and return audio/mpeg bytes."""
+    def _validate_speak(self, body: dict):
+        """Return (script, voice) or None (after sending the proper error status)."""
         if not all(isinstance(body.get(k), str) for k in ("title", "channel", "summary")):
-            self._send_json(400, {"error": "missing title/channel/summary"}); return
+            self._send_json(400, {"error": "missing title/channel/summary"}); return None
         kp = body.get("key_points", [])
         if not isinstance(kp, list) or not all(isinstance(x, str) for x in kp):
-            self._send_json(400, {"error": "key_points must be a list of strings"}); return
+            self._send_json(400, {"error": "key_points must be a list of strings"}); return None
         voice = body.get("voice", audio.DEFAULT_VOICE)
         if not isinstance(voice, str):
-            self._send_json(400, {"error": "voice must be a string"}); return
+            self._send_json(400, {"error": "voice must be a string"}); return None
         try:
             audio.resolve_voice(voice)  # allowlist -> model, before anything runs
         except TldrError as exc:
-            self._send_json(400, {"error": str(exc)}); return
+            self._send_json(400, {"error": str(exc)}); return None
         try:
             audio.require_piper()
         except TldrError as exc:
-            self._send_json(503, {"error": str(exc)}); return
-
+            self._send_json(503, {"error": str(exc)}); return None
         script = audio.build_spoken_script(body["title"], body["channel"], kp,
                                            body["summary"])
+        return script, voice
+
+    def _run_speak(self, body: dict, *, stream: bool) -> None:
+        parsed = self._validate_speak(body)
+        if parsed is None:
+            return  # error already sent (these precede any 200/stream)
+        script, voice = parsed
         workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-speak-"))
         start = time.monotonic()
+        tlog = self._logger(start)
+
+        if stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self._cors_headers()
+            self.end_headers()
+
+            def emit(obj):
+                self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
+                self.wfile.flush()
+
+            def progress(m):
+                tlog(m)
+                emit({"type": "progress", "message": m})
+        else:
+            def progress(m):
+                tlog(m)
+
         try:
             out = workdir / "out.mp3"
-            audio.synthesize_speech(script, out, voice, workdir, timeout=SPEAK_TIMEOUT)
+            audio.synthesize_speech(script, out, voice, workdir,
+                                    timeout=SPEAK_TIMEOUT, on_progress=progress)
             data = out.read_bytes()
-        except TldrTimeoutError as exc:
-            print(f"  speak timed out: {exc}", flush=True)
-            self._send_json(504, {"error": str(exc)}); return
-        except TldrError as exc:
-            print(f"  speak failed: {exc}", flush=True)
-            self._send_json(502, {"error": str(exc)}); return
+        except (TldrTimeoutError, TldrError) as exc:
+            status = 504 if isinstance(exc, TldrTimeoutError) else 502
+            print(f"  speak failed ({status}): {exc}", flush=True)
+            if stream:
+                emit({"type": "error", "status": status, "error": str(exc)})
+            else:
+                self._send_json(status, {"error": str(exc)})
+            return
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
         print(f"  spoke {len(data)//1024}KB in {time.monotonic()-start:.1f}s "
               f"(voice={voice})", flush=True)
-        self._send_bytes(200, "audio/mpeg", data)
+        if stream:
+            emit({"type": "audio", "mp3_base64": base64.b64encode(data).decode("ascii")})
+        else:
+            self._send_bytes(200, "audio/mpeg", data)
 
 
 def _to_payload(summary: core.Summary) -> dict:

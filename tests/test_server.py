@@ -145,9 +145,9 @@ def test_preflight_allows_extension_origin(srv):
     assert hdrs.get("Access-Control-Allow-Origin") == EXT_ORIGIN
 
 
-def _read_ndjson(port, body, headers):
+def _read_ndjson(port, body, headers, path="/summarize/stream"):
     data = json.dumps(body).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/summarize/stream",
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
                                  data=data, method="POST")
     for k, v in headers.items():
         req.add_header(k, v)
@@ -194,7 +194,7 @@ def test_speak_returns_mp3(srv, monkeypatch):
     _, port = srv
     monkeypatch.setattr(server.audio, "require_piper", lambda: None)
 
-    def fake_synth(text, out, voice, workdir, *, timeout=None):
+    def fake_synth(text, out, voice, workdir, *, timeout=None, on_progress=None):
         Path(out).write_bytes(b"ID3fake-mp3-bytes")
 
     monkeypatch.setattr(server.audio, "synthesize_speech", fake_synth)
@@ -208,6 +208,26 @@ def test_speak_returns_mp3(srv, monkeypatch):
         assert r.status == 200
         assert r.headers["Content-Type"] == "audio/mpeg"
         assert r.read() == b"ID3fake-mp3-bytes"
+
+
+def test_speak_stream_emits_progress_then_audio(srv, monkeypatch):
+    import base64
+    _, port = srv
+    monkeypatch.setattr(server.audio, "require_piper", lambda: None)
+
+    def fake_synth(text, out, voice, workdir, *, timeout=None, on_progress=None):
+        if on_progress:
+            on_progress("synthesizing speech…")
+            on_progress("encoding mp3…")
+        Path(out).write_bytes(b"MP3DATA")
+
+    monkeypatch.setattr(server.audio, "synthesize_speech", fake_synth)
+    body = {"title": "T", "channel": "C", "key_points": ["k"], "summary": "hi",
+            "voice": "amy"}
+    events = _read_ndjson(port, body, _auth(), path="/speak/stream")
+    assert [e["type"] for e in events] == ["progress", "progress", "audio"]
+    assert events[0]["message"] == "synthesizing speech…"
+    assert base64.b64decode(events[-1]["mp3_base64"]) == b"MP3DATA"
 
 
 def test_speak_rejects_unknown_voice(srv):

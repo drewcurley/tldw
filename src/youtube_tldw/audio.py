@@ -90,12 +90,14 @@ def extract_audio(video: Path, out_mp3: Path, *, timeout: float = 1800) -> None:
         raise TldrError("ffmpeg did not produce the audio file.")
 
 
-def ensure_voice(voice_id: str, *, timeout: float = 180, attempts: int = 3) -> str:
+def ensure_voice(voice_id: str, *, timeout: float = 180, attempts: int = 3,
+                 on_progress=None) -> str:
     """Return the Piper model for `voice_id` (allowlisted), downloading if absent.
 
     Voice-model downloads from HuggingFace occasionally drop mid-stream (SSL EOF),
     so retry a few times and clean any partial file between tries.
     """
+    log = on_progress or (lambda _m: None)
     model = resolve_voice(voice_id)
     onnx = VOICE_DIR / f"{model}.onnx"
     if onnx.exists():
@@ -104,6 +106,7 @@ def ensure_voice(voice_id: str, *, timeout: float = 180, attempts: int = 3) -> s
     last = ""
     for i in range(attempts):
         try:
+            log(f"downloading voice {model} (first use, this can take a bit)…")
             print(f"Downloading voice {model}… (attempt {i + 1}/{attempts})", flush=True)
             run([sys.executable, "-m", "piper.download_voices", model,
                  "--data-dir", str(VOICE_DIR)], timeout=timeout)
@@ -115,6 +118,7 @@ def ensure_voice(voice_id: str, *, timeout: float = 180, attempts: int = 3) -> s
         for partial in VOICE_DIR.glob(f"{model}.onnx*"):  # drop partials before retry
             partial.unlink(missing_ok=True)
         if i + 1 < attempts:
+            log("download dropped; retrying…")
             time.sleep(1.5)
     raise TldrError(
         f"Couldn't download the voice “{model}” after {attempts} tries "
@@ -124,14 +128,19 @@ def ensure_voice(voice_id: str, *, timeout: float = 180, attempts: int = 3) -> s
 
 
 def synthesize_speech(
-    text: str, out_mp3: Path, voice_id: str, workdir: Path, *, timeout: float = 120
+    text: str, out_mp3: Path, voice_id: str, workdir: Path, *, timeout: float = 120,
+    on_progress=None,
 ) -> None:
     """Synthesize `text` to speech with Piper, then encode to mp3."""
+    log = on_progress or (lambda _m: None)
     require_piper()
-    model = ensure_voice(voice_id)
+    log("preparing voice…")
+    model = ensure_voice(voice_id, on_progress=on_progress)
     wav = workdir / "speech.wav"
+    log("synthesizing speech…")
     run([sys.executable, "-m", "piper", "-m", model, "--data-dir", str(VOICE_DIR),
          "-f", str(wav)], stdin=text, timeout=timeout)
+    log("encoding mp3…")
     run(["ffmpeg", "-y", "-i", str(wav), "-c:a", "libmp3lame", "-q:a", "2",
          str(out_mp3)], timeout=timeout)
     if not out_mp3.exists():

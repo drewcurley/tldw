@@ -19,7 +19,7 @@
   const CREEP_CEILING = 96;  // never park at 99; result snaps it to done
 
   // Audio (text-to-speech) state.
-  let audioPort = null, audioPing = null, audioSafety = null, audioElapsed = null;
+  let audioPort = null, audioPing = null, audioSafety = null;
   let audioActive = false;
   let lastPayload = null;
   // Curated voices (kept in sync with server audio.VOICES; server validates anyway).
@@ -293,15 +293,12 @@
     const status = root.querySelector(".audiostatus");
     status.classList.remove("audioerr");
     btn.disabled = true; if (sel) sel.disabled = true;
-    let secs = 0;
-    status.textContent = "Synthesizing audio…";
-    audioElapsed = setInterval(() => {
-      if (++secs === 15) status.textContent = "Still working (first use downloads the voice)…";
-    }, 1000);
+    status.textContent = "Starting…";
     audioPort = chrome.runtime.connect({ name: "tldw" });
     audioPing = setInterval(() => { try { audioPort.postMessage({ type: "ping" }); } catch (_) {} }, 20000);
     audioPort.onMessage.addListener((m) => {
       if (!audioActive) return;
+      if (m.type === "speakProgress") { updateAudioStatus(m.message); return; }  // not terminal
       if (m.type === "audio") { teardownAudio(); finishAudioUI(); renderAudio(m.dataUrl); }
       else if (m.type === "speakError") { teardownAudio(); finishAudioUI(); showAudioError(m.error); }
     });
@@ -324,9 +321,13 @@
   function teardownAudio() {
     audioActive = false;
     if (audioPing) { clearInterval(audioPing); audioPing = null; }
-    if (audioElapsed) { clearInterval(audioElapsed); audioElapsed = null; }
     if (audioSafety) { clearTimeout(audioSafety); audioSafety = null; }
     if (audioPort) { try { audioPort.disconnect(); } catch (_) {} audioPort = null; }
+  }
+
+  function updateAudioStatus(msg) {
+    const status = root && root.querySelector(".audiostatus");
+    if (status) { status.classList.remove("audioerr"); status.textContent = msg; }
   }
 
   function finishAudioUI() {

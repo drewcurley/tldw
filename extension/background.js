@@ -140,8 +140,9 @@ async function handleSpeak(port, msg) {
   }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), SPEAK_TIMEOUT_MS);
+  let gotTerminal = false;
   try {
-    const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/speak", {
+    const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/speak/stream", {
       method: "POST", signal: ctrl.signal,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
       body: JSON.stringify({
@@ -155,9 +156,37 @@ async function handleSpeak(port, msg) {
       safePost(port, { type: "speakError", error: speakError(resp.status, detail) });
       return;
     }
-    const dataUrl = "data:audio/mpeg;base64," + bufToBase64(await resp.arrayBuffer());
-    audioCache.set(key, dataUrl);
-    safePost(port, { type: "audio", dataUrl });
+    // NDJSON: {type:progress} steps, then a final {type:audio, mp3_base64} or {type:error}.
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch (_) { continue; }
+        if (ev.type === "progress") {
+          safePost(port, { type: "speakProgress", message: ev.message });
+        } else if (ev.type === "audio") {
+          gotTerminal = true;
+          const dataUrl = "data:audio/mpeg;base64," + ev.mp3_base64;
+          audioCache.set(key, dataUrl);
+          safePost(port, { type: "audio", dataUrl });
+        } else if (ev.type === "error") {
+          gotTerminal = true;
+          safePost(port, { type: "speakError", error: speakError(ev.status, ev.error) });
+        }
+      }
+    }
+    if (!gotTerminal) {
+      safePost(port, { type: "speakError", error: "Audio stream ended unexpectedly. Try again." });
+    }
   } catch (e) {
     if (e.name === "AbortError") {
       safePost(port, { type: "speakError",
@@ -169,16 +198,6 @@ async function handleSpeak(port, msg) {
   } finally {
     clearTimeout(timer);
   }
-}
-
-function bufToBase64(buf) {
-  const bytes = new Uint8Array(buf);
-  let bin = "";
-  const chunk = 0x8000;  // avoid call-stack blowup on multi-MB buffers
-  for (let i = 0; i < bytes.length; i += chunk) {
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-  }
-  return btoa(bin);
 }
 
 function speakError(status, detail) {
