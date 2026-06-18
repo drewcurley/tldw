@@ -70,6 +70,11 @@
           display: inline-block; vertical-align: middle; margin-right: 8px; }
         @keyframes spin { to { transform: rotate(360deg); } }
         .status { font-size: 15px; padding: 26px 4px; }
+        .bar { height: 4px; background: rgba(128,128,128,.2); border-radius: 2px;
+          overflow: hidden; margin-top: 18px; }
+        .bar .fill { height: 100%; width: 35%; background: #c00; border-radius: 2px;
+          animation: slide 1.1s linear infinite; }
+        @keyframes slide { from { margin-left: -35%; } to { margin-left: 100%; } }
         .err { color: #c0392b; } .err code { background: rgba(128,128,128,.15);
           padding: 1px 6px; border-radius: 5px; }
       </style>
@@ -124,6 +129,7 @@
     port = chrome.runtime.connect({ name: "tldw" });
     port.onMessage.addListener((m) => {
       if (!requestActive) return;
+      if (m.type === "progress") { updateProgress(m.message); return; }  // not terminal
       requestActive = false;
       if (m.type === "result") showResult(m.payload, m.cached);
       else if (m.type === "error") showError(m.error);
@@ -148,11 +154,16 @@
 
   function showLoading() {
     const c = mount();
-    c.innerHTML = `<div class="status"><span class="spinner"></span><span class="msg">Fetching transcript…</span></div>`;
-    stageTimer = setTimeout(() => {
-      const m = root && root.querySelector(".status .msg");
-      if (m) m.textContent = "Summarizing with Claude (this usually takes ~20s)…";
-    }, 3000);
+    c.innerHTML = `
+      <div class="status">
+        <div><span class="spinner"></span><span class="msg">Starting…</span></div>
+        <div class="bar"><div class="fill"></div></div>
+      </div>`;
+  }
+
+  function updateProgress(msg) {
+    const el = root && root.querySelector(".status .msg");
+    if (el) el.textContent = msg;
   }
 
   function clearTimers() {

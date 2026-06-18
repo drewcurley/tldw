@@ -143,6 +143,43 @@ def test_preflight_allows_extension_origin(srv):
     assert hdrs.get("Access-Control-Allow-Origin") == EXT_ORIGIN
 
 
+def _read_ndjson(port, body, headers):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/summarize/stream",
+                                 data=data, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return [json.loads(ln) for ln in r.read().decode().splitlines() if ln.strip()]
+
+
+def test_summarize_stream_emits_progress_then_result(srv, monkeypatch):
+    _, port = srv
+
+    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None):
+        if on_progress:
+            on_progress("fetching metadata…")
+            on_progress("summarizing with Claude…")
+        return _summary()
+
+    monkeypatch.setattr(server.core, "summarize_url", fake)
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
+    assert [e["type"] for e in events] == ["progress", "progress", "result"]
+    assert events[0]["message"] == "fetching metadata…"
+    assert events[-1]["title"] == "Cool Title" and events[-1]["key_points"] == ["point one"]
+
+
+def test_summarize_stream_error_is_in_band(srv, monkeypatch):
+    _, port = srv
+
+    def boom(url, ratio, lang, *, timeout, max_chars, on_progress=None):
+        raise NoTranscriptError("no captions")
+
+    monkeypatch.setattr(server.core, "summarize_url", boom)
+    events = _read_ndjson(port, {"url": "x"}, _auth())
+    assert events[-1] == {"type": "error", "status": 422, "error": "no captions"}
+
+
 def test_token_persists_across_calls(monkeypatch, tmp_path):
     tf = tmp_path / "token"
     monkeypatch.setattr(server, "TOKEN_FILE", tf)

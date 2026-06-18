@@ -60,8 +60,9 @@ chrome.runtime.onConnect.addListener((port) => {
     }
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), CLIENT_TIMEOUT_MS);
+    let gotTerminal = false;
     try {
-      const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/summarize", {
+      const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/summarize/stream", {
         method: "POST", signal: ctrl.signal,
         headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
         body: JSON.stringify({ url }),
@@ -72,9 +73,37 @@ chrome.runtime.onConnect.addListener((port) => {
         safePost(port, { type: "error", error: httpError(resp.status, detail) });
         return;
       }
-      const payload = await resp.json();
-      if (videoId) cache.set(videoId, payload);
-      safePost(port, { type: "result", payload });
+      // Stream of NDJSON events: {type:progress|result|error}, one per line.
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          let ev;
+          try { ev = JSON.parse(line); } catch (_) { continue; }
+          if (ev.type === "progress") {
+            safePost(port, { type: "progress", message: ev.message });
+          } else if (ev.type === "result") {
+            gotTerminal = true;
+            if (videoId) cache.set(videoId, ev);
+            safePost(port, { type: "result", payload: ev });
+          } else if (ev.type === "error") {
+            gotTerminal = true;
+            safePost(port, { type: "error", error: httpError(ev.status, ev.error) });
+          }
+        }
+      }
+      if (!gotTerminal) {
+        safePost(port, { type: "error",
+          error: "The summary stream ended unexpectedly. Try again." });
+      }
     } catch (e) {
       if (e.name === "AbortError") {
         safePost(port, { type: "error",

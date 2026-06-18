@@ -128,7 +128,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        if self.path.split("?")[0] != "/summarize":
+        path = self.path.split("?")[0]
+        if path not in ("/summarize", "/summarize/stream"):
             self._send_json(404, {"error": "not found"})
             return
         if not self._authorized():
@@ -137,12 +138,17 @@ class _Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         if body is None:
             return  # _read_body already responded
-        acquired = self.server.sem.acquire(blocking=False)
-        if not acquired:
+        parsed = self._validate(body)
+        if parsed is None:
+            return  # _validate already responded
+        if not self.server.sem.acquire(blocking=False):
             self._send_json(429, {"error": "busy, try again shortly"})
             return
         try:
-            self._handle_summarize(body)
+            if path == "/summarize/stream":
+                self._run_stream(*parsed)
+            else:
+                self._run_buffered(*parsed)
         finally:
             self.server.sem.release()
 
@@ -168,39 +174,74 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid JSON"})
             return None
 
-    def _handle_summarize(self, body: dict) -> None:
+    def _validate(self, body: dict):
+        """Return (url, ratio, lang) or None (after sending a 400)."""
         if not isinstance(body, dict) or not isinstance(body.get("url"), str):
-            self._send_json(400, {"error": "missing 'url'"})
-            return
+            self._send_json(400, {"error": "missing 'url'"}); return None
         ratio = body.get("ratio")
         if ratio is not None:
             try:
                 ratio = float(ratio)
             except (TypeError, ValueError):
-                self._send_json(400, {"error": "ratio must be a number"})
-                return
+                self._send_json(400, {"error": "ratio must be a number"}); return None
             if not (0 < ratio <= 1):
-                self._send_json(400, {"error": "ratio must be in (0, 1]"})
-                return
+                self._send_json(400, {"error": "ratio must be in (0, 1]"}); return None
         lang = body.get("lang", "en")
         if not isinstance(lang, str) or not _LANG_RE.match(lang):
-            self._send_json(400, {"error": "invalid lang"})
-            return
+            self._send_json(400, {"error": "invalid lang"}); return None
+        return body["url"], ratio, lang
+
+    def _logger(self, start: float):
+        return lambda m: print(f"  [{time.monotonic()-start:5.1f}s] {m}", flush=True)
+
+    def _run_buffered(self, url, ratio, lang) -> None:
         start = time.monotonic()
-        progress = lambda m: print(f"  [{time.monotonic()-start:5.1f}s] {m}", flush=True)
         try:
             summary = core.summarize_url(
-                body["url"], ratio, lang,
-                timeout=REQUEST_TIMEOUT, max_chars=SINGLE_PASS_CHARS,
-                on_progress=progress,
-            )
+                url, ratio, lang, timeout=REQUEST_TIMEOUT,
+                max_chars=SINGLE_PASS_CHARS, on_progress=self._logger(start))
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
-            print(f"  summarize failed ({status}) in {time.monotonic()-start:.1f}s: {exc}", flush=True)
+            print(f"  failed ({status}) in {time.monotonic()-start:.1f}s: {exc}", flush=True)
             self._send_json(status, {"error": str(exc)})
             return
         print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s", flush=True)
         self._send_json(200, _to_payload(summary))
+
+    def _run_stream(self, url, ratio, lang) -> None:
+        """NDJSON stream: one {type:progress|result|error} JSON object per line."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self._cors_headers()
+        self.end_headers()
+        start = time.monotonic()
+        tlog = self._logger(start)
+
+        def emit(obj):
+            self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
+            self.wfile.flush()
+
+        def progress(m):
+            tlog(m)
+            emit({"type": "progress", "message": m})
+
+        try:
+            summary = core.summarize_url(
+                url, ratio, lang, timeout=REQUEST_TIMEOUT,
+                max_chars=SINGLE_PASS_CHARS, on_progress=progress)
+        except TldrError as exc:
+            status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
+            print(f"  failed ({status}) in {time.monotonic()-start:.1f}s: {exc}", flush=True)
+            emit({"type": "error", "status": status, "error": str(exc)})
+            return
+        except Exception as exc:  # never leave the stream hanging on an unexpected error
+            emit({"type": "error", "status": 500, "error": "internal error"})
+            print(f"  unexpected error: {exc!r}", flush=True)
+            return
+        print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s", flush=True)
+        emit({"type": "result", **_to_payload(summary)})
 
 
 def _to_payload(summary: core.Summary) -> dict:
