@@ -33,9 +33,9 @@ appears in a modal on the page.
   origins (a web page can't trigger it). It binds loopback only.
 - Long videos (map-reduce-sized transcripts) return 413 — use the `tldw` CLI for those.
 
-## Sharing it later
+## Distribution
 
-To let trusted people use a hosted server instead of running it locally, you must
-move the server off `localhost` — which means TLS, a real per-user auth model, and
-**Anthropic API billing instead of your personal Max subscription** (serving others
-through Max is against its terms). That's a separate, deliberate step.
+This is **local-only by design.** There is no hosted/shared server. If you want
+someone else to use it, they install the tool on their own machine and run their own
+`tldw serve` against their own Claude plan — each person uses their own subscription.
+The server deliberately refuses to bind anything but loopback.

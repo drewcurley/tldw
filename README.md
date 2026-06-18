@@ -110,8 +110,9 @@ tldw serve            # prints a bearer token; binds 127.0.0.1:8765
 Then load `extension/` unpacked in `chrome://extensions` and paste the token into the
 extension options. See [`extension/README.md`](extension/README.md). The server is
 loopback-only, token-protected, and accepts only `chrome-extension://` origins;
-nothing leaves your machine beyond the usual `yt-dlp` + `claude` calls. Hosting it for
-others requires TLS + API billing (not your Max plan) — a separate step.
+nothing leaves your machine beyond the usual `yt-dlp` + `claude` calls. This is
+**local-only by design** — to share it, others install it on their own machine and
+use their own Claude plan (no hosted/shared server).
 
 ## Development
 
