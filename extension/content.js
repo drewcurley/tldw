@@ -18,6 +18,27 @@
   let requestActive = false;
   const CREEP_CEILING = 96;  // never park at 99; result snaps it to done
 
+  // Audio (text-to-speech) state.
+  let audioPort = null, audioPing = null, audioSafety = null, audioElapsed = null;
+  let audioActive = false;
+  let lastPayload = null;
+  // Curated voices (kept in sync with server audio.VOICES; server validates anyway).
+  const VOICE_OPTIONS = [
+    { id: "amy", label: "Amy — female (US)" },
+    { id: "lessac", label: "Lessac — female (US)" },
+    { id: "kristin", label: "Kristin — female (US)" },
+    { id: "ljspeech", label: "LJSpeech — female (US)" },
+    { id: "ryan", label: "Ryan — male (US)" },
+    { id: "joe", label: "Joe — male (US)" },
+    { id: "john", label: "John — male (US)" },
+    { id: "norman", label: "Norman — male (US)" },
+    { id: "cori", label: "Cori — female (UK)" },
+    { id: "jenny", label: "Jenny — female (UK)" },
+    { id: "alba", label: "Alba — female (UK, Scottish)" },
+    { id: "alan", label: "Alan — male (UK)" },
+    { id: "northern", label: "Northern — male (UK)" },
+  ];
+
   const esc = (s) =>
     String(s).replace(/[&<>"']/g, (c) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -80,6 +101,14 @@
         .pct { font-size: 12px; color: #888; margin-top: 6px; text-align: right; }
         .err { color: #c0392b; } .err code { background: rgba(128,128,128,.15);
           padding: 1px 6px; border-radius: 5px; }
+        .audiorow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+          margin: 4px 0 14px; }
+        .audiorow select { font: inherit; font-size: 13px; padding: 4px 6px;
+          border-radius: 7px; border: 1px solid rgba(128,128,128,.4);
+          background: transparent; color: inherit; }
+        .audiostatus { font-size: 12px; color: #888; }
+        .audiostatus.audioerr { color: #c0392b; }
+        .audioslot audio { width: 100%; margin-bottom: 12px; }
       </style>
       <div class="backdrop" part="backdrop">
         <div class="panel" role="dialog" aria-modal="true" aria-labelledby="tldw-h" tabindex="-1">
@@ -108,7 +137,8 @@
     if (!host) return;
     if (e.key === "Escape") { e.stopPropagation(); close(); return; }
     if (e.key === "Tab") {
-      const f = root.querySelectorAll("button:not([hidden])");
+      const f = root.querySelectorAll(
+        "button:not([hidden]):not([disabled]), select:not([disabled]), audio");
       if (!f.length) return;
       const first = f[0], last = f[f.length - 1];
       if (e.shiftKey && root.activeElement === first) { e.preventDefault(); last.focus(); }
@@ -118,6 +148,7 @@
 
   function close() {
     clearTimers();
+    teardownAudio();                  // tear down any in-flight TTS request + ping
     requestActive = false;            // suppress late port errors after a manual close
     if (port) { try { port.disconnect(); } catch (_) {} port = null; }
     document.removeEventListener("keydown", onKey, true);
@@ -215,6 +246,7 @@
   function showResult(p, cached) {
     if (!host) mount();
     clearTimers();
+    lastPayload = p;
     root.querySelector("#tldw-h").textContent = "TL;DW" + (cached ? " (cached)" : "");
     const c = root.querySelector(".content");
     const points = (p.key_points || []).map((k) => `<li>${esc(k)}</li>`).join("");
@@ -222,6 +254,12 @@
       <div class="meta">${esc(p.channel)} · ${esc(p.original_length)} → ~${esc(p.length_label)} read ·
         <a href="${esc(p.source_url)}" target="_blank" rel="noopener noreferrer">original</a></div>
       <h1 style="margin-bottom:10px">${esc(p.title)}</h1>
+      <div class="audiorow">
+        <button class="listen" aria-label="Generate spoken audio of this summary">🔊 Listen to summary</button>
+        <select class="voice" aria-label="Voice"></select>
+        <span class="audiostatus" aria-live="polite"></span>
+      </div>
+      <div class="audioslot"></div>
       ${points ? `<h2>Key points</h2><ul class="points">${points}</ul>` : ""}
       <h2>Summary</h2><div class="body">${renderSummary(p.summary_md || "")}</div>
       ${p.rationale ? `<div class="rationale">${esc(p.rationale)}</div>` : ""}`;
@@ -232,6 +270,88 @@
         copy.textContent = "Copied"; setTimeout(() => (copy.textContent = "Copy"), 1500);
       });
     };
+    setupVoiceSelect();
+    root.querySelector(".listen").onclick = requestAudio;
+  }
+
+  function setupVoiceSelect() {
+    const sel = root.querySelector(".voice");
+    sel.innerHTML = VOICE_OPTIONS.map(
+      (v) => `<option value="${esc(v.id)}">${esc(v.label)}</option>`).join("");
+    try {
+      chrome.storage.local.get({ voice: "amy" }, (s) => {
+        if (sel && [...sel.options].some((o) => o.value === s.voice)) sel.value = s.voice;
+      });
+    } catch (_) {}
+  }
+
+  function requestAudio() {
+    if (audioActive || !lastPayload) return;            // re-entrancy guard
+    audioActive = true;
+    const btn = root.querySelector(".listen");
+    const sel = root.querySelector(".voice");
+    const status = root.querySelector(".audiostatus");
+    status.classList.remove("audioerr");
+    btn.disabled = true; if (sel) sel.disabled = true;
+    let secs = 0;
+    status.textContent = "Synthesizing audio…";
+    audioElapsed = setInterval(() => {
+      if (++secs === 15) status.textContent = "Still working (first use downloads the voice)…";
+    }, 1000);
+    audioPort = chrome.runtime.connect({ name: "tldw" });
+    audioPing = setInterval(() => { try { audioPort.postMessage({ type: "ping" }); } catch (_) {} }, 20000);
+    audioPort.onMessage.addListener((m) => {
+      if (!audioActive) return;
+      if (m.type === "audio") { teardownAudio(); finishAudioUI(); renderAudio(m.dataUrl); }
+      else if (m.type === "speakError") { teardownAudio(); finishAudioUI(); showAudioError(m.error); }
+    });
+    audioPort.onDisconnect.addListener(() => {
+      if (!audioActive) return;
+      teardownAudio(); finishAudioUI();
+      showAudioError("Lost connection to the worker. Try again.");
+    });
+    audioSafety = setTimeout(() => {
+      if (!audioActive) return;
+      teardownAudio(); finishAudioUI();
+      showAudioError("Audio is taking too long. Make sure `tldw serve` is running.");
+    }, 185000);
+    audioPort.postMessage({
+      type: "speak", videoId: lastPayload.video_id,
+      voice: sel ? sel.value : "amy", payload: lastPayload,
+    });
+  }
+
+  function teardownAudio() {
+    audioActive = false;
+    if (audioPing) { clearInterval(audioPing); audioPing = null; }
+    if (audioElapsed) { clearInterval(audioElapsed); audioElapsed = null; }
+    if (audioSafety) { clearTimeout(audioSafety); audioSafety = null; }
+    if (audioPort) { try { audioPort.disconnect(); } catch (_) {} audioPort = null; }
+  }
+
+  function finishAudioUI() {
+    const btn = root && root.querySelector(".listen");
+    const sel = root && root.querySelector(".voice");
+    const status = root && root.querySelector(".audiostatus");
+    if (btn) { btn.disabled = false; btn.textContent = "🔊 Regenerate"; }
+    if (sel) sel.disabled = false;
+    if (status) status.textContent = "";
+  }
+
+  function renderAudio(dataUrl) {
+    const slot = root && root.querySelector(".audioslot");
+    if (!slot) return;
+    slot.innerHTML = "";                                 // replace, never stack
+    const a = document.createElement("audio");
+    a.controls = true; a.src = dataUrl;
+    a.setAttribute("aria-label", "Spoken summary");
+    slot.appendChild(a);
+    a.focus();
+  }
+
+  function showAudioError(msg) {
+    const status = root && root.querySelector(".audiostatus");
+    if (status) { status.textContent = msg; status.classList.add("audioerr"); }
   }
 
   function toMarkdown(p) {

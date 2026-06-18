@@ -24,6 +24,9 @@ appears in a modal on the page.
 - Open any YouTube `/watch` page → click the **TL;DW** toolbar button.
 - A modal shows the title, key points, and summary (~20s; transcript fetch + Claude).
 - **Copy** grabs the markdown; **Esc** or click-outside closes.
+- **🔊 Listen to summary** synthesizes the summary to speech (local Piper TTS) and
+  plays it in the modal. Pick a voice (US/UK, male/female) right there or set a
+  default in options. First use of a voice downloads its model (~once).
 
 ## How it stays local & safe
 

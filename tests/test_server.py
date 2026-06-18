@@ -2,12 +2,14 @@ import json
 import threading
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
 from youtube_tldw import (
     BadUrlError,
     NoTranscriptError,
+    TldrError,
     TranscriptTooLongError,
     core,
     server,
@@ -178,6 +180,63 @@ def test_summarize_stream_error_is_in_band(srv, monkeypatch):
     monkeypatch.setattr(server.core, "summarize_url", boom)
     events = _read_ndjson(port, {"url": "x"}, _auth())
     assert events[-1] == {"type": "error", "status": 422, "error": "no captions"}
+
+
+def test_voices_endpoint_no_auth(srv):
+    _, port = srv
+    status, payload, _ = _req(port, "GET", "/voices")
+    ids = {v["id"] for v in payload["voices"]}
+    assert status == 200 and "amy" in ids and "alan" in ids
+    assert all("id" in v and "label" in v for v in payload["voices"])
+
+
+def test_speak_returns_mp3(srv, monkeypatch):
+    _, port = srv
+    monkeypatch.setattr(server.audio, "require_piper", lambda: None)
+
+    def fake_synth(text, out, voice, workdir, *, timeout=None):
+        Path(out).write_bytes(b"ID3fake-mp3-bytes")
+
+    monkeypatch.setattr(server.audio, "synthesize_speech", fake_synth)
+    body = {"title": "T", "channel": "C", "key_points": ["k"], "summary": "hi",
+            "voice": "amy"}
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/speak",
+                                 data=json.dumps(body).encode(), method="POST")
+    for k, v in _auth().items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=5) as r:
+        assert r.status == 200
+        assert r.headers["Content-Type"] == "audio/mpeg"
+        assert r.read() == b"ID3fake-mp3-bytes"
+
+
+def test_speak_rejects_unknown_voice(srv):
+    _, port = srv
+    status, _, _ = _req(port, "POST", "/speak",
+                        {"title": "T", "channel": "C", "summary": "s",
+                         "voice": "../etc/passwd"}, _auth())
+    assert status == 400  # allowlisted before anything touches piper/paths
+
+
+def test_speak_piper_missing_503(srv, monkeypatch):
+    _, port = srv
+
+    def no_piper():
+        raise TldrError("Piper not installed")
+
+    monkeypatch.setattr(server.audio, "require_piper", no_piper)
+    status, _, _ = _req(port, "POST", "/speak",
+                        {"title": "T", "channel": "C", "summary": "s", "voice": "amy"},
+                        _auth())
+    assert status == 503
+
+
+def test_speak_requires_token(srv):
+    _, port = srv
+    status, _, _ = _req(port, "POST", "/speak",
+                        {"title": "T", "channel": "C", "summary": "s"},
+                        {"Content-Type": "application/json"})
+    assert status == 401
 
 
 def test_token_persists_across_calls(monkeypatch, tmp_path):

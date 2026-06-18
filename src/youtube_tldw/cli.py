@@ -34,8 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--render-audio", action="store_true",
                    help="also save an mp3: video → the recut audio; text → spoken "
                         "summary via local neural TTS")
-    p.add_argument("--voice", choices=["female", "male"], default="female",
-                   help="(text --render-audio) TTS voice (default female)")
+    p.add_argument("--voice", default="female", metavar="VOICE",
+                   choices=["female", "male", *audio.VOICES.keys()],
+                   help="(text --render-audio) TTS voice: female|male or a named "
+                        "voice (amy, ryan, cori, alan, …).")
     p.add_argument("--ratio", type=float, default=None,
                    help="Target fraction of original length (0 < r <= 1). "
                         "Omit to let the AI choose.")
@@ -121,7 +123,9 @@ def _run_text(args, video_id: str, workdir: Path) -> Path:
         print(f"Synthesizing speech ({args.voice} voice)…")
         tmp_mp3 = workdir / "speech.mp3"
         audio.synthesize_speech(
-            audio.build_spoken_script(meta, result), tmp_mp3, args.voice, workdir
+            audio.build_spoken_script(meta.title, meta.channel, result.key_points,
+                                      result.summary),
+            tmp_mp3, args.voice, workdir,
         )
         _save_audio(args, meta, tmp_mp3)
     return out_path

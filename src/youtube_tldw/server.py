@@ -15,6 +15,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,13 +32,15 @@ from . import (
     __version__,
 )
 from . import metadata as md
-from . import core, textmode
+from . import audio, core, textmode
 from .summarize import SINGLE_PASS_CHARS
 from .timing import format_length
 
 MAX_BODY_BYTES = 16 * 1024
+MAX_SPEAK_BYTES = 64 * 1024   # /speak carries the summary text
 MAX_CONCURRENCY = 2
 REQUEST_TIMEOUT = 120.0  # per-request claude budget (shorter than the CLI's)
+SPEAK_TIMEOUT = 120.0    # per-request piper/ffmpeg budget
 _LANG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,15}$")
 TOKEN_FILE = Path.home() / ".config" / "youtube-tldw" / "token"
 
@@ -94,15 +98,18 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Max-Age", "600")
 
     def _send_json(self, status: int, payload: dict) -> None:
-        body = json.dumps(payload).encode("utf-8")
+        self._send_bytes(status, "application/json", json.dumps(payload).encode("utf-8"))
+
+    def _send_bytes(self, status: int, content_type: str, data: bytes) -> None:
+        # content_type is always a server-side constant; no user-derived headers.
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", "no-store")
         self._cors_headers()
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(data)
 
     def _authorized(self) -> bool:
         header = self.headers.get("Authorization", "")
@@ -122,37 +129,43 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
-        if self.path.split("?")[0] == "/health":
+        path = self.path.split("?")[0]
+        if path == "/health":
             self._send_json(200, {"ok": True, "name": "tldw", "version": __version__})
+        elif path == "/voices":
+            self._send_json(200, {"voices": audio.voice_list()})
         else:
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
-        if path not in ("/summarize", "/summarize/stream"):
+        if path not in ("/summarize", "/summarize/stream", "/speak"):
             self._send_json(404, {"error": "not found"})
             return
         if not self._authorized():
             self._send_json(401, {"error": "missing or invalid token"})
             return
-        body = self._read_body()
+        body = self._read_body(MAX_SPEAK_BYTES if path == "/speak" else MAX_BODY_BYTES)
         if body is None:
             return  # _read_body already responded
-        parsed = self._validate(body)
-        if parsed is None:
-            return  # _validate already responded
+        if path != "/speak":
+            parsed = self._validate(body)
+            if parsed is None:
+                return
         if not self.server.sem.acquire(blocking=False):
             self._send_json(429, {"error": "busy, try again shortly"})
             return
         try:
-            if path == "/summarize/stream":
+            if path == "/speak":
+                self._run_speak(body)
+            elif path == "/summarize/stream":
                 self._run_stream(*parsed)
             else:
                 self._run_buffered(*parsed)
         finally:
             self.server.sem.release()
 
-    def _read_body(self) -> dict | None:
+    def _read_body(self, max_bytes: int = MAX_BODY_BYTES) -> dict | None:
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
             self._send_json(400, {"error": "chunked transfer not supported"})
             return None
@@ -165,7 +178,7 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._send_json(411, {"error": "Content-Length required"})
             return None
-        if length <= 0 or length > MAX_BODY_BYTES:
+        if length <= 0 or length > max_bytes:
             self._send_json(413, {"error": "request body too large"})
             return None
         try:
@@ -243,6 +256,45 @@ class _Handler(BaseHTTPRequestHandler):
             return
         print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s", flush=True)
         emit({"type": "result", **_to_payload(summary)})
+
+    def _run_speak(self, body: dict) -> None:
+        """Synthesize the summary text to an mp3 and return audio/mpeg bytes."""
+        if not all(isinstance(body.get(k), str) for k in ("title", "channel", "summary")):
+            self._send_json(400, {"error": "missing title/channel/summary"}); return
+        kp = body.get("key_points", [])
+        if not isinstance(kp, list) or not all(isinstance(x, str) for x in kp):
+            self._send_json(400, {"error": "key_points must be a list of strings"}); return
+        voice = body.get("voice", audio.DEFAULT_VOICE)
+        if not isinstance(voice, str):
+            self._send_json(400, {"error": "voice must be a string"}); return
+        try:
+            audio.resolve_voice(voice)  # allowlist -> model, before anything runs
+        except TldrError as exc:
+            self._send_json(400, {"error": str(exc)}); return
+        try:
+            audio.require_piper()
+        except TldrError as exc:
+            self._send_json(503, {"error": str(exc)}); return
+
+        script = audio.build_spoken_script(body["title"], body["channel"], kp,
+                                           body["summary"])
+        workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-speak-"))
+        start = time.monotonic()
+        try:
+            out = workdir / "out.mp3"
+            audio.synthesize_speech(script, out, voice, workdir, timeout=SPEAK_TIMEOUT)
+            data = out.read_bytes()
+        except TldrTimeoutError as exc:
+            print(f"  speak timed out: {exc}", flush=True)
+            self._send_json(504, {"error": str(exc)}); return
+        except TldrError as exc:
+            print(f"  speak failed: {exc}", flush=True)
+            self._send_json(502, {"error": str(exc)}); return
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        print(f"  spoke {len(data)//1024}KB in {time.monotonic()-start:.1f}s "
+              f"(voice={voice})", flush=True)
+        self._send_bytes(200, "audio/mpeg", data)
 
 
 def _to_payload(summary: core.Summary) -> dict:

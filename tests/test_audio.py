@@ -3,15 +3,13 @@ from pathlib import Path
 import pytest
 
 from youtube_tldw import TldrError, audio
-from youtube_tldw.metadata import VideoMeta
-from youtube_tldw.summarize import TextResult
 
 
 def test_build_spoken_script_strips_markdown():
-    meta = VideoMeta("id12345abcd", "My **Great** Video", "The #1 Channel", 1000, {}, {})
-    r = TextResult(["point *one*", "point two"], "The **summary** with `code` and a "
-                   "[link](http://x).", 0.2, "why")
-    s = audio.build_spoken_script(meta, r)
+    s = audio.build_spoken_script(
+        "My **Great** Video", "The #1 Channel",
+        ["point *one*", "point two"],
+        "The **summary** with `code` and a [link](http://x).")
     assert "Key points" in s and "Summary" in s
     assert "point one" in s and "point two" in s
     assert "summary" in s and "link" in s
@@ -21,14 +19,30 @@ def test_build_spoken_script_strips_markdown():
 
 
 def test_spoken_script_expands_unambiguous_abbreviations():
-    meta = VideoMeta("id12345abcd", "History", "Chan", 1000, {}, {})
-    r = TextResult(["Allies won WWII"], "Turnout was 60% vs. last year & rising.",
-                   0.2, "x")
-    s = audio.build_spoken_script(meta, r)
+    s = audio.build_spoken_script("History", "Chan", ["Allies won WWII"],
+                                  "Turnout was 60% vs. last year & rising.")
     assert "World War Two" in s and "WWII" not in s
     assert "versus" in s and "vs." not in s
     assert "percent" in s and "%" not in s
     assert "&" not in s and " and " in s
+
+
+def test_resolve_voice_and_aliases():
+    assert audio.resolve_voice("female") == "en_US-amy-medium"
+    assert audio.resolve_voice("male") == "en_US-ryan-high"
+    assert audio.resolve_voice("cori") == "en_GB-cori-high"
+    assert audio.resolve_voice("alan") == "en_GB-alan-medium"
+    with pytest.raises(TldrError):
+        audio.resolve_voice("../etc/passwd")
+    with pytest.raises(TldrError):
+        audio.resolve_voice("nope")
+
+
+def test_voice_list_shape():
+    vs = audio.voice_list()
+    ids = {v["id"] for v in vs}
+    assert "amy" in ids and "cori" in ids and "alan" in ids
+    assert all("label" in v and "id" in v for v in vs)
 
 
 def test_extract_audio_command(monkeypatch, tmp_path):
@@ -59,7 +73,7 @@ def test_synthesize_speech_uses_piper_then_ffmpeg(monkeypatch, tmp_path):
 
     monkeypatch.setattr(audio, "run", fake_run)
     monkeypatch.setattr(audio, "require_piper", lambda: None)
-    monkeypatch.setattr(audio, "ensure_voice", lambda gender, **k: "en_US-amy-medium")
+    monkeypatch.setattr(audio, "ensure_voice", lambda v, **k: "en_US-amy-medium")
     out = tmp_path / "out.mp3"
     audio.synthesize_speech("hello world", out, "female", tmp_path)
 
@@ -74,10 +88,10 @@ def test_ensure_voice_downloads_when_missing(monkeypatch, tmp_path):
     captured = {}
     monkeypatch.setattr(audio, "VOICE_DIR", tmp_path / "voices")
     monkeypatch.setattr(audio, "run", lambda argv, **kw: captured.update(argv=argv))
-    name = audio.ensure_voice("male")
-    assert name == "en_US-ryan-medium"
+    name = audio.ensure_voice("male")  # alias -> ryan
+    assert name == "en_US-ryan-high"
     assert "piper.download_voices" in captured["argv"]
-    assert "en_US-ryan-medium" in captured["argv"]
+    assert "en_US-ryan-high" in captured["argv"]
 
 
 def test_ensure_voice_skips_download_when_present(monkeypatch, tmp_path):

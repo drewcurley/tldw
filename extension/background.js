@@ -3,9 +3,11 @@
 // summarize (a plain awaited fetch in the click handler would be suspended ~30s in
 // and silently never deliver a result). A hard timeout guarantees an answer.
 
-const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "" };
+const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "", voice: "amy" };
 const CLIENT_TIMEOUT_MS = 150000;
-const cache = new Map(); // videoId -> payload (best-effort)
+const SPEAK_TIMEOUT_MS = 170000;        // first-use voice download can be slow
+const cache = new Map();                // videoId -> summary payload
+const audioCache = new Map();           // `${videoId}|${voice}` -> data: URL
 
 function videoIdFromUrl(url) {
   try {
@@ -45,79 +47,147 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "tldw") return;
-  port.onMessage.addListener(async (msg) => {
-    if (!msg || msg.type !== "summarize") return;
-    const { url, videoId } = msg;
-    if (videoId && cache.has(videoId)) {
-      safePost(port, { type: "result", payload: cache.get(videoId), cached: true });
-      return;
-    }
-    const { serverUrl, token } = await getSettings();
-    if (!token) {
-      safePost(port, { type: "error",
-        error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
-      return;
-    }
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), CLIENT_TIMEOUT_MS);
-    let gotTerminal = false;
-    try {
-      const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/summarize/stream", {
-        method: "POST", signal: ctrl.signal,
-        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-        body: JSON.stringify({ url }),
-      });
-      if (!resp.ok) {
-        let detail = "";
-        try { detail = (await resp.json()).error || ""; } catch (_) {}
-        safePost(port, { type: "error", error: httpError(resp.status, detail) });
-        return;
-      }
-      // Stream of NDJSON events: {type:progress|result|error}, one per line.
-      const reader = resp.body.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line) continue;
-          let ev;
-          try { ev = JSON.parse(line); } catch (_) { continue; }
-          if (ev.type === "progress") {
-            safePost(port, { type: "progress", message: ev.message,
-              percent: ev.percent, creep: ev.creep });
-          } else if (ev.type === "result") {
-            gotTerminal = true;
-            if (videoId) cache.set(videoId, ev);
-            safePost(port, { type: "result", payload: ev });
-          } else if (ev.type === "error") {
-            gotTerminal = true;
-            safePost(port, { type: "error", error: httpError(ev.status, ev.error) });
-          }
-        }
-      }
-      if (!gotTerminal) {
-        safePost(port, { type: "error",
-          error: "The summary stream ended unexpectedly. Try again." });
-      }
-    } catch (e) {
-      if (e.name === "AbortError") {
-        safePost(port, { type: "error",
-          error: "Summarizing timed out (over 150s). Try again, or use the tldw CLI for long videos." });
-      } else {
-        safePost(port, { type: "error",
-          error: "Can't reach the tldw server. Is it running? In a terminal:  tldw serve" });
-      }
-    } finally {
-      clearTimeout(timer);
-    }
+  port.onMessage.addListener((msg) => {
+    if (!msg) return;
+    if (msg.type === "summarize") handleSummarize(port, msg);
+    else if (msg.type === "speak") handleSpeak(port, msg);
+    // "ping" is ignored; receiving it just keeps the worker alive
   });
 });
+
+async function handleSummarize(port, msg) {
+  const { url, videoId } = msg;
+  if (videoId && cache.has(videoId)) {
+    safePost(port, { type: "result", payload: cache.get(videoId), cached: true });
+    return;
+  }
+  const { serverUrl, token } = await getSettings();
+  if (!token) {
+    safePost(port, { type: "error",
+      error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
+    return;
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), CLIENT_TIMEOUT_MS);
+  let gotTerminal = false;
+  try {
+    const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/summarize/stream", {
+      method: "POST", signal: ctrl.signal,
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({ url }),
+    });
+    if (!resp.ok) {
+      let detail = "";
+      try { detail = (await resp.json()).error || ""; } catch (_) {}
+      safePost(port, { type: "error", error: httpError(resp.status, detail) });
+      return;
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch (_) { continue; }
+        if (ev.type === "progress") {
+          safePost(port, { type: "progress", message: ev.message,
+            percent: ev.percent, creep: ev.creep });
+        } else if (ev.type === "result") {
+          gotTerminal = true;
+          if (videoId) cache.set(videoId, ev);
+          safePost(port, { type: "result", payload: ev });
+        } else if (ev.type === "error") {
+          gotTerminal = true;
+          safePost(port, { type: "error", error: httpError(ev.status, ev.error) });
+        }
+      }
+    }
+    if (!gotTerminal) {
+      safePost(port, { type: "error", error: "The summary stream ended unexpectedly. Try again." });
+    }
+  } catch (e) {
+    if (e.name === "AbortError") {
+      safePost(port, { type: "error",
+        error: "Summarizing timed out (over 150s). Try again, or use the tldw CLI for long videos." });
+    } else {
+      safePost(port, { type: "error",
+        error: "Can't reach the tldw server. Is it running? In a terminal:  tldw serve" });
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function handleSpeak(port, msg) {
+  const { videoId, voice, payload } = msg;
+  const key = (videoId || "") + "|" + voice;
+  if (audioCache.has(key)) {
+    safePost(port, { type: "audio", dataUrl: audioCache.get(key), cached: true });
+    return;
+  }
+  const { serverUrl, token } = await getSettings();
+  if (!token) {
+    safePost(port, { type: "speakError",
+      error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
+    return;
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), SPEAK_TIMEOUT_MS);
+  try {
+    const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/speak", {
+      method: "POST", signal: ctrl.signal,
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({
+        title: payload.title, channel: payload.channel,
+        key_points: payload.key_points, summary: payload.summary_md, voice,
+      }),
+    });
+    if (!resp.ok) {
+      let detail = "";
+      try { detail = (await resp.json()).error || ""; } catch (_) {}
+      safePost(port, { type: "speakError", error: speakError(resp.status, detail) });
+      return;
+    }
+    const dataUrl = "data:audio/mpeg;base64," + bufToBase64(await resp.arrayBuffer());
+    audioCache.set(key, dataUrl);
+    safePost(port, { type: "audio", dataUrl });
+  } catch (e) {
+    if (e.name === "AbortError") {
+      safePost(port, { type: "speakError",
+        error: "Audio generation timed out. Try again (first use downloads the voice)." });
+    } else {
+      safePost(port, { type: "speakError",
+        error: "Can't reach the tldw server. Is it running?  tldw serve" });
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function bufToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  const chunk = 0x8000;  // avoid call-stack blowup on multi-MB buffers
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+function speakError(status, detail) {
+  if (status === 401) return "Token mismatch. Re-check the token in the extension's Options.";
+  if (status === 429) return "Server busy, try again in a moment.";
+  if (status === 503) return detail || "Audio isn't available — Piper TTS isn't installed on the server.";
+  if (status === 504) return "Audio generation timed out. Try again.";
+  return detail || ("Audio failed (server error " + status + ").");
+}
 
 function safePost(port, msg) {
   try { port.postMessage(msg); } catch (_) {}
