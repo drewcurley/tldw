@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 import tempfile
@@ -26,7 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tldw",
         description="Summarize a YouTube video into a text or video TL;DW "
-        "using your Claude Max subscription.",
+        "using the `claude` CLI (any Claude plan or API key) — or another model "
+        "via --llm-cmd.",
     )
     p.add_argument("url", help="YouTube URL (watch / youtu.be / shorts) or bare video id")
     p.add_argument("--mode", choices=["text", "video"], default="video",
@@ -65,6 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="(video) don't fade in the source timestamp at each cut")
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT,
                    help=f"Base output dir (default {DEFAULT_OUTPUT})")
+    p.add_argument("--llm-cmd", default=None, metavar="CMD",
+                   help="LLM backend command (reads prompt on stdin, prints the "
+                        "model's text). Default: the `claude` CLI. Or set TLDW_LLM_CMD. "
+                        "e.g. \"llm -m gpt-4o\" or \"ollama run llama3\".")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 
@@ -225,7 +231,12 @@ def _run_video(args, video_id: str, max_ms, workdir: Path) -> Path:
 
 def run(args: argparse.Namespace) -> int:
     max_ms = _validate_args(args)
-    proc.require("claude", "yt-dlp", "ffmpeg", "ffprobe")
+    if args.llm_cmd:
+        os.environ["TLDW_LLM_CMD"] = args.llm_cmd
+    required = ["yt-dlp", "ffmpeg", "ffprobe"]
+    if not (args.llm_cmd or os.environ.get("TLDW_LLM_CMD")):
+        required.append("claude")  # only needed for the default backend
+    proc.require(*required)
     if args.render_audio and args.mode == "text":
         audio.require_piper()  # fail fast before any Claude work
     video_id = canonical_video_id(args.url)
@@ -251,6 +262,8 @@ def _serve_parser() -> argparse.ArgumentParser:
     p.add_argument("--token", default=None, help="bearer token (or set TLDW_TOKEN)")
     p.add_argument("--allow-origin", default=None,
                    help="pin one extension origin; default allows any chrome-extension://")
+    p.add_argument("--llm-cmd", default=None, metavar="CMD",
+                   help="LLM backend command (default: claude CLI; or set TLDW_LLM_CMD)")
     return p
 
 
@@ -258,9 +271,10 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     # Dispatch `serve` before argparse so `tldw <url>` stays unchanged.
     if argv and argv[0] == "serve":
-        import os
         from . import server
         sargs = _serve_parser().parse_args(argv[1:])
+        if sargs.llm_cmd:
+            os.environ["TLDW_LLM_CMD"] = sargs.llm_cmd
         try:
             server.serve(sargs.host, sargs.port,
                          sargs.token or os.environ.get("TLDW_TOKEN"),

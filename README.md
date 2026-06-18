@@ -1,8 +1,10 @@
 # youtube-tldw
 
 Turn a YouTube video into a succinct **TL;DW** — either as Markdown text or as a
-recut MP4 of just the key moments — using your **Claude Max subscription** (no API
-keys, no per-token billing).
+recut MP4 of just the key moments — using the **`claude` CLI** (works with any Claude
+plan — Pro/Max/Team — or an Anthropic API key; no per-token billing on a subscription).
+You can also point it at **another model** (OpenAI, Gemini, local/Ollama) — see
+[Using other models](#using-other-models).
 
 ## How it works
 
@@ -113,6 +115,23 @@ loopback-only, token-protected, and accepts only `chrome-extension://` origins;
 nothing leaves your machine beyond the usual `yt-dlp` + `claude` calls. This is
 **local-only by design** — to share it, others install it on their own machine and
 use their own Claude plan (no hosted/shared server).
+
+## Using other models
+
+By default the summarizer shells out to the `claude` CLI (whatever it's logged into:
+Claude Pro/Max/Team, or `ANTHROPIC_API_KEY`). To use a different model, set a backend
+command that **reads the prompt on stdin and prints the model's text on stdout**:
+
+```bash
+# any run, or `tldw serve`, accepts --llm-cmd (or set TLDW_LLM_CMD)
+tldw <url> --mode text --llm-cmd "llm -m gpt-4o"        # Simon Willison's llm CLI
+tldw <url> --mode text --llm-cmd "ollama run llama3.1"  # fully local
+TLDW_LLM_CMD="llm -m gemini-1.5-pro" tldw serve
+```
+
+The backend is **operator config only** (never set by an extension/HTTP request).
+Text summaries port cleanly to most models; the **video** cue-selection needs reliable
+structured JSON, where smaller/local models may be less consistent than Claude.
 
 ## Development
 

@@ -1,15 +1,21 @@
-"""Call the Claude Max subscription via headless `claude -p`.
+"""Call an LLM backend headlessly and get back validated JSON.
 
-The static prompt template is passed on argv; the (untrusted, possibly huge)
-transcript is piped on stdin. We parse the JSON envelope, pull `.result`, strip
-any markdown fences, parse the inner JSON, and validate it. Exactly one repair
-retry on bad/invalid JSON, then abort.
+Default backend: the `claude` CLI (`claude -p --output-format json`), which uses
+whatever the CLI is logged into — Claude Pro, Max, Team, or an Anthropic API key.
+Override with the `TLDW_LLM_CMD` env var (or `--llm-cmd`): any command that reads the
+prompt on stdin and prints the model's text on stdout (e.g. the `llm` CLI or
+`ollama run <model>`), letting you use OpenAI/Gemini/local models instead.
+
+The prompt + (untrusted) transcript are piped on stdin — never argv, never a shell.
+The backend command itself is OPERATOR config (env/flag), never request-controlled.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 from typing import Callable
 
 from . import ClaudeError, TldrError, TldrTimeoutError
@@ -25,7 +31,7 @@ def _extract_result_text(stdout: str) -> str:
     if not stdout:
         raise ClaudeError(
             "Claude returned no output. Are you logged in? Try `claude` once "
-            "interactively to confirm your Max session."
+            "interactively to confirm your session."
         )
     try:
         envelope = json.loads(stdout)
@@ -37,6 +43,22 @@ def _extract_result_text(stdout: str) -> str:
     if not isinstance(result, str) or not result.strip():
         raise ClaudeError("Claude returned an empty result.")
     return result
+
+
+def _raw_extract(stdout: str) -> str:
+    """A generic backend just prints the model's text; use it verbatim."""
+    text = stdout.strip()
+    if not text:
+        raise ClaudeError("The LLM command returned no output.")
+    return text
+
+
+def _backend() -> tuple[list[str], Callable[[str], str]]:
+    """(argv, extractor) for the configured backend. argv reads the prompt on stdin."""
+    cmd = os.environ.get("TLDW_LLM_CMD", "").strip()
+    if cmd:
+        return shlex.split(cmd), _raw_extract
+    return ["claude", "-p", "--output-format", "json"], _extract_result_text
 
 
 def _parse_inner_json(text: str) -> dict:
@@ -62,28 +84,27 @@ def ask_json(
     `validate` receives the parsed dict and returns the caller's object (or raises
     ValueError/TldrError to trigger the single retry).
     """
-    argv = ["claude", "-p", prompt, "--output-format", "json"]
+    argv, extract = _backend()
     last_err: Exception | None = None
     for attempt in range(2):
-        payload = stdin_payload
+        full = prompt + "\n\n" + stdin_payload
         if attempt == 1:
-            payload = (
-                stdin_payload
-                + "\n\nIMPORTANT: Your previous reply was not valid JSON matching "
-                "the requested schema. Reply with ONLY the raw JSON object, no "
-                "prose, no markdown fences."
+            full += (
+                "\n\nIMPORTANT: Your previous reply was not valid JSON matching the "
+                "requested schema. Reply with ONLY the raw JSON object, no prose, no "
+                "markdown fences."
             )
         try:
-            result = run(argv, stdin=payload, timeout=timeout)
+            result = run(argv, stdin=full, timeout=timeout)
         except TldrTimeoutError:
             raise  # surfaces as 504, not swallowed by the retry
         except TldrError as exc:
             raise ClaudeError(str(exc)) from exc  # non-zero exit etc. -> 502
         try:
-            data = _parse_inner_json(_extract_result_text(result.stdout))
+            data = _parse_inner_json(extract(result.stdout))
             return validate(data)
         except (ValueError, json.JSONDecodeError, TldrError) as exc:
             last_err = exc
     raise ClaudeError(
-        f"Claude did not return valid structured output after a retry: {last_err}"
+        f"The model did not return valid structured output after a retry: {last_err}"
     )

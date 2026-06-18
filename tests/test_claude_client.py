@@ -63,6 +63,38 @@ def test_empty_result_raises(monkeypatch):
         claude_client.ask_json("p", "data", validate=lambda d: d)
 
 
+def test_default_backend_is_claude_envelope(monkeypatch):
+    monkeypatch.delenv("TLDW_LLM_CMD", raising=False)
+    captured = {}
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        captured["stdin"] = kw.get("stdin")
+        return _envelope('{"ok": 2}')
+
+    monkeypatch.setattr(claude_client, "run", fake_run)
+    out = claude_client.ask_json("PROMPT", "DATA", validate=lambda d: d)
+    assert out == {"ok": 2}
+    assert captured["argv"][0] == "claude" and "--output-format" in captured["argv"]
+    assert "PROMPT" in captured["stdin"] and "DATA" in captured["stdin"]  # both on stdin
+
+
+def test_custom_backend_raw_stdout(monkeypatch):
+    monkeypatch.setenv("TLDW_LLM_CMD", "mymodel --json")
+    captured = {}
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        captured["stdin"] = kw.get("stdin")
+        return ProcResult(0, '{"ok": 5}', "")  # raw model text, no envelope
+
+    monkeypatch.setattr(claude_client, "run", fake_run)
+    out = claude_client.ask_json("P", "D", validate=lambda d: d)
+    assert out == {"ok": 5}
+    assert captured["argv"] == ["mymodel", "--json"]   # shlex-split operator command
+    assert "P" in captured["stdin"] and "D" in captured["stdin"]
+
+
 def test_validator_rejection_triggers_retry(monkeypatch):
     def validate(d):
         if "good" not in d:
