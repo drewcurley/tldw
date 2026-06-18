@@ -143,6 +143,24 @@ def test_preflight_allows_extension_origin(srv):
     assert hdrs.get("Access-Control-Allow-Origin") == EXT_ORIGIN
 
 
+def test_token_persists_across_calls(monkeypatch, tmp_path):
+    tf = tmp_path / "token"
+    monkeypatch.setattr(server, "TOKEN_FILE", tf)
+    t1, p1 = server.load_or_create_token(None)
+    assert p1 and tf.exists()
+    t2, p2 = server.load_or_create_token(None)
+    assert t2 == t1 and p2                     # stable across restarts
+    assert oct(tf.stat().st_mode)[-3:] == "600"  # not world-readable
+
+
+def test_explicit_token_not_persisted(monkeypatch, tmp_path):
+    tf = tmp_path / "token"
+    monkeypatch.setattr(server, "TOKEN_FILE", tf)
+    t, persisted = server.load_or_create_token("explicit-token")
+    assert t == "explicit-token" and not persisted
+    assert not tf.exists()
+
+
 def test_preflight_rejects_web_origin(srv):
     _, port = srv
     status, _, hdrs = _req(port, "OPTIONS", body=None,

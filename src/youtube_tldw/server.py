@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import hmac
 import json
+import os
 import re
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from . import (
     BadUrlError,
@@ -35,6 +38,26 @@ MAX_BODY_BYTES = 16 * 1024
 MAX_CONCURRENCY = 2
 REQUEST_TIMEOUT = 120.0  # per-request claude budget (shorter than the CLI's)
 _LANG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,15}$")
+TOKEN_FILE = Path.home() / ".config" / "youtube-tldw" / "token"
+
+
+def load_or_create_token(explicit: str | None) -> tuple[str, bool]:
+    """Resolve the token: explicit/env > persisted file > newly generated+saved.
+
+    Returns (token, persisted_path_used). A stable per-install token means the
+    extension only needs to be configured once.
+    """
+    if explicit:
+        return explicit, False
+    if TOKEN_FILE.exists():
+        saved = TOKEN_FILE.read_text().strip()
+        if saved:
+            return saved, True
+    token = secrets.token_urlsafe(32)
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(token)
+    os.chmod(TOKEN_FILE, 0o600)
+    return token, True
 
 # Typed error -> HTTP status.
 _STATUS = {
@@ -88,8 +111,8 @@ class _Handler(BaseHTTPRequestHandler):
             return False
         return hmac.compare_digest(header[len(prefix):], self.server.token)
 
-    def log_message(self, *args) -> None:  # don't log request lines (may carry data)
-        pass
+    # Default log_message is kept: it logs only "METHOD /path HTTP/x" + status to
+    # stderr (no body, no token, no query) — exactly the activity feedback we want.
 
     # --- routes --------------------------------------------------------------
     def do_OPTIONS(self) -> None:
@@ -163,6 +186,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(lang, str) or not _LANG_RE.match(lang):
             self._send_json(400, {"error": "invalid lang"})
             return
+        start = time.monotonic()
         try:
             summary = core.summarize_url(
                 body["url"], ratio, lang,
@@ -170,8 +194,10 @@ class _Handler(BaseHTTPRequestHandler):
             )
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
+            print(f"  summarize failed ({status}) in {time.monotonic()-start:.1f}s: {exc}", flush=True)
             self._send_json(status, {"error": str(exc)})
             return
+        print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s", flush=True)
         self._send_json(200, _to_payload(summary))
 
 
@@ -207,11 +233,14 @@ def serve(host: str = "127.0.0.1", port: int = 8765,
             "Refusing to bind a non-loopback host. Hosting for others needs TLS and "
             "API billing — see docs/reviews/PLAN-extension.md."
         )
-    token = token or secrets.token_urlsafe(32)
+    token, persisted = load_or_create_token(token)
     httpd = _Server((host, port), token, allow_origin)
-    print(f"tldw serve listening on http://{host}:{port}")
+    print(f"tldw serve listening on http://{host}:{port}", flush=True)
     print(f"  token: {token}")
-    print("  paste this token into the extension's options. Ctrl-C to stop.")
+    if persisted:
+        print(f"  (saved to {TOKEN_FILE} — stable across restarts; configure the "
+              "extension once)")
+    print("  Ctrl-C to stop. Requests are logged below:")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

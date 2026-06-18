@@ -10,6 +10,9 @@
   let root = null;
   let lastFocused = null;
   let stageTimer = null;
+  let port = null;
+  let safetyTimer = null;
+  let requestActive = false;
 
   const esc = (s) =>
     String(s).replace(/[&<>"']/g, (c) =>
@@ -106,10 +109,36 @@
 
   function close() {
     if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
+    if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
+    requestActive = false;            // suppress late port errors after a manual close
+    if (port) { try { port.disconnect(); } catch (_) {} port = null; }
     document.removeEventListener("keydown", onKey, true);
     if (host && host.parentNode) host.parentNode.removeChild(host);
     host = root = null;
     if (lastFocused && lastFocused.focus) { try { lastFocused.focus(); } catch (_) {} }
+  }
+
+  function startSummarize(url, videoId) {
+    showLoading();
+    requestActive = true;
+    port = chrome.runtime.connect({ name: "tldw" });
+    port.onMessage.addListener((m) => {
+      if (!requestActive) return;
+      requestActive = false;
+      if (m.type === "result") showResult(m.payload, m.cached);
+      else if (m.type === "error") showError(m.error);
+    });
+    port.onDisconnect.addListener(() => {
+      if (!requestActive) return;
+      requestActive = false;
+      showError("Lost connection to the extension worker. Click TL;DW to try again.");
+    });
+    port.postMessage({ type: "summarize", url, videoId });
+    safetyTimer = setTimeout(() => {
+      if (!requestActive) return;
+      requestActive = false;
+      showError("This is taking too long. Make sure `tldw serve` is running, then try again.");
+    }, 160000);
   }
 
   function showLoading() {
@@ -121,16 +150,21 @@
     }, 3000);
   }
 
+  function clearTimers() {
+    if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
+    if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
+  }
+
   function showError(msg) {
     if (!host) mount();
-    if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
+    clearTimers();
     const c = root.querySelector(".content");
     c.innerHTML = `<div class="status err">${esc(msg).replace(/`([^`]+)`/g, "<code>$1</code>")}</div>`;
   }
 
   function showResult(p, cached) {
     if (!host) mount();
-    if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
+    clearTimers();
     root.querySelector("#tldw-h").textContent = "TL;DW" + (cached ? " (cached)" : "");
     const c = root.querySelector(".content");
     const points = (p.key_points || []).map((k) => `<li>${esc(k)}</li>`).join("");
@@ -157,8 +191,7 @@
   }
 
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.type === "TLDW_LOADING") showLoading();
-    else if (msg.type === "TLDW_RESULT") showResult(msg.payload, msg.cached);
+    if (msg.type === "TLDW_INVOKE") startSummarize(msg.url, msg.videoId);
     else if (msg.type === "TLDW_ERROR") showError(msg.error);
   });
 })();
