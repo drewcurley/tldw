@@ -6,6 +6,8 @@
   if (window.__tldwInit) return;
   window.__tldwInit = true;
 
+  const api = globalThis.browser ?? globalThis.chrome;  // Firefox/Chrome shim
+
   let host = null;
   let root = null;
   let lastFocused = null;
@@ -179,7 +181,7 @@
   function startSummarize(url, videoId) {
     showLoading();
     requestActive = true;
-    port = chrome.runtime.connect({ name: "tldw" });
+    port = api.runtime.connect({ name: "tldw" });
     port.onMessage.addListener((m) => {
       if (!requestActive) return;
       if (m.type === "progress") { updateProgress(m.message, m.percent, m.creep); return; }
@@ -309,11 +311,10 @@
     const sel = root.querySelector(".voice");
     sel.innerHTML = VOICE_OPTIONS.map(
       (v) => `<option value="${esc(v.id)}">${esc(v.label)}</option>`).join("");
-    try {
-      chrome.storage.local.get({ voice: "amy" }, (s) => {
-        if (sel && [...sel.options].some((o) => o.value === s.voice)) sel.value = s.voice;
-      });
-    } catch (_) {}
+    // Promise form works in both Firefox (browser.*) and Chrome MV3 (chrome.*).
+    api.storage.local.get({ voice: "amy" }).then((s) => {
+      if (sel && [...sel.options].some((o) => o.value === s.voice)) sel.value = s.voice;
+    }).catch(() => {});
   }
 
   function requestAudio() {
@@ -326,7 +327,7 @@
     btn.disabled = true; if (sel) sel.disabled = true;
     status.textContent = "Starting…";
     setCircle(null);                                    // indeterminate until first %
-    audioPort = chrome.runtime.connect({ name: "tldw" });
+    audioPort = api.runtime.connect({ name: "tldw" });
     audioPing = setInterval(() => { try { audioPort.postMessage({ type: "ping" }); } catch (_) {} }, 20000);
     audioPort.onMessage.addListener((m) => {
       if (!busy) return;
@@ -395,7 +396,7 @@
     if (sel) sel.disabled = true;
     status.textContent = "Finding key moments…";
     setCircle(null);
-    segPort = chrome.runtime.connect({ name: "tldw" });
+    segPort = api.runtime.connect({ name: "tldw" });
     segPing = setInterval(() => { try { segPort.postMessage({ type: "ping" }); } catch (_) {} }, 20000);
     segPort.onMessage.addListener((m) => {
       if (!busy) return;
@@ -564,7 +565,7 @@
       `Source: ${p.source_url}\n\n## Key points\n${kp}\n\n## Summary\n${p.summary_md}\n`;
   }
 
-  chrome.runtime.onMessage.addListener((msg) => {
+  api.runtime.onMessage.addListener((msg) => {
     if (msg.type === "TLDW_INVOKE") {
       // Re-open instantly if we already summarized this video this page-session.
       if (lastPayload && lastPayload.video_id === msg.videoId) showResult(lastPayload, true);

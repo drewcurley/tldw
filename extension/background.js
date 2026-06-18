@@ -3,6 +3,10 @@
 // summarize (a plain awaited fetch in the click handler would be suspended ~30s in
 // and silently never deliver a result). A hard timeout guarantees an answer.
 
+// Cross-browser: Firefox exposes promise-based `browser.*`; Chrome uses `chrome.*`
+// (also promise-based in MV3). Either way, `api` gives us promises.
+const api = globalThis.browser ?? globalThis.chrome;
+
 const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "", voice: "amy" };
 const CLIENT_TIMEOUT_MS = 150000;
 const SPEAK_TIMEOUT_MS = 170000;        // first-use voice download can be slow
@@ -25,18 +29,18 @@ function videoIdFromUrl(url) {
 }
 
 async function getSettings() {
-  const s = await chrome.storage.local.get(DEFAULTS);
+  const s = await api.storage.local.get(DEFAULTS);
   return { serverUrl: s.serverUrl || DEFAULTS.serverUrl, token: s.token || "" };
 }
 
 function send(tabId, msg) {
-  chrome.tabs.sendMessage(tabId, msg).catch(() => {});
+  api.tabs.sendMessage(tabId, msg).catch(() => {});
 }
 
-chrome.action.onClicked.addListener(async (tab) => {
+api.action.onClicked.addListener(async (tab) => {
   if (!tab.id) return;
   const videoId = tab.url && videoIdFromUrl(tab.url);
-  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+  await api.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
   if (!videoId) {
     send(tab.id, { type: "TLDW_ERROR",
       error: "Open a YouTube video (a /watch page) first, then click TL;DW." });
@@ -45,7 +49,7 @@ chrome.action.onClicked.addListener(async (tab) => {
   send(tab.id, { type: "TLDW_INVOKE", url: tab.url, videoId });
 });
 
-chrome.runtime.onConnect.addListener((port) => {
+api.runtime.onConnect.addListener((port) => {
   if (port.name !== "tldw") return;
   port.onMessage.addListener((msg) => {
     if (!msg) return;
