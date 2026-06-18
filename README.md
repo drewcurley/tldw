@@ -20,17 +20,33 @@ You can also point it at **another model** (OpenAI, Gemini, local/Ollama) — se
 
 ## Requirements
 
-These must be on your `PATH` (all already installed if you use Claude Code + brew):
+- **Python 3.11+**
+- **`claude` CLI** — logged into any Claude plan (Pro/Max/Team) or with
+  `ANTHROPIC_API_KEY` set. Install from
+  [claude.com/claude-code](https://www.claude.com/product/claude-code) (or
+  `npm i -g @anthropic-ai/claude-code`), then run `claude` once to log in.
+  *(Or use a different model via [Using other models](#using-other-models) — then
+  `claude` isn't needed.)*
+- **`yt-dlp`** and **`ffmpeg`/`ffprobe`** on your `PATH`:
+  - macOS: `brew install yt-dlp ffmpeg`
+  - Linux: e.g. `sudo apt install ffmpeg` + `pipx install yt-dlp`
 
-- `claude` (logged into your Max account)
-- `yt-dlp`
-- `ffmpeg` / `ffprobe`
+Developed and tested on macOS; Linux should work the same. (The browser extension is
+Chromium-based — see [Browser extension](#browser-extension-text-only).)
 
 ## Install
 
 ```bash
+git clone https://github.com/drewcurley/tldw.git
+cd tldw
+
+# Recommended: a global `tldw` command (also what the browser extension's server uses)
+pipx install .
+pipx inject youtube-tldw piper-tts      # optional: text-to-speech voices
+
+# …or a local virtualenv instead of pipx:
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
+pip install -e ".[tts]"
 ```
 
 ## Usage
@@ -52,7 +68,7 @@ tldw "https://youtu.be/VIDEO_ID" --mode video --ratio 0.2 --keep-source
 |------|-------------|
 | `--mode {text,video}` | Defaults to `video`. |
 | `--render-audio` | Also save an mp3: video → the recut audio; text → spoken summary (TTS). |
-| `--voice {female,male}` | Voice for text-mode TTS (default `female`). |
+| `--voice VOICE` | Text-mode TTS voice: `female`/`male` or a named US/UK voice (`amy`, `ryan`, `cori`, `alan`, …). |
 | `--ratio FLOAT` | Target fraction of original length (`0 < r <= 1`). Omit to let the AI choose. |
 | `--max-length DUR` | Hard cap (`5m`, `90s`, `1m30s`). **Wins over `--ratio`.** |
 | `--lang CODE` | Preferred subtitle language (default `en`). |
@@ -85,8 +101,9 @@ The URL argument also accepts a **bare 11-character video id** (e.g. `tldw 86QbF
 
 - **video mode** → extracts the recut video's audio to an mp3.
 - **text mode** → synthesizes the summary to natural speech using **Piper** (local
-  neural TTS, no API keys). `--voice female|male`. Voice models download once on
-  first use into `~/.cache/youtube-tldw/voices/`.
+  neural TTS, no API keys). 13 US/UK voices (`--voice female|male` or a named voice
+  like `amy`/`ryan`/`cori`/`alan`). Voice models download once on first use into
+  `~/.cache/youtube-tldw/voices/`.
 
 Text-mode TTS needs Piper installed: `pipx inject youtube-tldw piper-tts`
 (or `pip install -e ".[tts]"` for a dev checkout).
@@ -100,21 +117,29 @@ Text-mode TTS needs Piper installed: `pipx inject youtube-tldw piper-tts`
   audio/  {channel} - {video} - tl;dw - {length}.mp3
 ```
 
-## Browser extension (text only)
+## Browser extension
 
-Summarize the video you're watching with one toolbar click — the summary appears in
-a modal on the page, powered by a small local server:
+One toolbar click on a YouTube page summarizes the video in an on-page modal, and from
+there you can also **🔊 Listen** (text-to-speech of the summary) or **⏭ Play key
+moments** (auto-skip the real YouTube player through just the key segments). Powered by
+a small local server:
 
 ```bash
-tldw serve            # prints a bearer token; binds 127.0.0.1:8765
+tldw serve            # prints a bearer token (saved + reused); binds 127.0.0.1:8765
 ```
 
-Then load `extension/` unpacked in `chrome://extensions` and paste the token into the
-extension options. See [`extension/README.md`](extension/README.md). The server is
-loopback-only, token-protected, and accepts only `chrome-extension://` origins;
-nothing leaves your machine beyond the usual `yt-dlp` + `claude` calls. This is
-**local-only by design** — to share it, others install it on their own machine and
-use their own Claude plan (no hosted/shared server).
+Then load `extension/` unpacked and paste the token into the extension options — full
+steps in [`extension/README.md`](extension/README.md).
+
+**Browser support:** it's a Chromium MV3 extension — works in **Chrome, Edge, Brave,
+Arc, Opera, Vivaldi** (load unpacked via `chrome://extensions` → Developer mode). Firefox
+and Safari aren't supported yet (Firefox needs a small manifest port; Safari needs an
+Xcode wrapper).
+
+The server is loopback-only, token-protected, and accepts only `chrome-extension://`
+origins; nothing leaves your machine beyond the usual `yt-dlp` + `claude` calls. This is
+**local-only by design** — to share it, others install it on their own machine and use
+their own Claude plan (no hosted/shared server).
 
 ## Using other models
 
