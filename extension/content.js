@@ -132,7 +132,7 @@
     port = chrome.runtime.connect({ name: "tldw" });
     port.onMessage.addListener((m) => {
       if (!requestActive) return;
-      if (m.type === "progress") { updateProgress(m.message, m.percent); return; }
+      if (m.type === "progress") { updateProgress(m.message, m.percent, m.creep); return; }
       requestActive = false;
       if (m.type === "result") showResult(m.payload, m.cached);
       else if (m.type === "error") showError(m.error);
@@ -166,16 +166,17 @@
       </div>`;
   }
 
-  function updateProgress(msg, pct) {
+  function updateProgress(msg, pct, creep) {
     const el = root && root.querySelector(".status .msg");
     if (el) el.textContent = msg;
-    if (typeof pct === "number") setProgress(pct);
+    if (typeof pct === "number") setProgress(pct, !!creep);
   }
 
-  function setProgress(target) {
+  function setProgress(target, creep) {
     progressPct = Math.max(progressPct, target);
     applyWidth();
-    startCreep();  // keep inching forward toward the ceiling during long steps
+    // Only the long step (Claude) eases forward; quick early steps just jump.
+    if (creep) startCreep();
   }
 
   function applyWidth() {

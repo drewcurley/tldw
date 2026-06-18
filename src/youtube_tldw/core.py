@@ -40,7 +40,7 @@ def summarize_url(
     browser flow uses this so a click never blocks for minutes).
     `on_progress`: optional callback for human-readable step messages.
     """
-    log = on_progress or (lambda _m, _p=None: None)
+    log = on_progress or (lambda _m, _p=None, _c=False: None)
     video_id = canonical_video_id(url)  # BadUrlError
     log(f"video {video_id}: fetching metadata…", 3)
     workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-core-"))
@@ -61,9 +61,10 @@ def summarize_url(
                     "This transcript is too long for the browser flow; "
                     "use the `tldw` CLI for very long videos."
                 )
-        # The long step owns ~80% of the bar: it starts at 15% and the client eases
-        # it forward toward ~96% until the result lands.
-        log("summarizing with Claude (this can take 30-90s for a long video)…", 15)
+        # The long step owns ~80% of the bar: starts at 15%, and creep=True tells the
+        # client to ease forward toward ~96% from here until the result lands.
+        log("summarizing with Claude (this can take 30-90s for a long video)…", 15,
+            True)
         result = summarize.summarize_text(
             cues, meta.channel, meta.title, ratio, timeout=timeout
         )
