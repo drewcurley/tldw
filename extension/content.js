@@ -23,7 +23,8 @@
   let segPort = null, segPing = null, segSafety = null;
   let busy = false;
   let lastPayload = null;
-  let lastAudio = null;   // { videoId, dataUrl } — restore the player on re-open
+  let lastAudio = null;       // { videoId, dataUrl } — restore the player on re-open
+  let lastSegments = null;    // { videoId, segments } — re-skip without re-fetching
   // Skip-playback engine state.
   let skipVideo = null, skipSegs = null, skipIdx = 0, skipHandler = null;
   // Curated voices (kept in sync with server audio.VOICES; server validates anyway).
@@ -106,10 +107,12 @@
         .err { color: #c0392b; } .err code { background: rgba(128,128,128,.15);
           padding: 1px 6px; border-radius: 5px; }
         .audiorow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-          margin: 4px 0 14px; }
+          margin: 4px 0 6px; }
         .audiorow select { font: inherit; font-size: 13px; padding: 4px 6px;
           border-radius: 7px; border: 1px solid rgba(128,128,128,.4);
           background: transparent; color: inherit; }
+        .audioprogress { display: flex; align-items: center; gap: 8px; margin: 0 0 10px;
+          min-height: 14px; }
         .audiostatus { font-size: 12px; color: #888; }
         .audiostatus.audioerr { color: #c0392b; }
         .audioslot audio { width: 100%; margin-bottom: 12px; }
@@ -274,6 +277,8 @@
         <button class="playkey" aria-label="Play just the key moments in the YouTube player">⏭ Play key moments</button>
         <button class="listen" aria-label="Generate spoken audio of this summary">🔊 Listen to summary</button>
         <select class="voice" aria-label="Voice"></select>
+      </div>
+      <div class="audioprogress">
         <svg class="circ" viewBox="0 0 36 36" width="20" height="20" aria-hidden="true">
           <circle class="circ-bg" cx="18" cy="18" r="15.5"></circle>
           <circle class="circ-fg" cx="18" cy="18" r="15.5"></circle>
@@ -374,6 +379,11 @@
 
   function requestSegments() {
     if (busy) return;
+    const vid = lastPayload && lastPayload.video_id;
+    if (lastSegments && lastSegments.videoId === vid && lastSegments.segments.length) {
+      startSkip(lastSegments.segments);   // cached this session — skip the round-trip
+      return;
+    }
     busy = true;
     const listen = root.querySelector(".listen");
     const play = root.querySelector(".playkey");
@@ -390,8 +400,10 @@
     segPort.onMessage.addListener((m) => {
       if (!busy) return;
       if (m.type === "segProgress") { updateAudioStatus(m.message, m.percent); return; }
-      if (m.type === "segments") { teardownSeg(); finishAudioUI(); startSkip(m.segments); }
-      else if (m.type === "segError") { teardownSeg(); finishAudioUI(); showAudioError(m.error); }
+      if (m.type === "segments") {
+        lastSegments = { videoId: lastPayload && lastPayload.video_id, segments: m.segments };
+        teardownSeg(); finishAudioUI(); startSkip(m.segments);
+      } else if (m.type === "segError") { teardownSeg(); finishAudioUI(); showAudioError(m.error); }
     });
     segPort.onDisconnect.addListener(() => {
       if (!busy) return;
