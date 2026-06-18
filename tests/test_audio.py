@@ -86,12 +86,49 @@ def test_synthesize_speech_uses_piper_then_ffmpeg(monkeypatch, tmp_path):
 
 def test_ensure_voice_downloads_when_missing(monkeypatch, tmp_path):
     captured = {}
-    monkeypatch.setattr(audio, "VOICE_DIR", tmp_path / "voices")
-    monkeypatch.setattr(audio, "run", lambda argv, **kw: captured.update(argv=argv))
+    vdir = tmp_path / "voices"
+    monkeypatch.setattr(audio, "VOICE_DIR", vdir)
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "en_US-ryan-high.onnx").write_bytes(b"\x00")
+
+    monkeypatch.setattr(audio, "run", fake_run)
     name = audio.ensure_voice("male")  # alias -> ryan
     assert name == "en_US-ryan-high"
     assert "piper.download_voices" in captured["argv"]
     assert "en_US-ryan-high" in captured["argv"]
+
+
+def test_ensure_voice_retries_then_succeeds(monkeypatch, tmp_path):
+    vdir = tmp_path / "voices"
+    monkeypatch.setattr(audio, "VOICE_DIR", vdir)
+    monkeypatch.setattr(audio.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def flaky(argv, **kw):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise TldrError("SSL: UNEXPECTED_EOF_WHILE_READING")  # transient
+        vdir.mkdir(parents=True, exist_ok=True)
+        (vdir / "en_US-amy-medium.onnx").write_bytes(b"\x00")
+
+    monkeypatch.setattr(audio, "run", flaky)
+    assert audio.ensure_voice("amy") == "en_US-amy-medium"
+    assert calls["n"] == 2  # failed once, succeeded on retry
+
+
+def test_ensure_voice_gives_up_with_clean_message(monkeypatch, tmp_path):
+    monkeypatch.setattr(audio, "VOICE_DIR", tmp_path / "voices")
+    monkeypatch.setattr(audio.time, "sleep", lambda _s: None)
+
+    def always_fail(argv, **kw):
+        raise TldrError("network down")
+
+    monkeypatch.setattr(audio, "run", always_fail)
+    with pytest.raises(TldrError, match="Couldn't download"):
+        audio.ensure_voice("amy", attempts=2)
 
 
 def test_ensure_voice_skips_download_when_present(monkeypatch, tmp_path):

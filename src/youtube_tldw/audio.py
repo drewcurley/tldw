@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+import time
 from pathlib import Path
 
 from . import TldrError
@@ -89,15 +90,37 @@ def extract_audio(video: Path, out_mp3: Path, *, timeout: float = 1800) -> None:
         raise TldrError("ffmpeg did not produce the audio file.")
 
 
-def ensure_voice(voice_id: str, *, timeout: float = 180) -> str:
-    """Return the Piper model for `voice_id` (allowlisted), downloading if absent."""
+def ensure_voice(voice_id: str, *, timeout: float = 180, attempts: int = 3) -> str:
+    """Return the Piper model for `voice_id` (allowlisted), downloading if absent.
+
+    Voice-model downloads from HuggingFace occasionally drop mid-stream (SSL EOF),
+    so retry a few times and clean any partial file between tries.
+    """
     model = resolve_voice(voice_id)
-    if not (VOICE_DIR / f"{model}.onnx").exists():
-        VOICE_DIR.mkdir(parents=True, exist_ok=True)
-        print(f"Downloading voice {model}… (first use only)")
-        run([sys.executable, "-m", "piper.download_voices", model,
-             "--data-dir", str(VOICE_DIR)], timeout=timeout)
-    return model
+    onnx = VOICE_DIR / f"{model}.onnx"
+    if onnx.exists():
+        return model
+    VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    last = ""
+    for i in range(attempts):
+        try:
+            print(f"Downloading voice {model}… (attempt {i + 1}/{attempts})", flush=True)
+            run([sys.executable, "-m", "piper.download_voices", model,
+                 "--data-dir", str(VOICE_DIR)], timeout=timeout)
+            if onnx.exists():
+                return model
+            last = "download produced no model file"
+        except TldrError as exc:
+            last = str(exc)
+        for partial in VOICE_DIR.glob(f"{model}.onnx*"):  # drop partials before retry
+            partial.unlink(missing_ok=True)
+        if i + 1 < attempts:
+            time.sleep(1.5)
+    raise TldrError(
+        f"Couldn't download the voice “{model}” after {attempts} tries "
+        f"(network/SSL error: {last.splitlines()[-1] if last else 'unknown'}). "
+        "Check your connection and try again."
+    )
 
 
 def synthesize_speech(

@@ -333,7 +333,7 @@
     const btn = root && root.querySelector(".listen");
     const sel = root && root.querySelector(".voice");
     const status = root && root.querySelector(".audiostatus");
-    if (btn) { btn.disabled = false; btn.textContent = "🔊 Regenerate"; }
+    if (btn) btn.disabled = false;
     if (sel) sel.disabled = false;
     if (status) status.textContent = "";
   }
@@ -346,6 +346,8 @@
     a.controls = true; a.src = dataUrl;
     a.setAttribute("aria-label", "Spoken summary");
     slot.appendChild(a);
+    const btn = root.querySelector(".listen");
+    if (btn) btn.textContent = "🔊 Regenerate";
     a.focus();
   }
 
