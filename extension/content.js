@@ -189,11 +189,12 @@
 
   function startCreep() {
     if (creepTimer) return;
+    // Linear ~1%/s (no front-loading -> no false optimism); only the last sliver
+    // eases. If Claude finishes early the result snaps ahead (pleasant surprise).
     creepTimer = setInterval(() => {
-      if (progressPct < CREEP_CEILING) {
-        progressPct += (CREEP_CEILING - progressPct) * 0.045;  // ease-out, never stalls
-        applyWidth();
-      }
+      if (progressPct < 88) progressPct += 0.6;
+      else if (progressPct < CREEP_CEILING) progressPct += (CREEP_CEILING - progressPct) * 0.05;
+      applyWidth();
     }, 600);
   }
 
