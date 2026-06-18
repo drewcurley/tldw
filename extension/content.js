@@ -23,6 +23,7 @@
   let segPort = null, segPing = null, segSafety = null;
   let busy = false;
   let lastPayload = null;
+  let lastAudio = null;   // { videoId, dataUrl } — restore the player on re-open
   // Skip-playback engine state.
   let skipVideo = null, skipSegs = null, skipIdx = 0, skipHandler = null;
   // Curated voices (kept in sync with server audio.VOICES; server validates anyway).
@@ -293,6 +294,10 @@
     setupVoiceSelect();
     root.querySelector(".listen").onclick = requestAudio;
     root.querySelector(".playkey").onclick = requestSegments;
+    // Restore a previously generated clip for this video this session.
+    if (lastAudio && lastAudio.videoId === p.video_id && lastAudio.dataUrl) {
+      renderAudio(lastAudio.dataUrl, true);
+    }
   }
 
   function setupVoiceSelect() {
@@ -520,7 +525,7 @@
     if (svg) svg.classList.remove("on", "indet");       // hidden until next request
   }
 
-  function renderAudio(dataUrl) {
+  function renderAudio(dataUrl, restore) {
     const slot = root && root.querySelector(".audioslot");
     if (!slot) return;
     slot.innerHTML = "";                                 // replace, never stack
@@ -530,7 +535,10 @@
     slot.appendChild(a);
     const btn = root.querySelector(".listen");
     if (btn) btn.textContent = "🔊 Regenerate";
-    a.focus();
+    if (!restore) {
+      lastAudio = { videoId: lastPayload && lastPayload.video_id, dataUrl };
+      a.focus();                                         // don't steal focus on re-open
+    }
   }
 
   function showAudioError(msg) {
@@ -545,7 +553,10 @@
   }
 
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.type === "TLDW_INVOKE") startSummarize(msg.url, msg.videoId);
-    else if (msg.type === "TLDW_ERROR") showError(msg.error);
+    if (msg.type === "TLDW_INVOKE") {
+      // Re-open instantly if we already summarized this video this page-session.
+      if (lastPayload && lastPayload.video_id === msg.videoId) showResult(lastPayload, true);
+      else startSummarize(msg.url, msg.videoId);
+    } else if (msg.type === "TLDW_ERROR") showError(msg.error);
   });
 })();
