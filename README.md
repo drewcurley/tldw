@@ -117,6 +117,17 @@ Text-mode TTS needs Piper installed: `pipx inject youtube-tldw piper-tts`
   audio/  {channel} - {video} - tl;dw - {length}.mp3
 ```
 
+Set a persistent **render folder** so saved files go where you want (no `--output-dir`
+each run):
+
+```bash
+tldw config set output-dir ~/Media/tldw     # persists to ~/.config/youtube-tldw/config.json
+tldw config get                             # show config + the effective output dir
+tldw config unset output-dir                # back to the default
+```
+
+Precedence: `--output-dir` (per run) > `TLDW_OUTPUT_DIR` (env) > `tldw config` > default.
+
 ## Browser extension
 
 One toolbar click on a YouTube page summarizes the video in an on-page modal, and from

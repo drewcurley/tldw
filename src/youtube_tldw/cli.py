@@ -11,11 +11,23 @@ from pathlib import Path
 
 from . import TldrError, __version__
 from . import metadata as md
-from . import audio, naming, proc, spans, summarize, textmode, transcript, videomode
+from . import audio, config, naming, proc, spans, summarize, textmode, transcript, videomode
 from .timing import format_length, parse_duration
 from .urls import canonical_video_id
 
 DEFAULT_OUTPUT = Path.home() / "Downloads" / "youtube-tldw" / "tldws"
+
+
+def _default_output_dir() -> Path:
+    """Resolve the render/output folder: TLDW_OUTPUT_DIR env > saved config > default.
+    (`--output-dir` on the command line still overrides this.)"""
+    env = os.environ.get("TLDW_OUTPUT_DIR")
+    if env:
+        return Path(env).expanduser()
+    saved = config.get("output_dir")
+    if saved:
+        return Path(saved).expanduser()
+    return DEFAULT_OUTPUT
 XFADE_MS = 400
 MIN_CLIP_MS = 1200
 BOUNDARY_PAD_MS = 600  # pad cuts into real silence so crossfades don't clip words
@@ -65,8 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="(video) no fade-to-black 'Made with youtube-tldw' end card")
     p.add_argument("--no-timestamps", action="store_true",
                    help="(video) don't fade in the source timestamp at each cut")
-    p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT,
-                   help=f"Base output dir (default {DEFAULT_OUTPUT})")
+    p.add_argument("--output-dir", type=Path, default=_default_output_dir(),
+                   help="Base output dir for saved files (default from `tldw config` "
+                        "/ TLDW_OUTPUT_DIR, else ~/Downloads/youtube-tldw/tldws)")
     p.add_argument("--llm-cmd", default=None, metavar="CMD",
                    help="LLM backend command (reads prompt on stdin, prints the "
                         "model's text). Default: the `claude` CLI. Or set TLDW_LLM_CMD. "
@@ -267,9 +280,40 @@ def _serve_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _run_config(args: list[str]) -> int:
+    """`tldw config get` | `tldw config set output-dir <path>` | `tldw config unset <key>`."""
+    keymap = {"output-dir": "output_dir"}
+    if not args or args[0] == "get":
+        cfg = config.load()
+        if cfg:
+            for k, v in cfg.items():
+                print(f"{k.replace('_', '-')} = {v}")
+        else:
+            print("(no config set)")
+        print(f"effective output-dir: {_default_output_dir()}")
+        return 0
+    if args[0] == "set" and len(args) >= 3:
+        key = keymap.get(args[1], args[1].replace("-", "_"))
+        value = " ".join(args[2:])
+        if key == "output_dir":
+            value = str(Path(value).expanduser().resolve())
+        config.set_value(key, value)
+        print(f"set {args[1]} = {value}")
+        return 0
+    if args[0] == "unset" and len(args) >= 2:
+        key = keymap.get(args[1], args[1].replace("-", "_"))
+        print("removed" if config.unset(key) else f"{args[1]} was not set")
+        return 0
+    print("usage: tldw config get | tldw config set output-dir <path> | "
+          "tldw config unset output-dir", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    # Dispatch `serve` before argparse so `tldw <url>` stays unchanged.
+    # Dispatch `config` and `serve` before argparse so `tldw <url>` stays unchanged.
+    if argv and argv[0] == "config":
+        return _run_config(argv[1:])
     if argv and argv[0] == "serve":
         from . import server
         sargs = _serve_parser().parse_args(argv[1:])
