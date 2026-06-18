@@ -109,7 +109,8 @@
         .audiostatus { font-size: 12px; color: #888; }
         .audiostatus.audioerr { color: #c0392b; }
         .audioslot audio { width: 100%; margin-bottom: 12px; }
-        .circ { flex: 0 0 auto; }
+        .circ { flex: 0 0 auto; display: none; }
+        .circ.on { display: inline-block; }
         .circ.indet { animation: circspin 0.9s linear infinite; }
         .circ-bg { fill: none; stroke: rgba(128,128,128,.25); stroke-width: 4; }
         .circ-fg { fill: none; stroke: #c00; stroke-width: 4; stroke-linecap: round;
@@ -266,7 +267,7 @@
       <div class="audiorow">
         <button class="listen" aria-label="Generate spoken audio of this summary">🔊 Listen to summary</button>
         <select class="voice" aria-label="Voice"></select>
-        <svg class="circ" viewBox="0 0 36 36" width="20" height="20" aria-hidden="true" hidden>
+        <svg class="circ" viewBox="0 0 36 36" width="20" height="20" aria-hidden="true">
           <circle class="circ-bg" cx="18" cy="18" r="15.5"></circle>
           <circle class="circ-fg" cx="18" cy="18" r="15.5"></circle>
         </svg>
@@ -359,7 +360,7 @@
     const svg = root && root.querySelector(".circ");
     const fg = root && root.querySelector(".circ-fg");
     if (!svg || !fg) return;
-    svg.hidden = false;
+    svg.classList.add("on");                            // shown only during a request
     if (typeof percent === "number") {
       svg.classList.remove("indet");
       const C = 97.4;  // 2π·15.5
@@ -372,7 +373,7 @@
 
   function hideCircle() {
     const svg = root && root.querySelector(".circ");
-    if (svg) { svg.hidden = true; svg.classList.remove("indet"); }
+    if (svg) svg.classList.remove("on", "indet");       // hidden until next request
   }
 
   function renderAudio(dataUrl) {
