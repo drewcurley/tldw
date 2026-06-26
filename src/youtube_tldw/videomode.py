@@ -10,6 +10,8 @@ from pathlib import Path
 from . import TldrError, overlays
 from .proc import run
 from .spans import Span, build_xfade_chain, build_xfade_filter, xfade_offsets_ms
+
+_MIN_CLIP_MS = 500  # clamp guard; xfade needs a clip longer than its own duration
 from .timing import format_clock, to_ffmpeg_ts
 from .transcript import Cue
 
@@ -171,6 +173,22 @@ def recut(
     """
     if not spans:
         raise TldrError("No segments to cut.")
+
+    # yt-dlp metadata duration can be off by a second or two from the actual
+    # container.  Clamp every span to the probed source length so the last
+    # ffmpeg extraction never asks for frames that don't exist.
+    src_ms = probe_duration_ms(source)
+    clamped: list[Span] = []
+    for s in spans:
+        end = min(s.end_ms, src_ms)
+        if end - s.start_ms >= _MIN_CLIP_MS:
+            clamped.append(Span(s.start_ms, end, label_ms=s.label_ms))
+    if not clamped:
+        raise TldrError(
+            "No segments remain after clamping to the source video's actual length."
+        )
+    spans = clamped
+
     ts_on = polish is not None and polish.timestamps
     clips = [
         _extract_clip(source, s, workdir, i,
