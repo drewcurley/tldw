@@ -99,7 +99,10 @@ def _stub_pipeline(monkeypatch):
         videomode, "_extract_clip",
         lambda source, span, workdir, idx, ts_text=None: workdir / f"clip_{idx}.mp4",
     )
-    monkeypatch.setattr(videomode, "probe_duration_ms", lambda path: 2000)
+    # Source ("src.mp4") gets a large duration so clamping never drops spans;
+    # extracted clips get 2000ms (used for xfade math).
+    monkeypatch.setattr(videomode, "probe_duration_ms",
+                        lambda p: 100_000 if p.name == "src.mp4" else 2000)
 
 
 def test_recut_single_clip(monkeypatch, tmp_path):
@@ -212,7 +215,9 @@ def test_recut_passes_source_timestamp(monkeypatch, tmp_path):
         videomode, "_extract_clip",
         lambda src, s, wd, i, ts_text=None: (seen.append(ts_text), wd / f"c{i}.mp4")[1],
     )
-    monkeypatch.setattr(videomode, "probe_duration_ms", lambda p: 2000)
+    # Source gets 80000ms so the 72–75s span is not clamped away; clips get 2000ms.
+    monkeypatch.setattr(videomode, "probe_duration_ms",
+                        lambda p: 80_000 if p.name == "s.mp4" else 2000)
     monkeypatch.setattr(videomode, "_recut_polished",
                         lambda *a, **k: Path(a[2]).write_bytes(b"\x00"))
     videomode.recut(tmp_path / "s.mp4", [Span(72000, 75000)], [], tmp_path / "o.mp4",

@@ -162,6 +162,42 @@ tldw config unset output-dir                # back to the default
 
 Precedence: `--output-dir` (per run) > `TLDW_OUTPUT_DIR` (env) > `tldw config` > default.
 
+## Captionless videos (Whisper fallback)
+
+If a video has no subtitles or auto-captions, tldw normally exits with an error.
+Add `--whisper-fallback` to download the audio instead and transcribe it locally
+with [faster-whisper](https://github.com/SYSTRAN/faster-whisper):
+
+```bash
+tldw "https://youtu.be/VIDEO_ID" --whisper-fallback
+```
+
+Install faster-whisper once:
+```bash
+pipx inject youtube-tldw faster-whisper   # if using pipx
+pip install faster-whisper                # if using a venv
+# or: pip install -e ".[whisper]"         # dev checkout
+```
+
+The model downloads once to `~/.cache/youtube-tldw/whisper/` on first use.
+Default model is `small` (~244 MB, good accuracy/speed). Change it with:
+
+```bash
+tldw config set whisper-model small    # tiny/base/small/medium/large
+```
+
+| Model | Size | Speed (relative) | Notes |
+|-------|------|-----------------|-------|
+| tiny | 75 MB | fastest | usable for simple speech |
+| base | 145 MB | fast | |
+| small | **244 MB** | **default** | good balance |
+| medium | 769 MB | slower | noticeably better accuracy |
+| large | 1.5 GB | slowest | best accuracy |
+
+Transcription typically takes 0.5–2× the video length on CPU. The browser
+extension does not use this fallback (requests would time out for long videos);
+use the CLI instead.
+
 ## Browser extension
 
 One toolbar click on a YouTube page summarizes the video in an on-page modal, and from

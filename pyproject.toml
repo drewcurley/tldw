@@ -5,13 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "youtube-tldw"
 version = "0.1.0"
-description = "Summarize a YouTube video into a text or video TL;DW using a Claude Max subscription."
+description = "Summarize a YouTube video into a text or video TL;DW."
 requires-python = ">=3.11"
 dependencies = ["pillow>=10.3,<12"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
-tts = ["piper-tts>=1.2"]   # text-mode --render-audio (local neural voices)
+tts = ["piper-tts>=1.2"]       # text-mode --render-audio (local neural voices)
+whisper = ["faster-whisper>=1.0"]  # --whisper-fallback (captionless videos)
 
 [project.scripts]
 tldw = "youtube_tldw.cli:main"

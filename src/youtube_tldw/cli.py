@@ -9,9 +9,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import TldrError, __version__
+from . import NoTranscriptError, TldrError, __version__
 from . import metadata as md
 from . import audio, config, naming, proc, spans, summarize, textmode, transcript, videomode
+from . import whisper_transcribe as wt
 from .timing import format_length, parse_duration
 from .urls import canonical_video_id
 
@@ -84,6 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="LLM backend command (reads prompt on stdin, prints the "
                         "model's text). Default: the `claude` CLI. Or set TLDW_LLM_CMD. "
                         "e.g. \"llm -m gpt-4o\" or \"ollama run llama3\".")
+    p.add_argument("--whisper-fallback", action="store_true",
+                   help="If no captions are found, download audio and transcribe with "
+                        "faster-whisper (install: `pipx inject youtube-tldw faster-whisper`). "
+                        "Model size: `tldw config set whisper-model small` (tiny/base/small/"
+                        "medium/large; default: small, ~244MB download on first use).")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 
@@ -109,20 +115,42 @@ def _intro_seconds(args: argparse.Namespace) -> int:
     return DEFAULT_INTRO_S
 
 
-def _get_cues(video_id: str, lang: str, workdir: Path) -> tuple[md.VideoMeta, list]:
+def _get_cues(
+    video_id: str, lang: str, workdir: Path, *, whisper_fallback: bool = False
+) -> tuple[md.VideoMeta, list]:
     meta = md.fetch_metadata(video_id)
-    lang_key, is_auto = md.choose_track(meta, lang)
-    kind = "auto-captions" if is_auto else "subtitles"
-    print(f"Using {kind} ({lang_key}) for “{meta.title}” by {meta.channel}.")
-    content = md.download_subtitle(video_id, lang_key, is_auto, workdir)
-    cues = transcript.parse_subtitles(content)
-    print(f"Parsed {len(cues)} transcript cues "
-          f"({transcript.word_count(cues)} words).")
-    return meta, cues
+    try:
+        lang_key, is_auto = md.choose_track(meta, lang)
+        kind = "auto-captions" if is_auto else "subtitles"
+        print(f'Using {kind} ({lang_key}) for "{meta.title}" by {meta.channel}.')
+        content = md.download_subtitle(video_id, lang_key, is_auto, workdir)
+        cues = transcript.parse_subtitles(content)
+        print(f"Parsed {len(cues)} transcript cues "
+              f"({transcript.word_count(cues)} words).")
+        return meta, cues
+    except NoTranscriptError:
+        if not whisper_fallback:
+            raise
+        wt.require_whisper()  # raises with install instructions if missing
+        model = wt.resolve_model()
+        size = wt._MODEL_SIZES.get(model, "?")
+        print(f"No captions found — transcribing audio with Whisper "
+              f"(model: {model}, {size}; downloads on first use)…")
+        audio_path = wt.download_audio(video_id, workdir)
+
+        def _progress(m: str, pct: float | None = None) -> None:
+            prefix = f"  [{pct:.0f}%]" if pct is not None else "  "
+            print(f"{prefix} {m}")
+
+        cues = wt.transcribe(audio_path, model, on_progress=_progress)
+        print(f"Transcribed {len(cues)} segments "
+              f"({transcript.word_count(cues)} words).")
+        return meta, cues
 
 
 def _run_text(args, video_id: str, workdir: Path) -> Path:
-    meta, cues = _get_cues(video_id, args.lang, workdir)
+    meta, cues = _get_cues(video_id, args.lang, workdir,
+                           whisper_fallback=args.whisper_fallback)
     print("Summarizing with Claude…")
     result = summarize.summarize_text(
         cues, meta.channel, meta.title, args.ratio, timeout=CLAUDE_TIMEOUT
@@ -161,7 +189,8 @@ def _save_audio(args, meta: md.VideoMeta, tmp_mp3: Path) -> None:
 
 
 def _run_video(args, video_id: str, max_ms, workdir: Path) -> Path:
-    meta, cues = _get_cues(video_id, args.lang, workdir)
+    meta, cues = _get_cues(video_id, args.lang, workdir,
+                           whisper_fallback=args.whisper_fallback)
     print("Asking Claude which segments to keep…")
     selection = summarize.select_video_segments(
         cues, meta.channel, meta.title, args.ratio, max_ms, timeout=CLAUDE_TIMEOUT
@@ -282,7 +311,7 @@ def _serve_parser() -> argparse.ArgumentParser:
 
 def _run_config(args: list[str]) -> int:
     """`tldw config get` | `tldw config set output-dir <path>` | `tldw config unset <key>`."""
-    keymap = {"output-dir": "output_dir"}
+    keymap = {"output-dir": "output_dir", "whisper-model": "whisper_model"}
     if not args or args[0] == "get":
         cfg = config.load()
         if cfg:
