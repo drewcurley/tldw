@@ -9,6 +9,7 @@ const api = globalThis.browser ?? globalThis.chrome;
 
 const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "", voice: "amy" };
 const CLIENT_TIMEOUT_MS = 150000;
+const SEG_TIMEOUT_MS = 320000;          // segment selection can take 2-3 min (Claude JSON)
 const SPEAK_TIMEOUT_MS = 170000;        // first-use voice download can be slow
 const cache = new Map();                // videoId -> summary payload
 const audioCache = new Map();           // `${videoId}|${voice}` -> data: URL
@@ -222,7 +223,7 @@ async function handleSegments(port, msg) {
     return;
   }
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), CLIENT_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), SEG_TIMEOUT_MS);
   let gotTerminal = false;
   try {
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/segments/stream", {

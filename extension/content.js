@@ -415,7 +415,7 @@
       if (!busy) return;
       teardownSeg(); finishAudioUI();
       showAudioError("Finding key moments is taking too long. Is `tldw serve` running?");
-    }, 90000);
+    }, 320000);
     segPort.postMessage({
       type: "getSegments",
       url: (lastPayload && lastPayload.source_url) || location.href,

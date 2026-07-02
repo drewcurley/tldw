@@ -25,15 +25,17 @@ from pathlib import Path
 
 # Transcript cache: after a text summary, store (meta, cues) for the same video so
 # "play key moments" can skip the duplicate yt-dlp + subtitle-parse round-trip.
-_TRANSCRIPT_TTL = 900  # 15 minutes; long enough for any follow-up click
+# Segment cache: populated by a background prefetch triggered at the end of text
+# summary, so clicking "play key moments" usually gets an instant response.
+_CACHE_TTL = 900  # 15 minutes — shared TTL for both caches
 _cache_lock = threading.Lock()
 _transcript_cache: dict = {}  # video_id -> (expires_at, meta, cues)
+_seg_cache: dict = {}         # video_id -> (expires_at, meta, segments)
 
 
 def _cache_put(video_id: str, meta, cues: list) -> None:
     with _cache_lock:
-        _transcript_cache[video_id] = (time.monotonic() + _TRANSCRIPT_TTL, meta, cues)
-        # Evict expired entries to bound memory
+        _transcript_cache[video_id] = (time.monotonic() + _CACHE_TTL, meta, cues)
         now = time.monotonic()
         expired = [k for k, v in _transcript_cache.items() if v[0] < now]
         for k in expired:
@@ -47,6 +49,43 @@ def _cache_get(video_id: str):
         if entry and entry[0] > time.monotonic():
             return entry[1], entry[2]
         return None
+
+
+def _seg_cache_put(video_id: str, meta, segments: list) -> None:
+    with _cache_lock:
+        _seg_cache[video_id] = (time.monotonic() + _CACHE_TTL, meta, segments)
+        now = time.monotonic()
+        expired = [k for k, v in _seg_cache.items() if v[0] < now]
+        for k in expired:
+            del _seg_cache[k]
+
+
+def _seg_cache_get(video_id: str):
+    """Return (meta, segments) if a fresh entry exists, else None."""
+    with _cache_lock:
+        entry = _seg_cache.get(video_id)
+        if entry and entry[0] > time.monotonic():
+            return entry[1], entry[2]
+        return None
+
+
+def _start_seg_prefetch(meta, cues: list) -> None:
+    """Fire-and-forget: run select_segments in background so the result is cached
+    by the time the user clicks 'play key moments'. Uses default ratio/lang (same
+    as what the extension sends — no ratio, lang='en')."""
+    def _run():
+        from . import metadata as _md
+        try:
+            _meta, segs = core.select_segments(
+                _md.watch_url(meta.video_id), None, "en",
+                timeout=SEGMENTS_TIMEOUT,
+                _prefetched=(meta, cues),
+            )
+            _seg_cache_put(meta.video_id, _meta, segs)
+            print(f"  prefetched {len(segs)} segments for {meta.video_id}", flush=True)
+        except Exception as exc:
+            print(f"  segment prefetch failed for {meta.video_id}: {exc}", flush=True)
+    threading.Thread(target=_run, daemon=True).start()
 
 from . import (
     BadUrlError,
@@ -287,9 +326,11 @@ class _Handler(BaseHTTPRequestHandler):
             print(f"  unexpected error: {exc!r}", flush=True)
             return
         print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s", flush=True)
-        # Cache transcript so a follow-up "play key moments" skips the re-fetch
         if summary.cues:
             _cache_put(summary.meta.video_id, summary.meta, summary.cues)
+            # Kick off segment selection in the background so "play key moments" is
+            # ready by the time the user reads the summary.
+            _start_seg_prefetch(summary.meta, summary.cues)
         emit({"type": "result", **_to_payload(summary)})
 
     def _validate_speak(self, body: dict):
@@ -346,6 +387,18 @@ class _Handler(BaseHTTPRequestHandler):
             vid = canonical_video_id(url)
         except BadUrlError:
             vid = None
+
+        # Check segment cache first — populated by background prefetch after text summary
+        seg_hit = _seg_cache_get(vid) if vid else None
+        if seg_hit and max_ms is None and ratio is None:
+            meta, segments = seg_hit
+            print(f"  using cached segments for {vid} ({len(segments)} moments, "
+                  f"{time.monotonic()-start:.1f}s)", flush=True)
+            emit({"type": "progress", "message": "using cached segments", "percent": 95})
+            emit({"type": "segments", "segments": segments, "title": meta.title,
+                  "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
+            return
+
         prefetched = _cache_get(vid) if vid else None
         if prefetched:
             print(f"  using cached transcript for {vid}", flush=True)
@@ -360,6 +413,9 @@ class _Handler(BaseHTTPRequestHandler):
                   flush=True)
             emit({"type": "error", "status": status, "error": str(exc)})
             return
+        # Cache the result for any further "play key moments" clicks
+        if vid:
+            _seg_cache_put(vid, meta, segments)
         print(f"  {len(segments)} key segments for '{meta.title}' "
               f"in {time.monotonic()-start:.1f}s", flush=True)
         emit({"type": "segments", "segments": segments, "title": meta.title,
