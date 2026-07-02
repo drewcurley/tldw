@@ -483,6 +483,29 @@
     }
   }
 
+  function fmtTime(s) {
+    const t = Math.floor(s);
+    const h = Math.floor(t / 3600);
+    const m = Math.floor((t % 3600) / 60);
+    const sec = t % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+    return `${m}:${String(sec).padStart(2, "0")}`;
+  }
+
+  function skipPrev() {
+    if (!skipSegs || skipIdx <= 0) return;
+    skipIdx -= 1;
+    try { skipVideo.currentTime = skipSegs[skipIdx].start; skipVideo.play(); } catch (_) {}
+    updatePill();
+  }
+
+  function skipNext() {
+    if (!skipSegs || skipIdx >= skipSegs.length - 1) return;
+    skipIdx += 1;
+    try { skipVideo.currentTime = skipSegs[skipIdx].start; skipVideo.play(); } catch (_) {}
+    updatePill();
+  }
+
   function showPill() {
     removePill();
     const pill = document.createElement("div");
@@ -491,15 +514,31 @@
       "position:fixed;z-index:2147483647;bottom:84px;left:50%;transform:translateX(-50%);" +
       "background:#1e1f24;color:#e9e9ea;font:14px system-ui,-apple-system,sans-serif;" +
       "padding:8px 14px;border-radius:999px;box-shadow:0 6px 24px rgba(0,0,0,.45);" +
-      "display:flex;align-items:center;gap:12px;";
+      "display:flex;align-items:center;gap:10px;";
+
+    function navBtn(text, ariaLabel, fn) {
+      const btn = document.createElement("button");
+      btn.textContent = text;
+      btn.setAttribute("aria-label", ariaLabel);
+      btn.style.cssText =
+        "all:unset;cursor:pointer;padding:0 4px;color:#e9e9ea;font-size:18px;line-height:1;";
+      btn.onclick = fn;
+      return btn;
+    }
+
+    const prev = navBtn("‹", "Previous key moment", skipPrev);
+    prev.id = "tldw-pill-prev";
     const label = document.createElement("span");
     label.className = "pill-label";
-    const stop = document.createElement("button");
-    stop.textContent = "✕";
-    stop.setAttribute("aria-label", "Stop skipping");
-    stop.style.cssText = "all:unset;cursor:pointer;padding:0 4px;color:#e9e9ea;";
-    stop.onclick = stopSkip;
+    label.style.cssText = "white-space:nowrap;";
+    const next = navBtn("›", "Next key moment", skipNext);
+    next.id = "tldw-pill-next";
+    const stop = navBtn("✕", "Stop skipping", stopSkip);
+    stop.style.cssText += "font-size:14px;margin-left:2px;";
+
+    pill.appendChild(prev);
     pill.appendChild(label);
+    pill.appendChild(next);
     pill.appendChild(stop);
     (document.fullscreenElement || document.body).appendChild(pill);
   }
@@ -510,7 +549,11 @@
     const seg = skipSegs[skipIdx];
     const label = pill.querySelector(".pill-label");
     if (label) label.textContent =
-      `⏭ Key moment ${skipIdx + 1}/${skipSegs.length} · ${seg.label}`;
+      `⏭ Clip ${skipIdx + 1}/${skipSegs.length} · ${fmtTime(seg.start)}–${fmtTime(seg.end)}`;
+    const prev = document.getElementById("tldw-pill-prev");
+    if (prev) prev.style.opacity = skipIdx <= 0 ? "0.3" : "1";
+    const next = document.getElementById("tldw-pill-next");
+    if (next) next.style.opacity = skipIdx >= skipSegs.length - 1 ? "0.3" : "1";
   }
 
   function removePill() {
