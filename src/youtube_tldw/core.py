@@ -69,9 +69,9 @@ def select_segments(
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
-    log("selecting the key moments with Claude...", None)  # indeterminate spin
     sel = summarize.select_video_segments(
-        cues, meta.channel, meta.title, ratio, max_length_ms, timeout=timeout)
+        cues, meta.channel, meta.title, ratio, max_length_ms, timeout=timeout,
+        on_progress=on_progress)
     chosen = spans.spans_from_cue_ranges(sel.ranges, cues, min_clip_ms=MIN_CLIP_MS)
     chosen = spans.pad_spans(chosen, cues, BOUNDARY_PAD_MS, meta.duration_ms)
     caps = [c for c in (max_length_ms,

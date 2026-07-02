@@ -448,40 +448,23 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 # prefetch failed — fall through to direct call
 
-        # 3. Direct call: thread it so we can send heartbeats while Claude runs
-        done_evt = threading.Event()
-        result_box = [None]
-        error_box = [None]
+        # 3. Direct call — on_progress streams each clip to the client as Claude finds it
         prefetched = tx_hit
-
-        def _select_thread():
-            try:
-                result_box[0] = core.select_segments(
-                    url, ratio, lang, max_length_ms=max_ms,
-                    timeout=SEGMENTS_TIMEOUT,
-                    on_progress=lambda m, p=None: tlog(m),  # server log; heartbeat owns client
-                    _prefetched=prefetched)
-            except Exception as exc:
-                error_box[0] = exc
-            finally:
-                done_evt.set()
-
-        threading.Thread(target=_select_thread, daemon=True).start()
-        _wait_with_heartbeat(done_evt, cue_label)
-
-        if error_box[0] is not None:
-            exc = error_box[0]
-            if isinstance(exc, TldrError):
-                status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
-                print(f"  segments failed ({status}) in {time.monotonic()-start:.1f}s: {exc}",
-                      flush=True)
-                emit({"type": "error", "status": status, "error": str(exc)})
-            else:
-                print(f"  unexpected error: {error_box[0]!r}", flush=True)
-                emit({"type": "error", "status": 500, "error": "internal error"})
+        try:
+            meta, segments = core.select_segments(
+                url, ratio, lang, max_length_ms=max_ms,
+                timeout=SEGMENTS_TIMEOUT, on_progress=progress,
+                _prefetched=prefetched)
+        except TldrError as exc:
+            status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
+            print(f"  segments failed ({status}) in {time.monotonic()-start:.1f}s: {exc}",
+                  flush=True)
+            emit({"type": "error", "status": status, "error": str(exc)})
             return
-
-        meta, segments = result_box[0]
+        except Exception as exc:
+            print(f"  unexpected error: {exc!r}", flush=True)
+            emit({"type": "error", "status": 500, "error": "internal error"})
+            return
         if vid:
             _seg_cache_put(vid, meta, segments)
         _emit_segments(meta, segments)

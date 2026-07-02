@@ -16,6 +16,9 @@ import json
 import os
 import re
 import shlex
+import subprocess
+import threading
+import time
 from typing import Callable
 
 from . import ClaudeError, TldrError, TldrTimeoutError
@@ -74,6 +77,93 @@ def _parse_inner_json(text: str) -> dict:
             raise ValueError("no JSON object found")
         cleaned = cleaned[start : end + 1]
     return json.loads(cleaned)
+
+
+def is_claude_cli() -> bool:
+    """True when the default claude CLI backend is active (not a custom llm_cmd)."""
+    argv, _ = _backend()
+    return argv[0] == "claude"
+
+
+def stream_ndjson_segments(
+    prompt: str,
+    stdin_payload: str,
+    *,
+    on_segment: Callable[[dict], None],
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict:
+    """Stream segment selection from the claude CLI using --output-format stream-json.
+
+    The prompt must ask Claude to emit one segment JSON per line as it identifies
+    each one, then a final {chosen_ratio, rationale} line.  on_segment is called
+    for every {first_cue, last_cue, reason} line received in real time.
+
+    Returns the final summary dict {chosen_ratio, rationale}.
+    Raises TldrTimeoutError / ClaudeError on failure.
+    Falls back to ask_json (buffered, no streaming) for custom LLM backends.
+    """
+    if not is_claude_cli():
+        raise NotImplementedError  # caller must fall back
+
+    argv = ["claude", "-p", "--output-format", "stream-json"]
+    full = prompt + "\n\n" + stdin_payload
+
+    proc = subprocess.Popen(  # noqa: S603
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    # Write stdin in a thread — large payloads can block if not drained concurrently
+    def _write():
+        try:
+            proc.stdin.write(full)
+        finally:
+            proc.stdin.close()
+    threading.Thread(target=_write, daemon=True).start()
+
+    text_buf = ""
+    done_data: dict = {}
+    deadline = time.monotonic() + timeout
+
+    try:
+        for raw in proc.stdout:
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise TldrTimeoutError(f"`claude` timed out after {timeout}s.")
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text_buf += delta.get("text", "")
+                    # Flush complete NDJSON lines from the accumulated buffer
+                    while "\n" in text_buf:
+                        line, text_buf = text_buf.split("\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if "first_cue" in obj:
+                            on_segment(obj)
+                        elif "chosen_ratio" in obj or "rationale" in obj:
+                            done_data = obj
+    finally:
+        proc.stdout.close()
+        ret = proc.wait(timeout=5)
+
+    if ret and ret not in (0, -9):
+        tail = proc.stderr.read().strip().splitlines()[-3:]
+        raise ClaudeError(f"`claude` failed (exit {ret}): " + " | ".join(tail))
+
+    return done_data
 
 
 def ask_json(

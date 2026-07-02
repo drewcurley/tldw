@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import TldrError
-from .claude_client import ask_json
+from .claude_client import ask_json, is_claude_cli, stream_ndjson_segments
 from .timing import format_length, to_ffmpeg_ts
 from .transcript import Cue
 
@@ -55,39 +55,52 @@ Return ONLY a JSON object with this schema:
   "rationale": "one sentence"
 }}"""
 
-_VIDEO_PROMPT = """You are selecting the segments of a video to KEEP for a TL;DW \
-recut. Input (on stdin): metadata then the transcript as numbered cues, one per \
-line, formatted `[index] (timestamp) text`.
+_VIDEO_PROMPT_BODY = (
+    "You are selecting the segments of a video to KEEP for a TL;DW "
+    "recut. Input (on stdin): metadata then the transcript as numbered cues, one per "
+    "line, formatted `[index] (timestamp) text`.\n\n"
+    "Pick the cue ranges that together preserve every key point as a much shorter cut.\n"
+    "Select whole ranges of consecutive cues. Keep them in chronological order. Prefer\n"
+    "fewer, longer ranges over many tiny ones.\n\n"
+    "COHERENCE — THE MOST IMPORTANT RULE:\n"
+    "Every segment MUST begin at the start of a complete sentence/thought and MUST end at\n"
+    "the end of a complete sentence/thought. NEVER start or end a segment mid-sentence,\n"
+    "mid-clause, or mid-word — that destroys the meaning. Concretely:\n"
+    "- Set first_cue to the cue containing the FIRST word of the opening sentence.\n"
+    "- Set last_cue to the cue containing the FINAL word of the closing sentence.\n"
+    "- If a key point spans several sentences, include ALL of them so the thought is\n"
+    "  complete and self-contained.\n"
+    "- The transcript may be auto-generated: lowercase, no punctuation, and cues split\n"
+    "  mid-phrase. Do NOT trust cue boundaries as sentence boundaries — use meaning,\n"
+    "  grammar, and natural pauses to find where sentences actually begin and end.\n"
+    "- When in doubt, extend the range to include the whole thought. A slightly longer\n"
+    "  but coherent segment is REQUIRED; a shorter but choppy/mid-thought cut is WRONG.\n\n"
+    "{ratio_clause}\n"
+    "{maxlen_clause}"
+)
 
-Pick the cue ranges that together preserve every key point as a much shorter cut.
-Select whole ranges of consecutive cues. Keep them in chronological order. Prefer
-fewer, longer ranges over many tiny ones.
+# Batch output (default): single JSON blob returned at the end
+_VIDEO_PROMPT = _VIDEO_PROMPT_BODY + (
+    "\n\nReturn ONLY a JSON object, no prose, with this schema:\n"
+    "{{\n"
+    '  "segments": [\n'
+    '    {{"first_cue": 0, "last_cue": 12, "reason": "why this matters"}}\n'
+    "  ],\n"
+    '  "chosen_ratio": 0.0,\n'
+    '  "rationale": "one sentence on the overall length you chose"\n'
+    "}}"
+)
 
-COHERENCE — THE MOST IMPORTANT RULE:
-Every segment MUST begin at the start of a complete sentence/thought and MUST end at
-the end of a complete sentence/thought. NEVER start or end a segment mid-sentence,
-mid-clause, or mid-word — that destroys the meaning. Concretely:
-- Set first_cue to the cue containing the FIRST word of the opening sentence.
-- Set last_cue to the cue containing the FINAL word of the closing sentence.
-- If a key point spans several sentences, include ALL of them so the thought is
-  complete and self-contained.
-- The transcript may be auto-generated: lowercase, no punctuation, and cues split
-  mid-phrase. Do NOT trust cue boundaries as sentence boundaries — use meaning,
-  grammar, and natural pauses to find where sentences actually begin and end.
-- When in doubt, extend the range to include the whole thought. A slightly longer
-  but coherent segment is REQUIRED; a shorter but choppy/mid-thought cut is WRONG.
-
-{ratio_clause}
-{maxlen_clause}
-
-Return ONLY a JSON object, no prose, with this schema:
-{{
-  "segments": [
-    {{"first_cue": 0, "last_cue": 12, "reason": "why this matters"}}
-  ],
-  "chosen_ratio": 0.0,
-  "rationale": "one sentence on the overall length you chose"
-}}"""
+# Streaming output: emit one JSON line per segment as identified, then a summary line.
+# Used with claude_client.stream_ndjson_segments (--output-format stream-json).
+_VIDEO_PROMPT_STREAM = _VIDEO_PROMPT_BODY + (
+    "\n\nOutput each selected segment on its own line as JSON the moment you identify it"
+    " — do NOT wait until the end:\n"
+    '{{"first_cue": 0, "last_cue": 12, "reason": "why this matters"}}\n\n'
+    "After all segments, one final summary line:\n"
+    '{{"chosen_ratio": 0.0, "rationale": "one sentence on the overall length you chose"}}\n\n'
+    "Output ONLY these JSON lines. No prose, no markdown, no other text."
+)
 
 
 def _ratio_clause(ratio: float | None) -> str:
@@ -235,12 +248,47 @@ def select_video_segments(
     max_length_ms: int | None,
     *,
     timeout: float,
+    on_progress=None,
 ) -> VideoSelection:
+    log = on_progress or (lambda m, p=None: None)
     header = _metadata_header(channel, title)
+    listing = format_cues_for_selection(cues)
+
+    # --- Streaming path: one Claude call, segments arrive in real time ---
+    if on_progress is not None and is_claude_cli() and len(listing) <= SINGLE_PASS_CHARS:
+        prompt = _VIDEO_PROMPT_STREAM.format(
+            ratio_clause=_ratio_clause(ratio), maxlen_clause=_maxlen_clause(max_length_ms)
+        )
+        validate_seg = _make_video_validator(len(cues))
+        all_ranges: list[tuple[int, int]] = []
+        found = 0
+
+        def on_seg(obj):
+            nonlocal found
+            try:
+                sel = validate_seg({"segments": [obj]})
+                all_ranges.extend(sel.ranges)
+            except (ValueError, TldrError):
+                return  # skip malformed segment lines
+            found += 1
+            pct = min(15 + found * 10, 88)
+            log(f"Found {found} clip(s) so far...", pct)
+
+        done = stream_ndjson_segments(
+            prompt, header + listing, on_segment=on_seg, timeout=timeout
+        )
+        if not all_ranges:
+            raise TldrError("Claude selected no segments.")
+        return VideoSelection(
+            ranges=all_ranges,
+            chosen_ratio=done.get("chosen_ratio"),
+            rationale=done.get("rationale", ""),
+        )
+
+    # --- Batch path: single-pass or chunked for oversized transcripts ---
     prompt = _VIDEO_PROMPT.format(
         ratio_clause=_ratio_clause(ratio), maxlen_clause=_maxlen_clause(max_length_ms)
     )
-    listing = format_cues_for_selection(cues)
     if len(listing) <= SINGLE_PASS_CHARS:
         return ask_json(
             prompt, header + listing,
@@ -249,7 +297,7 @@ def select_video_segments(
 
     # Chunk cues but keep GLOBAL indices so spans stay on one timeline.
     approx_per = max(1, len(cues) * SINGLE_PASS_CHARS // max(1, len(listing)))
-    all_ranges: list[tuple[int, int]] = []
+    batch_ranges: list[tuple[int, int]] = []
     ratios: list[float] = []
     for group in _chunk(list(range(len(cues))), approx_per):
         sub_listing = "\n".join(
@@ -260,13 +308,13 @@ def select_video_segments(
             validate=_make_video_validator(len(cues), lo=group[0], hi=group[-1]),
             timeout=timeout,
         )
-        all_ranges.extend(sel.ranges)
+        batch_ranges.extend(sel.ranges)
         if sel.chosen_ratio is not None:
             ratios.append(sel.chosen_ratio)
-    if not all_ranges:
+    if not batch_ranges:
         raise TldrError("Claude selected no segments.")
     return VideoSelection(
-        ranges=all_ranges,
+        ranges=batch_ranges,
         chosen_ratio=(sum(ratios) / len(ratios)) if ratios else None,
         rationale="combined from chunked selection",
     )
