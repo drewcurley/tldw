@@ -23,6 +23,31 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# Transcript cache: after a text summary, store (meta, cues) for the same video so
+# "play key moments" can skip the duplicate yt-dlp + subtitle-parse round-trip.
+_TRANSCRIPT_TTL = 900  # 15 minutes; long enough for any follow-up click
+_cache_lock = threading.Lock()
+_transcript_cache: dict = {}  # video_id -> (expires_at, meta, cues)
+
+
+def _cache_put(video_id: str, meta, cues: list) -> None:
+    with _cache_lock:
+        _transcript_cache[video_id] = (time.monotonic() + _TRANSCRIPT_TTL, meta, cues)
+        # Evict expired entries to bound memory
+        now = time.monotonic()
+        expired = [k for k, v in _transcript_cache.items() if v[0] < now]
+        for k in expired:
+            del _transcript_cache[k]
+
+
+def _cache_get(video_id: str):
+    """Return (meta, cues) if a fresh entry exists, else None."""
+    with _cache_lock:
+        entry = _transcript_cache.get(video_id)
+        if entry and entry[0] > time.monotonic():
+            return entry[1], entry[2]
+        return None
+
 from . import (
     BadUrlError,
     ClaudeError,
@@ -40,8 +65,9 @@ from .timing import format_length, parse_duration
 MAX_BODY_BYTES = 16 * 1024
 MAX_SPEAK_BYTES = 64 * 1024   # /speak carries the summary text
 MAX_CONCURRENCY = 2
-REQUEST_TIMEOUT = 120.0  # per-request claude budget (shorter than the CLI's)
-SPEAK_TIMEOUT = 120.0    # per-request piper/ffmpeg budget
+REQUEST_TIMEOUT = 120.0   # text summarize budget
+SEGMENTS_TIMEOUT = 300.0  # segment selection needs structured JSON — allow more time
+SPEAK_TIMEOUT = 120.0     # per-request piper/ffmpeg budget
 _LANG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,15}$")
 TOKEN_FILE = Path.home() / ".config" / "youtube-tldw" / "token"
 
@@ -261,6 +287,9 @@ class _Handler(BaseHTTPRequestHandler):
             print(f"  unexpected error: {exc!r}", flush=True)
             return
         print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s", flush=True)
+        # Cache transcript so a follow-up "play key moments" skips the re-fetch
+        if summary.cues:
+            _cache_put(summary.meta.video_id, summary.meta, summary.cues)
         emit({"type": "result", **_to_payload(summary)})
 
     def _validate_speak(self, body: dict):
@@ -311,10 +340,20 @@ class _Handler(BaseHTTPRequestHandler):
             tlog(m)
             emit({"type": "progress", "message": m, "percent": pct})
 
+        from .urls import canonical_video_id
+        from . import BadUrlError
+        try:
+            vid = canonical_video_id(url)
+        except BadUrlError:
+            vid = None
+        prefetched = _cache_get(vid) if vid else None
+        if prefetched:
+            print(f"  using cached transcript for {vid}", flush=True)
         try:
             meta, segments = core.select_segments(
                 url, ratio, lang, max_length_ms=max_ms,
-                timeout=REQUEST_TIMEOUT, on_progress=progress)
+                timeout=SEGMENTS_TIMEOUT, on_progress=progress,
+                _prefetched=prefetched)
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
             print(f"  segments failed ({status}) in {time.monotonic()-start:.1f}s: {exc}",

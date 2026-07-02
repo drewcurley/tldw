@@ -185,7 +185,7 @@ def test_summarize_stream_error_is_in_band(srv, monkeypatch):
 def test_segments_stream(srv, monkeypatch):
     _, port = srv
 
-    def fake_seg(url, ratio, lang, *, max_length_ms=None, timeout=None, on_progress=None):
+    def fake_seg(url, ratio, lang, *, max_length_ms=None, timeout=None, on_progress=None, _prefetched=None):
         if on_progress:
             on_progress("selecting the key moments…", 22)
         meta = VideoMeta("dQw4w9WgXcQ", "Cool Title", "Chan", 600_000, {}, {})

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -17,7 +17,7 @@ from .summarize import TextResult
 from .timing import format_clock
 from .urls import canonical_video_id
 
-# Span shaping shared with the video recut (no crossfade math here — playback is
+# Span shaping shared with the video recut (no crossfade math here -- playback is
 # straight seeks, so the max-length cap uses 0 overlap).
 MIN_CLIP_MS = 1200
 BOUNDARY_PAD_MS = 600
@@ -28,6 +28,7 @@ class Summary:
     meta: md.VideoMeta
     result: TextResult
     cue_count: int
+    cues: list = field(default_factory=list)  # exposed for server-side transcript caching
 
 
 def select_segments(
@@ -38,40 +39,48 @@ def select_segments(
     max_length_ms: int | None = None,
     timeout: float = 300.0,
     on_progress=None,
+    _prefetched=None,
 ):
     """Pick the key source time-spans for in-player skip playback (no video work).
 
-    Returns (meta, segments) where segments = [{start, end, label}] in SECONDS, the
-    same cue-selection the recut uses (sentence-padded), minus intro/polish.
+    Returns (meta, segments) where segments = [{start, end, label}] in SECONDS.
+
+    _prefetched: (meta, cues) from a prior summarize call -- skips the yt-dlp fetch
+    and subtitle parse so "play key moments" after a text summary reuses the work.
     """
     log = on_progress or (lambda _m, _p=None: None)
-    video_id = canonical_video_id(url)            # BadUrlError
-    log(f"video {video_id}: fetching metadata…", 6)
-    import shutil
-    import tempfile
-    workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-seg-"))
-    try:
-        meta = md.fetch_metadata(video_id)
-        lang_key, is_auto = md.choose_track(meta, lang)   # NoTranscriptError
-        log(f"“{meta.title}” — using {'auto-captions' if is_auto else 'subtitles'} "
-            f"({lang_key})", 14)
-        cues = transcript.parse_subtitles(
-            md.download_subtitle(video_id, lang_key, is_auto, workdir))  # NoTranscriptError
-        log(f"parsed {len(cues)} cues, {sum(len(c.text.split()) for c in cues)} words", 22)
-        log("selecting the key moments with Claude…", None)   # indeterminate spin
-        sel = summarize.select_video_segments(
-            cues, meta.channel, meta.title, ratio, max_length_ms, timeout=timeout)
-        chosen = spans.spans_from_cue_ranges(sel.ranges, cues, min_clip_ms=MIN_CLIP_MS)
-        chosen = spans.pad_spans(chosen, cues, BOUNDARY_PAD_MS, meta.duration_ms)
-        caps = [c for c in (max_length_ms,
-                            int(ratio * meta.duration_ms) if ratio else None) if c]
-        chosen = spans.enforce_max_length(chosen, min(caps) if caps else None, 0)
-        segments = [{"start": round(s.start_ms / 1000, 2),
-                     "end": round(s.end_ms / 1000, 2),
-                     "label": format_clock(s.display_start_ms)} for s in chosen]
-        return meta, segments
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+    video_id = canonical_video_id(url)  # BadUrlError
+
+    if _prefetched is not None:
+        meta, cues = _prefetched
+        log(f"using cached transcript ({len(cues)} cues, skipping re-fetch)", 22)
+    else:
+        log(f"video {video_id}: fetching metadata...", 6)
+        workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-seg-"))
+        try:
+            meta = md.fetch_metadata(video_id)
+            lang_key, is_auto = md.choose_track(meta, lang)  # NoTranscriptError
+            kind = "auto-captions" if is_auto else "subtitles"
+            log(f'"{meta.title}" -- using {kind} ({lang_key})', 14)
+            cues = transcript.parse_subtitles(
+                md.download_subtitle(video_id, lang_key, is_auto, workdir))
+            log(f"parsed {len(cues)} cues, "
+                f"{sum(len(c.text.split()) for c in cues)} words", 22)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    log("selecting the key moments with Claude...", None)  # indeterminate spin
+    sel = summarize.select_video_segments(
+        cues, meta.channel, meta.title, ratio, max_length_ms, timeout=timeout)
+    chosen = spans.spans_from_cue_ranges(sel.ranges, cues, min_clip_ms=MIN_CLIP_MS)
+    chosen = spans.pad_spans(chosen, cues, BOUNDARY_PAD_MS, meta.duration_ms)
+    caps = [c for c in (max_length_ms,
+                        int(ratio * meta.duration_ms) if ratio else None) if c]
+    chosen = spans.enforce_max_length(chosen, min(caps) if caps else None, 0)
+    segments = [{"start": round(s.start_ms / 1000, 2),
+                 "end": round(s.end_ms / 1000, 2),
+                 "label": format_clock(s.display_start_ms)} for s in chosen]
+    return meta, segments
 
 
 def summarize_url(
@@ -86,20 +95,20 @@ def summarize_url(
     """Fetch a video's transcript and summarize it. Raises the typed TldrError
     subclasses (BadUrl/NoTranscript/TranscriptTooLong/Claude/Timeout).
 
-    `max_chars`: if set, reject transcripts that would trigger map-reduce (the
+    max_chars: if set, reject transcripts that would trigger map-reduce (the
     browser flow uses this so a click never blocks for minutes).
-    `on_progress`: optional callback for human-readable step messages.
+    on_progress: optional callback for human-readable step messages.
     """
     log = on_progress or (lambda _m, _p=None, _c=False: None)
     video_id = canonical_video_id(url)  # BadUrlError
-    log(f"video {video_id}: fetching metadata…", 3)
+    log(f"video {video_id}: fetching metadata...", 3)
     workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-core-"))
     try:
         meta = md.fetch_metadata(video_id)
         lang_key, is_auto = md.choose_track(meta, lang)  # NoTranscriptError
         kind = "auto-captions" if is_auto else "subtitles"
-        log(f"“{meta.title}” by {meta.channel} ({format_dur(meta.duration_ms)}) "
-            f"— using {kind} ({lang_key})", 7)
+        log(f'"{meta.title}" by {meta.channel} ({format_dur(meta.duration_ms)}) '
+            f"-- using {kind} ({lang_key})", 7)
         content = md.download_subtitle(video_id, lang_key, is_auto, workdir)
         cues = transcript.parse_subtitles(content)  # NoTranscriptError
         words = sum(len(c.text.split()) for c in cues)
@@ -113,12 +122,12 @@ def summarize_url(
                 )
         # The long step owns ~80% of the bar: starts at 15%, and creep=True tells the
         # client to ease forward toward ~96% from here until the result lands.
-        log("summarizing with Claude (this can take 30-90s for a long video)…", 15,
+        log("summarizing with Claude (this can take 30-90s for a long video)...", 15,
             True)
         result = summarize.summarize_text(
             cues, meta.channel, meta.title, ratio, timeout=timeout
         )
-        return Summary(meta, result, len(cues))
+        return Summary(meta, result, len(cues), cues)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
