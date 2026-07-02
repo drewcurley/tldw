@@ -195,7 +195,10 @@ def test_segments_stream(srv, monkeypatch):
     monkeypatch.setattr(server.core, "select_segments", fake_seg)
     events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"},
                           _auth(), path="/segments/stream")
-    assert [e["type"] for e in events] == ["progress", "segments"]
+    types = [e["type"] for e in events]
+    assert types[0] == "progress"   # "Analyzing…" heartbeat start
+    assert types[-1] == "segments"  # terminal segments event
+    assert types[-2] == "progress"  # "Found N key moments!" just before segments
     final = events[-1]
     assert final["title"] == "Cool Title"
     assert final["segments"][0] == {"start": 1.0, "end": 3.5, "label": "0:01"}

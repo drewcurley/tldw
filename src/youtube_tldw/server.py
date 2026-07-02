@@ -401,57 +401,90 @@ class _Handler(BaseHTTPRequestHandler):
         except BadUrlError:
             vid = None
 
-        # For the default case (no custom ratio/max_length) check segment cache first,
-        # then wait for an in-progress prefetch if one is running — prevents two
-        # concurrent Claude calls for the same video when the user clicks fast.
+        def _wait_with_heartbeat(wait_evt, cue_label):
+            """Block on wait_evt in 5s chunks, emitting progress each tick.
+            Returns True if the event fired, False if SEGMENTS_TIMEOUT exceeded."""
+            progress(f"Analyzing {cue_label}…", 22)
+            t0 = time.monotonic()
+            while not wait_evt.wait(timeout=5.0):
+                elapsed = time.monotonic() - t0
+                if elapsed >= SEGMENTS_TIMEOUT:
+                    return False
+                pct = round(min(25 + elapsed * 0.85, 92), 1)
+                progress(f"Analyzing {cue_label}… ({int(elapsed)}s)", pct)
+            return True
+
+        def _emit_segments(meta, segments):
+            progress(f"Found {len(segments)} key moment(s)!", 98)
+            print(f"  {len(segments)} key segments for '{meta.title}' "
+                  f"in {time.monotonic()-start:.1f}s", flush=True)
+            emit({"type": "segments", "segments": segments, "title": meta.title,
+                  "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
+
+        # 1. Instant cache hit
         if vid and max_ms is None and ratio is None:
             seg_hit = _seg_cache_get(vid)
             if seg_hit:
                 meta, segments = seg_hit
-                print(f"  using cached segments for {vid} ({len(segments)} moments, "
+                print(f"  cached segments for {vid} ({len(segments)} moments, "
                       f"{time.monotonic()-start:.1f}s)", flush=True)
-                emit({"type": "progress", "message": "using cached segments", "percent": 95})
-                emit({"type": "segments", "segments": segments, "title": meta.title,
-                      "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
+                _emit_segments(meta, segments)
                 return
 
+        # Cue count for informative heartbeat messages
+        tx_hit = _cache_get(vid) if vid else None
+        cue_label = f"{len(tx_hit[1])} cues" if tx_hit else "transcript"
+
+        # 2. Wait for in-progress prefetch (heartbeat while blocked)
+        if vid and max_ms is None and ratio is None:
             with _cache_lock:
                 prefetch_evt = _seg_prefetch_events.get(vid)
             if prefetch_evt:
-                print(f"  waiting for in-progress prefetch for {vid}", flush=True)
-                progress("selecting key moments (almost ready)…", None)
-                prefetch_evt.wait(timeout=SEGMENTS_TIMEOUT)
+                print(f"  waiting for prefetch for {vid}", flush=True)
+                _wait_with_heartbeat(prefetch_evt, cue_label)
                 seg_hit = _seg_cache_get(vid)
                 if seg_hit:
-                    meta, segments = seg_hit
-                    print(f"  prefetch ready for {vid} ({len(segments)} moments, "
-                          f"{time.monotonic()-start:.1f}s)", flush=True)
-                    emit({"type": "segments", "segments": segments, "title": meta.title,
-                          "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
+                    _emit_segments(*seg_hit)
                     return
-                # prefetch failed — fall through to on-demand
+                # prefetch failed — fall through to direct call
 
-        prefetched = _cache_get(vid) if vid else None
-        if prefetched:
-            print(f"  using cached transcript for {vid}", flush=True)
-        try:
-            meta, segments = core.select_segments(
-                url, ratio, lang, max_length_ms=max_ms,
-                timeout=SEGMENTS_TIMEOUT, on_progress=progress,
-                _prefetched=prefetched)
-        except TldrError as exc:
-            status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
-            print(f"  segments failed ({status}) in {time.monotonic()-start:.1f}s: {exc}",
-                  flush=True)
-            emit({"type": "error", "status": status, "error": str(exc)})
+        # 3. Direct call: thread it so we can send heartbeats while Claude runs
+        done_evt = threading.Event()
+        result_box = [None]
+        error_box = [None]
+        prefetched = tx_hit
+
+        def _select_thread():
+            try:
+                result_box[0] = core.select_segments(
+                    url, ratio, lang, max_length_ms=max_ms,
+                    timeout=SEGMENTS_TIMEOUT,
+                    on_progress=lambda m, p=None: tlog(m),  # server log; heartbeat owns client
+                    _prefetched=prefetched)
+            except Exception as exc:
+                error_box[0] = exc
+            finally:
+                done_evt.set()
+
+        threading.Thread(target=_select_thread, daemon=True).start()
+        _wait_with_heartbeat(done_evt, cue_label)
+
+        if error_box[0] is not None:
+            exc = error_box[0]
+            if isinstance(exc, TldrError):
+                status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
+                print(f"  segments failed ({status}) in {time.monotonic()-start:.1f}s: {exc}",
+                      flush=True)
+                emit({"type": "error", "status": status, "error": str(exc)})
+            else:
+                print(f"  unexpected error: {error_box[0]!r}", flush=True)
+                emit({"type": "error", "status": 500, "error": "internal error"})
             return
-        # Cache the result for any further "play key moments" clicks
+
+        meta, segments = result_box[0]
         if vid:
             _seg_cache_put(vid, meta, segments)
-        print(f"  {len(segments)} key segments for '{meta.title}' "
-              f"in {time.monotonic()-start:.1f}s", flush=True)
-        emit({"type": "segments", "segments": segments, "title": meta.title,
-              "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
+        _emit_segments(meta, segments)
 
     def _run_speak(self, body: dict, *, stream: bool) -> None:
         parsed = self._validate_speak(body)
