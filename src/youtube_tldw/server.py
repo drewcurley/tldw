@@ -29,8 +29,9 @@ from pathlib import Path
 # summary, so clicking "play key moments" usually gets an instant response.
 _CACHE_TTL = 900  # 15 minutes — shared TTL for both caches
 _cache_lock = threading.Lock()
-_transcript_cache: dict = {}  # video_id -> (expires_at, meta, cues)
-_seg_cache: dict = {}         # video_id -> (expires_at, meta, segments)
+_transcript_cache: dict = {}    # video_id -> (expires_at, meta, cues)
+_seg_cache: dict = {}           # video_id -> (expires_at, meta, segments)
+_seg_prefetch_events: dict = {} # video_id -> threading.Event (while prefetch is running)
 
 
 def _cache_put(video_id: str, meta, cues: list) -> None:
@@ -70,21 +71,33 @@ def _seg_cache_get(video_id: str):
 
 
 def _start_seg_prefetch(meta, cues: list) -> None:
-    """Fire-and-forget: run select_segments in background so the result is cached
-    by the time the user clicks 'play key moments'. Uses default ratio/lang (same
-    as what the extension sends — no ratio, lang='en')."""
+    """Start background segment selection. No-op if one is already running for this video.
+    Stores a threading.Event in _seg_prefetch_events so _run_segments can wait instead
+    of spawning a second concurrent Claude call."""
+    vid = meta.video_id
+    with _cache_lock:
+        if vid in _seg_prefetch_events:
+            return  # already running — don't spawn a second one
+        evt = threading.Event()
+        _seg_prefetch_events[vid] = evt
+
     def _run():
         from . import metadata as _md
         try:
             _meta, segs = core.select_segments(
-                _md.watch_url(meta.video_id), None, "en",
+                _md.watch_url(vid), None, "en",
                 timeout=SEGMENTS_TIMEOUT,
                 _prefetched=(meta, cues),
             )
-            _seg_cache_put(meta.video_id, _meta, segs)
-            print(f"  prefetched {len(segs)} segments for {meta.video_id}", flush=True)
+            _seg_cache_put(vid, _meta, segs)
+            print(f"  prefetched {len(segs)} segments for {vid}", flush=True)
         except Exception as exc:
-            print(f"  segment prefetch failed for {meta.video_id}: {exc}", flush=True)
+            print(f"  segment prefetch failed for {vid}: {exc}", flush=True)
+        finally:
+            with _cache_lock:
+                _seg_prefetch_events.pop(vid, None)
+            evt.set()  # wake any waiter (even on failure, so it doesn't block forever)
+
     threading.Thread(target=_run, daemon=True).start()
 
 from . import (
@@ -388,16 +401,35 @@ class _Handler(BaseHTTPRequestHandler):
         except BadUrlError:
             vid = None
 
-        # Check segment cache first — populated by background prefetch after text summary
-        seg_hit = _seg_cache_get(vid) if vid else None
-        if seg_hit and max_ms is None and ratio is None:
-            meta, segments = seg_hit
-            print(f"  using cached segments for {vid} ({len(segments)} moments, "
-                  f"{time.monotonic()-start:.1f}s)", flush=True)
-            emit({"type": "progress", "message": "using cached segments", "percent": 95})
-            emit({"type": "segments", "segments": segments, "title": meta.title,
-                  "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
-            return
+        # For the default case (no custom ratio/max_length) check segment cache first,
+        # then wait for an in-progress prefetch if one is running — prevents two
+        # concurrent Claude calls for the same video when the user clicks fast.
+        if vid and max_ms is None and ratio is None:
+            seg_hit = _seg_cache_get(vid)
+            if seg_hit:
+                meta, segments = seg_hit
+                print(f"  using cached segments for {vid} ({len(segments)} moments, "
+                      f"{time.monotonic()-start:.1f}s)", flush=True)
+                emit({"type": "progress", "message": "using cached segments", "percent": 95})
+                emit({"type": "segments", "segments": segments, "title": meta.title,
+                      "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
+                return
+
+            with _cache_lock:
+                prefetch_evt = _seg_prefetch_events.get(vid)
+            if prefetch_evt:
+                print(f"  waiting for in-progress prefetch for {vid}", flush=True)
+                progress("selecting key moments (almost ready)…", None)
+                prefetch_evt.wait(timeout=SEGMENTS_TIMEOUT)
+                seg_hit = _seg_cache_get(vid)
+                if seg_hit:
+                    meta, segments = seg_hit
+                    print(f"  prefetch ready for {vid} ({len(segments)} moments, "
+                          f"{time.monotonic()-start:.1f}s)", flush=True)
+                    emit({"type": "segments", "segments": segments, "title": meta.title,
+                          "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
+                    return
+                # prefetch failed — fall through to on-demand
 
         prefetched = _cache_get(vid) if vid else None
         if prefetched:
