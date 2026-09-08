@@ -39,11 +39,15 @@ def select_segments(
     max_length_ms: int | None = None,
     timeout: float = 300.0,
     on_progress=None,
+    on_segment_ready=None,
     _prefetched=None,
 ):
     """Pick the key source time-spans for in-player skip playback (no video work).
 
     Returns (meta, segments) where segments = [{start, end, label}] in SECONDS.
+
+    on_segment_ready: optional callback(seg) called with {start, end, label} for each
+    span as soon as Claude identifies it during streaming (before the full list is done).
 
     _prefetched: (meta, cues) from a prior summarize call -- skips the yt-dlp fetch
     and subtitle parse so "play key moments" after a text summary reuses the work.
@@ -69,9 +73,28 @@ def select_segments(
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
+    # Per-segment callback: convert each (first_cue, last_cue) to a span and emit
+    # immediately so the client can start playback before the full list arrives.
+    _on_seg_found = None
+    if on_segment_ready is not None:
+        def _on_seg_found(first_cue: int, last_cue: int) -> None:
+            try:
+                new_spans = spans.spans_from_cue_ranges(
+                    [(first_cue, last_cue)], cues, min_clip_ms=MIN_CLIP_MS)
+                new_spans = spans.pad_spans(
+                    new_spans, cues, BOUNDARY_PAD_MS, meta.duration_ms)
+                for s in new_spans:
+                    on_segment_ready({
+                        "start": round(s.start_ms / 1000, 2),
+                        "end": round(s.end_ms / 1000, 2),
+                        "label": format_clock(s.display_start_ms),
+                    })
+            except Exception:
+                pass  # never let streaming errors abort the main flow
+
     sel = summarize.select_video_segments(
         cues, meta.channel, meta.title, ratio, max_length_ms, timeout=timeout,
-        on_progress=on_progress)
+        on_progress=on_progress, on_segment_found=_on_seg_found)
     chosen = spans.spans_from_cue_ranges(sel.ranges, cues, min_clip_ms=MIN_CLIP_MS)
     chosen = spans.pad_spans(chosen, cues, BOUNDARY_PAD_MS, meta.duration_ms)
     caps = [c for c in (max_length_ms,

@@ -139,6 +139,10 @@ The URL argument also accepts a **bare 11-character video id** (e.g. `tldw 86QbF
   like `amy`/`ryan`/`cori`/`alan`). Voice models download once on first use into
   `~/.cache/youtube-tldw/voices/`.
 
+Speech is encoded while it's still being synthesized — Piper's per-sentence PCM is
+piped straight into a long-lived ffmpeg encoder — so `tldw serve` can hand the
+extension playable mp3 within about a second instead of after the whole script.
+
 Text-mode TTS needs Piper installed: `pipx inject youtube-tldw piper-tts`
 (or `pip install -e ".[tts]"` for a dev checkout).
 

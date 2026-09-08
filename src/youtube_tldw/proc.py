@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 
 from . import TldrError, TldrTimeoutError
@@ -67,3 +68,86 @@ def run(
             f"`{argv[0]}` failed (exit {result.returncode}): " + " ".join(tail)
         )
     return result
+
+
+def stream_filter(
+    argv: list[str],
+    feed,
+    *,
+    timeout: float | None = None,
+    block: int = 65536,
+):
+    """Run argv as a long-lived byte filter and yield its stdout as it appears.
+
+    `feed(write)` runs on a worker thread and produces stdin (write is called with
+    bytes; stdin is closed when it returns). Same policy as run(): argv list,
+    shell=False, no untrusted data in argv. Used where waiting for the whole output
+    would add latency the caller can't afford — mp3 encoding while TTS is still
+    running. `timeout` kills the process, which unblocks the read loop.
+    """
+    if not argv or not isinstance(argv, list):
+        raise ValueError("argv must be a non-empty list")
+    try:
+        proc = subprocess.Popen(  # noqa: S603 - argv list, shell=False by default
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+    except FileNotFoundError as exc:
+        raise TldrError(f"`{argv[0]}` is not installed or not on PATH.") from exc
+
+    errbuf: list[bytes] = []
+    feed_exc: list[BaseException] = []
+    killed = threading.Event()
+
+    def _write(data: bytes) -> None:
+        # Flush every write: a buffered write would sit here until stdin closed,
+        # which is exactly the latency this function exists to remove.
+        proc.stdin.write(data)
+        proc.stdin.flush()
+
+    def _feed() -> None:
+        try:
+            feed(_write)
+        except BaseException as exc:  # surfaced after the read loop drains
+            feed_exc.append(exc)
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass  # already gone (killed, or the filter exited early)
+
+    def _drain_err() -> None:
+        errbuf.append(proc.stderr.read() or b"")
+
+    def _kill() -> None:
+        killed.set()
+        proc.kill()
+
+    threads = [threading.Thread(target=_feed, daemon=True),
+               threading.Thread(target=_drain_err, daemon=True)]
+    for t in threads:
+        t.start()
+    watchdog = threading.Timer(timeout, _kill) if timeout else None
+    if watchdog:
+        watchdog.daemon = True
+        watchdog.start()
+    try:
+        while True:
+            chunk = proc.stdout.read1(block)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        if watchdog:
+            watchdog.cancel()
+        if proc.poll() is None:
+            proc.kill()  # consumer abandoned us, or we're unwinding on an error
+        threads[0].join(timeout=5)
+        threads[1].join(timeout=5)
+        proc.wait()
+    if killed.is_set():
+        raise TldrTimeoutError(f"`{argv[0]}` timed out after {timeout}s.")
+    if feed_exc:
+        raise feed_exc[0]
+    if proc.returncode != 0:
+        tail = (b"".join(errbuf)).decode("utf-8", "replace").strip().splitlines()[-3:]
+        raise TldrError(f"`{argv[0]}` failed (exit {proc.returncode}): " + " ".join(tail))

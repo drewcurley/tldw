@@ -68,30 +68,79 @@ class _FakeChunk:
     sample_channels = 1
 
 
+class _FakeConfig:
+    sample_rate = 22050
+
+
 class _FakeVoice:
+    config = _FakeConfig()
+
     def synthesize(self, text):
         return [_FakeChunk(), _FakeChunk(), _FakeChunk()]
 
 
-def test_synthesize_speech_inprocess_with_progress(monkeypatch, tmp_path):
+def _patch_voice(monkeypatch):
     monkeypatch.setattr(audio, "require_piper", lambda: None)
     monkeypatch.setattr(audio, "ensure_voice", lambda v, **k: "en_US-amy-medium")
     monkeypatch.setattr(audio, "_load_voice", lambda p: _FakeVoice())
-    ff = []
-    monkeypatch.setattr(audio, "run",
-                        lambda argv, **kw: (ff.append(argv), Path(argv[-1]).write_bytes(b"\x00")))
-    prog = []
-    out = tmp_path / "out.mp3"
-    audio.synthesize_speech("One. Two. Three.", out, "amy", tmp_path,
-                            on_progress=lambda m, p=None: prog.append((m, p)))
 
-    assert (tmp_path / "speech.wav").exists()          # wav assembled from chunks
-    assert ff and ff[0][0] == "ffmpeg" and "libmp3lame" in ff[0]
-    assert out.exists()
-    # per-sentence synth percentages reported, increasing, capped at 95
+
+def _fake_filter(out_blocks, captured=None):
+    """Stand in for proc.stream_filter: drain the feed, then yield canned mp3 bytes."""
+    def _filter(argv, feed, *, timeout=None, block=65536):
+        if captured is not None:
+            captured["argv"] = argv
+            captured["pcm"] = bytearray()
+            feed(captured["pcm"].extend)
+        else:
+            feed(lambda _b: None)
+        yield from out_blocks
+    return _filter
+
+
+def test_stream_speech_yields_mp3_and_reports_progress(monkeypatch):
+    _patch_voice(monkeypatch)
+    cap = {}
+    monkeypatch.setattr(audio, "stream_filter", _fake_filter([b"ID3", b"more"], cap))
+    prog = []
+    blocks = list(audio.stream_speech("One. Two. Three.", "amy",
+                                      on_progress=lambda m, p=None: prog.append((m, p))))
+
+    assert b"".join(blocks) == b"ID3more"                # nothing lost
+    assert bytes(cap["pcm"]) == b"\x00\x00" * 3       # every sentence reached ffmpeg
+    assert cap["argv"][0] == "ffmpeg" and "libmp3lame" in cap["argv"]
+    assert "22050" in cap["argv"]                        # rate taken from the voice
     synth = [p for m, p in prog if "synthesizing" in m and isinstance(p, int)]
-    assert synth and synth == sorted(synth) and synth[-1] <= 95
-    assert any(p is None for m, p in prog)             # preparing/loading are indeterminate
+    assert synth and synth == sorted(synth) and synth[-1] <= 99
+    assert any(p is None for m, p in prog)               # preparing/loading indeterminate
+
+
+def test_stream_speech_coalesces_small_blocks(monkeypatch):
+    """ffmpeg emits ~200-byte frames; the caller should get a few big blocks instead."""
+    _patch_voice(monkeypatch)
+    frames = [b"x" * 200] * 400                          # 80KB in 400 tiny writes
+    monkeypatch.setattr(audio, "stream_filter", _fake_filter(frames))
+    blocks = list(audio.stream_speech("One.", "amy"))
+
+    assert b"".join(blocks) == b"".join(frames)          # nothing lost or reordered
+    assert len(blocks) < 10                              # coalesced, not passed through
+    assert len(blocks[0]) < audio.BLOCK_BYTES            # first block small: fast start
+    assert len(blocks[0]) >= audio.FIRST_BLOCK_BYTES
+
+
+def test_synthesize_speech_writes_mp3(monkeypatch, tmp_path):
+    _patch_voice(monkeypatch)
+    monkeypatch.setattr(audio, "stream_filter", _fake_filter([b"ID3", b"payload"]))
+    out = tmp_path / "out.mp3"
+    audio.synthesize_speech("One. Two.", out, "amy")
+    assert out.read_bytes() == b"ID3payload"
+
+
+def test_synthesize_speech_empty_output_raises(monkeypatch, tmp_path):
+    _patch_voice(monkeypatch)
+    monkeypatch.setattr(audio, "stream_filter", _fake_filter([]))
+    with pytest.raises(TldrError):
+        audio.synthesize_speech("One.", tmp_path / "out.mp3", "amy")
 
 
 def test_ensure_voice_downloads_when_missing(monkeypatch, tmp_path):

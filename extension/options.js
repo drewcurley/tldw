@@ -40,6 +40,52 @@ async function load() {
   } catch (_) {}
 }
 
+// Preview plays a short sample of the highlighted voice. The options page is an
+// extension origin, so it can call the server directly with whatever token is in the
+// field — no need to save first just to audition a voice.
+const previewCache = new Map();          // voice -> object URL
+
+async function preview() {
+  const btn = document.getElementById("preview");
+  const note = document.getElementById("previewStatus");
+  const sample = document.getElementById("sample");
+  const voice = document.getElementById("voice").value;
+  const token = document.getElementById("token").value.trim();
+  note.textContent = "";
+  if (!token) { note.textContent = "Paste the token first."; return; }
+  if (previewCache.has(voice)) { sample.src = previewCache.get(voice); sample.play(); return; }
+  const serverUrl = (document.getElementById("serverUrl").value.trim()
+    || DEFAULTS.serverUrl).replace(/\/+$/, "");
+  btn.disabled = true;
+  btn.textContent = "…";
+  try {
+    const resp = await fetch(serverUrl + "/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({ voice }),
+    });
+    if (!resp.ok) {
+      let detail = "";
+      try { detail = (await resp.json()).error || ""; } catch (_) {}
+      note.textContent = resp.status === 401
+        ? "Token mismatch — check the token from `tldw serve`."
+        : (detail || `Preview failed (${resp.status}).`);
+      return;
+    }
+    const url = URL.createObjectURL(await resp.blob());
+    previewCache.set(voice, url);
+    sample.src = url;
+    sample.play().catch(() => {});
+  } catch (_) {
+    note.textContent = "Can't reach the server. Is `tldw serve` running?";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "▶ Preview";
+  }
+}
+
+document.getElementById("preview").addEventListener("click", preview);
+
 document.getElementById("save").addEventListener("click", async () => {
   const serverUrl = document.getElementById("serverUrl").value.trim() || DEFAULTS.serverUrl;
   const token = document.getElementById("token").value.trim();
