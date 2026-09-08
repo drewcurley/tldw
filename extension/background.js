@@ -10,7 +10,8 @@ const api = globalThis.browser ?? globalThis.chrome;
 const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "", voice: "amy" };
 const CLIENT_TIMEOUT_MS = 150000;
 const SEG_TIMEOUT_MS = 320000;          // segment selection can take 2-3 min (Claude JSON)
-const SPEAK_TIMEOUT_MS = 170000;        // first-use voice download can be slow
+const SPEAK_TIMEOUT_MS = 600000;        // long summaries synthesize for minutes;
+                                        // playback starts in ~1s regardless
 const cache = new Map();                // videoId -> summary payload
 const audioCache = new Map();           // `${videoId}|${voice}` -> data: URL
 
@@ -147,6 +148,10 @@ async function handleSpeak(port, msg) {
   }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), SPEAK_TIMEOUT_MS);
+  // Stop button (or a closed tab) disconnects the port — cancel the request so the
+  // server stops synthesizing instead of finishing a clip nobody will hear.
+  let stopped = false;
+  port.onDisconnect.addListener(() => { stopped = true; ctrl.abort(); });
   let gotTerminal = false;
   try {
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/speak/stream", {
@@ -204,11 +209,13 @@ async function handleSpeak(port, msg) {
         }
       }
     }
-    if (!gotTerminal) {
+    if (!gotTerminal && !stopped) {
       safePost(port, { type: "speakError", error: "Audio stream ended unexpectedly. Try again." });
     }
   } catch (e) {
-    if (e.name === "AbortError") {
+    if (stopped) {
+      // Deliberate abort — the page has already reset itself.
+    } else if (e.name === "AbortError") {
       safePost(port, { type: "speakError",
         error: "Audio generation timed out. Try again (first use downloads the voice)." });
     } else {

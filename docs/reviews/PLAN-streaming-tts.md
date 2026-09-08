@@ -19,8 +19,9 @@ Two changes to the "Listen to summary" path:
 | full clip delivered | 2.5s | 2.5s |
 | voice preview (cold / cached) | — | 1.15s / instant |
 
-Piper runs ~25× realtime here, so synthesis always finishes long before playback
-catches up — the buffer never starves in practice.
+Piper runs ~25× realtime on a short script and ~7× on a long one (a real 13-minute
+spoken summary took 107s), so synthesis stays well ahead of playback either way —
+the buffer never starves in practice.
 
 ## Design
 
@@ -91,6 +92,38 @@ lens: one new subprocess primitive, tested, in the file that already owns
 subprocesses. Investor/CEO/Purchasing: no cost, vendor, or posture change — still
 local-only, still no API keys.
 
+## Round 2 — Stop mid-synthesis
+
+Streaming made the first second instant but left a 13-minute summary synthesizing
+for ~107s with no way out: the voice picker was locked the whole time, so a
+wrong-sounding voice had to be waited out.
+
+- **Third button state.** The Listen button is now idle / **⏹ Stop** / Regenerate,
+  owned by one `setListenState()`. It had to become one function: `renderAudio`
+  used to stamp "Regenerate" onto the button at the first streamed block, i.e.
+  while generation was still running.
+- **Stop is a real abort, not a UI reset.** The page disconnects the port, the
+  worker aborts the fetch on `port.onDisconnect`, the server's next write fails,
+  and `speech.close()` unwinds into `stream_filter`, which kills ffmpeg and
+  unblocks Piper. Measured: ffmpeg gone 0.18s after hang-up, both concurrency
+  slots reacquirable, no leaked threads. Without the abort the server happily
+  finished the clip and held its slot.
+- **Stopping a Regenerate restores the previous clip** rather than leaving an
+  empty slot; a mid-stream error now does the same instead of stranding a partial
+  player.
+- **Timeout headroom.** A 13-minute read is ~107s of Piper against a 120s
+  `SPEAK_TIMEOUT` — 89% of the budget. Raised to 600s server-side (and the
+  extension's fetch cap to match). The old cap was sized for a request the client
+  waited out; now the client hears audio immediately and can Stop at will, so a
+  generous ceiling costs nothing. A test pins the constant.
+
+Verification: `pytest` 248 tests. The disconnect test was mutation-checked — with
+the abort removed it fails (the server ran the full clip). The client state machine
+was driven in a browser against the **real** `content.js` with stubbed extension
+APIs: Listen→Stop→re-pick voice→restart, finish→Regenerate, Stop-a-Regenerate,
+and error-mid-stream all verified, including that the button still reads Stop while
+a streamed clip is playing.
+
 ## Items (non-blocking)
 
 - **Firefox gets no streaming.** Its MSE has no `audio/mpeg`, so it keeps today's
@@ -100,3 +133,7 @@ local-only, still no API keys.
   once `endOfStream()` lands.
 - **First preview of an undownloaded voice** pays the ~60MB model download. The
   button shows a pending state; there is no progress bar for it.
+- **"Play key moments" has the same leak** the Stop button fixed for audio: its
+  worker fetch isn't aborted when the port disconnects. Left alone as out of scope.
+- **No JS test harness in the repo**, so the client state machine is verified by
+  driving the real file in a browser rather than by a committed test.

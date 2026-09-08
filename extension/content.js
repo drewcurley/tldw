@@ -124,6 +124,7 @@
         .audiostatus { font-size: 12px; color: #888; }
         .audiostatus.audioerr { color: #c0392b; }
         .audioslot audio { width: 100%; margin-bottom: 12px; }
+        .listen.stopping { border-color: #c00; color: #c00; }
         .vpreview { padding: 4px 9px; font-size: 13px; line-height: 1.2; }
         .vpreview[disabled] { opacity: .55; cursor: default; }
         .circ { flex: 0 0 auto; display: none; }
@@ -328,15 +329,37 @@
     }).catch(() => {});
   }
 
+  // The Listen button has three states: idle, generating (a live Stop), and done
+  // (Regenerate). One function owns label/handler/styling so nothing else clobbers
+  // it mid-flight — renderAudio used to overwrite the label from under it.
+  function setListenState(state) {
+    const btn = root && root.querySelector(".listen");
+    if (!btn) return;
+    const stopping = state === "generating";
+    btn.textContent = stopping ? "⏹ Stop"
+      : state === "done" ? "🔊 Regenerate" : "🔊 Listen to summary";
+    btn.setAttribute("aria-label", stopping
+      ? "Stop generating audio and choose a different voice"
+      : "Generate spoken audio of this summary");
+    btn.classList.toggle("stopping", stopping);
+    btn.disabled = false;
+    btn.onclick = stopping ? abortAudio : requestAudio;
+  }
+
+  function listenIdleState() {
+    // "Regenerate" only makes sense once a clip is actually sitting in the slot.
+    return root && root.querySelector(".audioslot audio") ? "done" : "idle";
+  }
+
   function requestAudio() {
     if (busy || !lastPayload) return;            // re-entrancy guard
     busy = true;
-    const btn = root.querySelector(".listen");
     const sel = root.querySelector(".voice");
     const status = root.querySelector(".audiostatus");
     const prev = root.querySelector(".vpreview");
     status.classList.remove("audioerr");
-    btn.disabled = true; if (sel) sel.disabled = true;
+    setListenState("generating");
+    if (sel) sel.disabled = true;
     if (prev) prev.disabled = true;
     status.textContent = "Starting…";
     setCircle(null);                                    // indeterminate until first %
@@ -355,7 +378,7 @@
       } else if (m.type === "audio") {
         teardownAudio(); finishAudioUI(); renderAudio(m.dataUrl);
       } else if (m.type === "speakError") {
-        teardownAudio(); finishAudioUI(); resetStream(); showAudioError(m.error);
+        teardownAudio(); discardStream(); finishAudioUI(); showAudioError(m.error);
       }
     });
     audioPort.onDisconnect.addListener(() => {
@@ -370,6 +393,29 @@
       voice: sel ? sel.value : "amy", payload: lastPayload,
       stream: mseSupported(),        // no MSE (Firefox) -> ask for one buffered clip
     });
+  }
+
+  // Stop: drop the request, the partial clip, and the lock on the voice picker, so
+  // a wrong-sounding voice can be swapped without waiting the synthesis out.
+  function abortAudio() {
+    if (!busy) return;
+    teardownAudio();               // disconnects the port; the worker aborts the fetch
+    discardStream();
+    finishAudioUI();
+    const status = root && root.querySelector(".audiostatus");
+    if (status) status.textContent = "Stopped. Pick another voice and try again.";
+  }
+
+  // Throw away whatever streamed in, and put back the last finished clip (if this
+  // was a Regenerate that got stopped) rather than leaving an empty slot.
+  function discardStream() {
+    if (stream && stream.audio) { try { stream.audio.pause(); } catch (_) {} }
+    resetStream();
+    const slot = root && root.querySelector(".audioslot");
+    if (slot) slot.innerHTML = "";
+    if (lastAudio && lastPayload && lastAudio.videoId === lastPayload.video_id) {
+      renderAudio(lastAudio.dataUrl, true);
+    }
   }
 
   // Idle watchdog: re-armed on every message, so a long-but-progressing stream is
@@ -495,12 +541,11 @@
   }
 
   function finishAudioUI() {
-    const listen = root && root.querySelector(".listen");
     const play = root && root.querySelector(".playkey");
     const sel = root && root.querySelector(".voice");
     const prev = root && root.querySelector(".vpreview");
     const status = root && root.querySelector(".audiostatus");
-    if (listen) listen.disabled = false;
+    setListenState(listenIdleState());
     if (play) play.disabled = false;
     if (sel) sel.disabled = false;
     if (prev) { prev.disabled = false; prev.textContent = "▶ Preview"; }
@@ -805,8 +850,7 @@
     a.controls = true; a.src = src;
     a.setAttribute("aria-label", "Spoken summary");
     slot.appendChild(a);
-    const btn = root.querySelector(".listen");
-    if (btn) btn.textContent = "🔊 Regenerate";
+    if (!busy) setListenState("done");        // mid-stream the button is still Stop
     if (!restore) {
       // A blob: URL is a live MediaSource, not a clip worth restoring later.
       if (src.startsWith("data:")) {
