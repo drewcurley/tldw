@@ -120,7 +120,10 @@ _preview_lock = threading.Lock()
 MAX_CONCURRENCY = 2
 REQUEST_TIMEOUT = 120.0   # text summarize budget
 SEGMENTS_TIMEOUT = 300.0  # segment selection needs structured JSON — allow more time
-SPEAK_TIMEOUT = 120.0     # per-request piper/ffmpeg budget
+# Whole-synthesis budget, not a per-clip one: a 13-minute spoken summary takes
+# ~107s of Piper. The client hears the first second immediately and can Stop at any
+# point, so a generous ceiling costs nothing.
+SPEAK_TIMEOUT = 600.0
 _LANG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,15}$")
 TOKEN_FILE = Path.home() / ".config" / "youtube-tldw" / "token"
 
@@ -514,6 +517,7 @@ class _Handler(BaseHTTPRequestHandler):
         script, voice = parsed
         # Opt-in: an older extension gets the single buffered {"type":"audio"} event.
         chunked = stream and body.get("stream_audio") is True
+        gone = threading.Event()   # set when the client stops listening
         start = time.monotonic()
         tlog = self._logger(start)
 
@@ -529,10 +533,18 @@ class _Handler(BaseHTTPRequestHandler):
             wlock = threading.Lock()
 
             def emit(obj):
+                # A failed write means the client hung up (Stop button, closed tab).
+                # Record it instead of raising: the synthesis thread calls this too,
+                # and an exception there would surface as a confusing server error.
+                if gone.is_set():
+                    return
                 line = (json.dumps(obj) + "\n").encode("utf-8")
                 with wlock:
-                    self.wfile.write(line)
-                    self.wfile.flush()
+                    try:
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                    except OSError:
+                        gone.set()
 
             def progress(m, pct=None):
                 tlog(m)
@@ -541,11 +553,12 @@ class _Handler(BaseHTTPRequestHandler):
             def progress(m, pct=None):
                 tlog(m)
 
+        total, seq = 0, 0
+        blocks = []
+        speech = audio.stream_speech(script, voice, timeout=SPEAK_TIMEOUT,
+                                     on_progress=progress)
         try:
-            total, seq = 0, 0
-            blocks = []
-            for block in audio.stream_speech(script, voice, timeout=SPEAK_TIMEOUT,
-                                             on_progress=progress):
+            for block in speech:
                 total += len(block)
                 if chunked:
                     emit({"type": "audio_chunk", "seq": seq,
@@ -553,6 +566,8 @@ class _Handler(BaseHTTPRequestHandler):
                     seq += 1
                 else:
                     blocks.append(block)
+                if gone.is_set():
+                    break
         except (TldrTimeoutError, TldrError) as exc:
             status = 504 if isinstance(exc, TldrTimeoutError) else 502
             print(f"  speak failed ({status}): {exc}", flush=True)
@@ -567,6 +582,14 @@ class _Handler(BaseHTTPRequestHandler):
                 emit({"type": "error", "status": 500, "error": "internal error"})
             else:
                 self._send_json(500, {"error": "internal error"})
+            return
+        finally:
+            # Closing the generator unwinds into stream_filter, which kills ffmpeg and
+            # unblocks Piper — without this an abort would synthesize to the end.
+            speech.close()
+        if gone.is_set():
+            print(f"  speak stopped by client after {time.monotonic()-start:.1f}s "
+                  f"({total//1024}KB, voice={voice})", flush=True)
             return
         print(f"  spoke {total//1024}KB in {time.monotonic()-start:.1f}s "
               f"(voice={voice}{', streamed' if chunked else ''})", flush=True)

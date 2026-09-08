@@ -158,7 +158,7 @@ def _mp3_argv(sample_rate: int) -> list[str]:
 
 
 def stream_speech(
-    text: str, voice_id: str, *, timeout: float = 120, on_progress=None,
+    text: str, voice_id: str, *, timeout: float = 600, on_progress=None,
 ):
     """Yield mp3 blocks as Piper synthesizes `text` — first audio in well under a
     second instead of after the whole script.
@@ -199,7 +199,7 @@ def stream_speech(
 
 
 def synthesize_speech(
-    text: str, out_mp3: Path, voice_id: str, *, timeout: float = 120, on_progress=None,
+    text: str, out_mp3: Path, voice_id: str, *, timeout: float = 600, on_progress=None,
 ) -> None:
     """Synthesize `text` to an mp3 file (the batch form of stream_speech)."""
     with out_mp3.open("wb") as f:

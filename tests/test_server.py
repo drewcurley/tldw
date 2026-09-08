@@ -1,5 +1,7 @@
 import json
+import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -296,6 +298,69 @@ def test_speak_stream_reports_failure_mid_stream(srv, monkeypatch):
     events = _read_ndjson(port, body, _auth(), path="/speak/stream")
     assert [e["type"] for e in events] == ["audio_chunk", "error"]
     assert events[-1]["status"] == 502 and "ffmpeg died" in events[-1]["error"]
+
+
+def test_speak_stream_stops_synthesizing_when_client_disconnects(srv, monkeypatch):
+    """Stop button: the page drops the connection, so the server must abandon the
+    clip instead of synthesizing minutes of audio nobody will hear."""
+    _, port = srv
+    monkeypatch.setattr(server.audio, "require_piper", lambda: None)
+    state = {"yielded": 0, "closed": False, "ran_to_end": False}
+
+    def slow(text, voice, *, timeout=None, on_progress=None):
+        try:
+            for _ in range(500):
+                state["yielded"] += 1
+                yield b"x" * 4096
+                time.sleep(0.01)
+            state["ran_to_end"] = True
+        finally:
+            state["closed"] = True      # generator closed -> ffmpeg killed, slot freed
+
+    monkeypatch.setattr(server.audio, "stream_speech", slow)
+    payload = json.dumps({"title": "T", "channel": "C", "key_points": [],
+                          "summary": "hi", "voice": "amy",
+                          "stream_audio": True}).encode()
+    request = (b"POST /speak/stream HTTP/1.1\r\n"
+               b"Host: 127.0.0.1\r\n"
+               b"Authorization: Bearer " + TOKEN.encode() + b"\r\n"
+               b"Origin: " + EXT_ORIGIN.encode() + b"\r\n"
+               b"Content-Type: application/json\r\n"
+               b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.sendall(request)
+    assert sock.recv(4096)              # streaming has started
+    sock.close()                        # hang up mid-clip
+
+    deadline = time.monotonic() + 10
+    while not state["closed"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert state["closed"], "synthesis was never stopped"
+    assert not state["ran_to_end"], "server kept synthesizing after the client left"
+    assert state["yielded"] < 500
+
+    # The concurrency slot came back with it — the next request still works.
+    monkeypatch.setattr(server.audio, "stream_speech", _fake_stream([b"MP3"]))
+    events = _read_ndjson(port, {"title": "T", "channel": "C", "key_points": [],
+                                 "summary": "hi", "voice": "amy"},
+                          _auth(), path="/speak/stream")
+    assert events[-1]["type"] == "audio"
+
+
+def test_speak_uses_the_long_synthesis_budget(srv, monkeypatch):
+    """A 13-minute spoken summary is ~107s of Piper; guard the headroom."""
+    _, port = srv
+    monkeypatch.setattr(server.audio, "require_piper", lambda: None)
+    seen = {}
+
+    def capture(text, voice, *, timeout=None, on_progress=None):
+        seen["timeout"] = timeout
+        yield b"MP3"
+
+    monkeypatch.setattr(server.audio, "stream_speech", capture)
+    _read_ndjson(port, {"title": "T", "channel": "C", "key_points": [],
+                        "summary": "hi", "voice": "amy"}, _auth(), path="/speak/stream")
+    assert seen["timeout"] == server.SPEAK_TIMEOUT >= 600
 
 
 def test_preview_returns_mp3_and_caches(srv, monkeypatch):
