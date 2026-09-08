@@ -148,10 +148,13 @@ async function handleSpeak(port, msg) {
   }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), SPEAK_TIMEOUT_MS);
-  // Stop button (or a closed tab) disconnects the port — cancel the request so the
-  // server stops synthesizing instead of finishing a clip nobody will hear.
+  // Only an explicit Stop cancels the request. A plain disconnect must NOT: closing
+  // the panel to pause the video is normal, and letting synthesis finish puts the
+  // clip in audioCache so re-opening and pressing Listen is instant.
   let stopped = false;
-  port.onDisconnect.addListener(() => { stopped = true; ctrl.abort(); });
+  port.onMessage.addListener((m) => {
+    if (m && m.type === "stopSpeak") { stopped = true; ctrl.abort(); }
+  });
   let gotTerminal = false;
   try {
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/speak/stream", {
