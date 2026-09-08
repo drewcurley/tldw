@@ -221,7 +221,7 @@ def test_text_render_audio_synthesizes(monkeypatch, tmp_path):
     monkeypatch.setattr(cli.videomode, "probe_duration_ms", lambda p: 30_000)
     monkeypatch.setattr(
         cli.audio, "synthesize_speech",
-        lambda text, out_mp3, gender, workdir, **k: Path(out_mp3).write_bytes(b"\x00"),
+        lambda text, out_mp3, voice, **k: Path(out_mp3).write_bytes(b"\x00"),
     )
     cli.run(cli.build_parser().parse_args(
         [URL, "--mode", "text", "--render-audio", "--output-dir", str(tmp_path)]))

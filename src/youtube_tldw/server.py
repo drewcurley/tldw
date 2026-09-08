@@ -16,8 +16,6 @@ import json
 import os
 import re
 import secrets
-import shutil
-import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -116,6 +114,9 @@ from .timing import format_length, parse_duration
 
 MAX_BODY_BYTES = 16 * 1024
 MAX_SPEAK_BYTES = 64 * 1024   # /speak carries the summary text
+PREVIEW_TEXT = "Hi — this is how your T L D W summaries will sound."
+_preview_cache: dict[str, bytes] = {}   # voice model -> mp3 (13 voices, ~40KB each)
+_preview_lock = threading.Lock()
 MAX_CONCURRENCY = 2
 REQUEST_TIMEOUT = 120.0   # text summarize budget
 SEGMENTS_TIMEOUT = 300.0  # segment selection needs structured JSON — allow more time
@@ -219,6 +220,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
         speak = path in ("/speak", "/speak/stream")
+        if path == "/preview":
+            self._guarded(self._run_preview)
+            return
         if path not in ("/summarize", "/summarize/stream", "/segments/stream") and not speak:
             self._send_json(404, {"error": "not found"})
             return
@@ -246,6 +250,22 @@ class _Handler(BaseHTTPRequestHandler):
                 self._run_segments(*parsed, body)
             else:
                 self._run_buffered(*parsed)
+        finally:
+            self.server.sem.release()
+
+    def _guarded(self, handler) -> None:
+        """auth -> small body -> concurrency slot, then run `handler(body)`."""
+        if not self._authorized():
+            self._send_json(401, {"error": "missing or invalid token"})
+            return
+        body = self._read_body(MAX_BODY_BYTES)
+        if body is None:
+            return  # _read_body already responded
+        if not self.server.sem.acquire(blocking=False):
+            self._send_json(429, {"error": "busy, try again shortly"})
+            return
+        try:
+            handler(body)
         finally:
             self.server.sem.release()
 
@@ -421,6 +441,13 @@ class _Handler(BaseHTTPRequestHandler):
             emit({"type": "segments", "segments": segments, "title": meta.title,
                   "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
 
+        def _emit_segments_done(meta, segments):
+            progress(f"Found {len(segments)} key moment(s)!", 98)
+            print(f"  {len(segments)} key segments for '{meta.title}' "
+                  f"in {time.monotonic()-start:.1f}s", flush=True)
+            emit({"type": "segments_done", "title": meta.title,
+                  "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
+
         # 1. Instant cache hit
         if vid and max_ms is None and ratio is None:
             seg_hit = _seg_cache_get(vid)
@@ -448,12 +475,20 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 # prefetch failed — fall through to direct call
 
-        # 3. Direct call — on_progress streams each clip to the client as Claude finds it
+        # 3. Direct call — emit segment_added for each span as Claude finds it so the
+        #    client can start playback immediately without waiting for the full list.
         prefetched = tx_hit
+        streamed_segs: list = []
+
+        def _on_segment_ready(seg: dict) -> None:
+            streamed_segs.append(seg)
+            emit({"type": "segment_added", "segment": seg})
+
         try:
             meta, segments = core.select_segments(
                 url, ratio, lang, max_length_ms=max_ms,
                 timeout=SEGMENTS_TIMEOUT, on_progress=progress,
+                on_segment_ready=_on_segment_ready,
                 _prefetched=prefetched)
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
@@ -467,14 +502,18 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if vid:
             _seg_cache_put(vid, meta, segments)
-        _emit_segments(meta, segments)
+        if streamed_segs:
+            _emit_segments_done(meta, segments)
+        else:
+            _emit_segments(meta, segments)
 
     def _run_speak(self, body: dict, *, stream: bool) -> None:
         parsed = self._validate_speak(body)
         if parsed is None:
             return  # error already sent (these precede any 200/stream)
         script, voice = parsed
-        workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-speak-"))
+        # Opt-in: an older extension gets the single buffered {"type":"audio"} event.
+        chunked = stream and body.get("stream_audio") is True
         start = time.monotonic()
         tlog = self._logger(start)
 
@@ -485,10 +524,15 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             self._cors_headers()
             self.end_headers()
+            # Progress comes from the synthesis thread while audio blocks are yielded
+            # on this one — one lock so a line is never interleaved with another.
+            wlock = threading.Lock()
 
             def emit(obj):
-                self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
-                self.wfile.flush()
+                line = (json.dumps(obj) + "\n").encode("utf-8")
+                with wlock:
+                    self.wfile.write(line)
+                    self.wfile.flush()
 
             def progress(m, pct=None):
                 tlog(m)
@@ -498,10 +542,17 @@ class _Handler(BaseHTTPRequestHandler):
                 tlog(m)
 
         try:
-            out = workdir / "out.mp3"
-            audio.synthesize_speech(script, out, voice, workdir,
-                                    timeout=SPEAK_TIMEOUT, on_progress=progress)
-            data = out.read_bytes()
+            total, seq = 0, 0
+            blocks = []
+            for block in audio.stream_speech(script, voice, timeout=SPEAK_TIMEOUT,
+                                             on_progress=progress):
+                total += len(block)
+                if chunked:
+                    emit({"type": "audio_chunk", "seq": seq,
+                          "mp3_base64": base64.b64encode(block).decode("ascii")})
+                    seq += 1
+                else:
+                    blocks.append(block)
         except (TldrTimeoutError, TldrError) as exc:
             status = 504 if isinstance(exc, TldrTimeoutError) else 502
             print(f"  speak failed ({status}): {exc}", flush=True)
@@ -510,14 +561,59 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json(status, {"error": str(exc)})
             return
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
-        print(f"  spoke {len(data)//1024}KB in {time.monotonic()-start:.1f}s "
-              f"(voice={voice})", flush=True)
-        if stream:
-            emit({"type": "audio", "mp3_base64": base64.b64encode(data).decode("ascii")})
+        except Exception as exc:
+            print(f"  unexpected speak error: {exc!r}", flush=True)
+            if stream:
+                emit({"type": "error", "status": 500, "error": "internal error"})
+            else:
+                self._send_json(500, {"error": "internal error"})
+            return
+        print(f"  spoke {total//1024}KB in {time.monotonic()-start:.1f}s "
+              f"(voice={voice}{', streamed' if chunked else ''})", flush=True)
+        if chunked:
+            emit({"type": "audio_end", "chunks": seq, "bytes": total})
+        elif stream:
+            emit({"type": "audio",
+                  "mp3_base64": base64.b64encode(b"".join(blocks)).decode("ascii")})
         else:
-            self._send_bytes(200, "audio/mpeg", data)
+            self._send_bytes(200, "audio/mpeg", b"".join(blocks))
+
+    def _run_preview(self, body: dict) -> None:
+        """A short spoken sample of one voice, for the voice pickers. Memoized."""
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "invalid body"}); return
+        voice = body.get("voice", audio.DEFAULT_VOICE)
+        if not isinstance(voice, str):
+            self._send_json(400, {"error": "voice must be a string"}); return
+        try:
+            model = audio.resolve_voice(voice)  # allowlist -> model, before anything runs
+        except TldrError as exc:
+            self._send_json(400, {"error": str(exc)}); return
+        try:
+            audio.require_piper()
+        except TldrError as exc:
+            self._send_json(503, {"error": str(exc)}); return
+        with _preview_lock:
+            cached = _preview_cache.get(model)
+        if cached:
+            self._send_bytes(200, "audio/mpeg", cached)
+            return
+        start = time.monotonic()
+        try:
+            data = b"".join(audio.stream_speech(PREVIEW_TEXT, voice,
+                                                timeout=SPEAK_TIMEOUT))
+        except (TldrTimeoutError, TldrError) as exc:
+            status = 504 if isinstance(exc, TldrTimeoutError) else 502
+            print(f"  preview failed ({status}): {exc}", flush=True)
+            self._send_json(status, {"error": str(exc)}); return
+        except Exception as exc:
+            print(f"  unexpected preview error: {exc!r}", flush=True)
+            self._send_json(500, {"error": "internal error"}); return
+        with _preview_lock:
+            _preview_cache[model] = data
+        print(f"  preview {model} ({len(data)//1024}KB) in "
+              f"{time.monotonic()-start:.1f}s", flush=True)
+        self._send_bytes(200, "audio/mpeg", data)
 
 
 def _to_payload(summary: core.Summary) -> dict:

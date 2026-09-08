@@ -185,23 +185,31 @@ def test_summarize_stream_error_is_in_band(srv, monkeypatch):
 def test_segments_stream(srv, monkeypatch):
     _, port = srv
 
-    def fake_seg(url, ratio, lang, *, max_length_ms=None, timeout=None, on_progress=None, _prefetched=None):
+    def fake_seg(url, ratio, lang, *, max_length_ms=None, timeout=None, on_progress=None,
+                 on_segment_ready=None, _prefetched=None):
+        segs = [{"start": 1.0, "end": 3.5, "label": "0:01"},
+                {"start": 12.0, "end": 18.0, "label": "0:12"}]
         if on_progress:
             on_progress("selecting the key moments…", 22)
         meta = VideoMeta("dQw4w9WgXcQ", "Cool Title", "Chan", 600_000, {}, {})
-        return meta, [{"start": 1.0, "end": 3.5, "label": "0:01"},
-                      {"start": 12.0, "end": 18.0, "label": "0:12"}]
+        if on_segment_ready:
+            for s in segs:
+                on_segment_ready(s)
+        return meta, segs
 
     monkeypatch.setattr(server.core, "select_segments", fake_seg)
     events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"},
                           _auth(), path="/segments/stream")
     types = [e["type"] for e in events]
-    assert types[0] == "progress"   # "Analyzing…" heartbeat start
-    assert types[-1] == "segments"  # terminal segments event
-    assert types[-2] == "progress"  # "Found N key moments!" just before segments
+    # Streaming path: progress → segment_added × N → progress → segments_done
+    assert types[0] == "progress"
+    assert types[-1] == "segments_done"
+    assert types[-2] == "progress"   # "Found N key moments!" just before done
+    seg_events = [e for e in events if e["type"] == "segment_added"]
+    assert len(seg_events) == 2
+    assert seg_events[0]["segment"] == {"start": 1.0, "end": 3.5, "label": "0:01"}
     final = events[-1]
     assert final["title"] == "Cool Title"
-    assert final["segments"][0] == {"start": 1.0, "end": 3.5, "label": "0:01"}
 
 
 def test_voices_endpoint_no_auth(srv):
@@ -212,14 +220,21 @@ def test_voices_endpoint_no_auth(srv):
     assert all("id" in v and "label" in v for v in payload["voices"])
 
 
+def _fake_stream(blocks, progress=()):
+    """Stand in for audio.stream_speech: report progress, then yield mp3 blocks."""
+    def _stream(text, voice, *, timeout=None, on_progress=None):
+        for m in progress:
+            if on_progress:
+                on_progress(m, None)
+        yield from blocks
+    return _stream
+
+
 def test_speak_returns_mp3(srv, monkeypatch):
     _, port = srv
     monkeypatch.setattr(server.audio, "require_piper", lambda: None)
-
-    def fake_synth(text, out, voice, workdir, *, timeout=None, on_progress=None):
-        Path(out).write_bytes(b"ID3fake-mp3-bytes")
-
-    monkeypatch.setattr(server.audio, "synthesize_speech", fake_synth)
+    monkeypatch.setattr(server.audio, "stream_speech",
+                        _fake_stream([b"ID3fake-", b"mp3-bytes"]))
     body = {"title": "T", "channel": "C", "key_points": ["k"], "summary": "hi",
             "voice": "amy"}
     req = urllib.request.Request(f"http://127.0.0.1:{port}/speak",
@@ -229,27 +244,107 @@ def test_speak_returns_mp3(srv, monkeypatch):
     with urllib.request.urlopen(req, timeout=5) as r:
         assert r.status == 200
         assert r.headers["Content-Type"] == "audio/mpeg"
-        assert r.read() == b"ID3fake-mp3-bytes"
+        assert r.read() == b"ID3fake-mp3-bytes"   # blocks joined for the buffered route
 
 
 def test_speak_stream_emits_progress_then_audio(srv, monkeypatch):
+    """Without stream_audio, an older extension still gets one buffered clip."""
     import base64
     _, port = srv
     monkeypatch.setattr(server.audio, "require_piper", lambda: None)
-
-    def fake_synth(text, out, voice, workdir, *, timeout=None, on_progress=None):
-        if on_progress:
-            on_progress("synthesizing speech…")
-            on_progress("encoding mp3…")
-        Path(out).write_bytes(b"MP3DATA")
-
-    monkeypatch.setattr(server.audio, "synthesize_speech", fake_synth)
+    monkeypatch.setattr(server.audio, "stream_speech",
+                        _fake_stream([b"MP3", b"DATA"],
+                                     progress=["synthesizing speech…", "encoding mp3…"]))
     body = {"title": "T", "channel": "C", "key_points": ["k"], "summary": "hi",
             "voice": "amy"}
     events = _read_ndjson(port, body, _auth(), path="/speak/stream")
     assert [e["type"] for e in events] == ["progress", "progress", "audio"]
     assert events[0]["message"] == "synthesizing speech…"
     assert base64.b64decode(events[-1]["mp3_base64"]) == b"MP3DATA"
+
+
+def test_speak_stream_chunks_audio_when_opted_in(srv, monkeypatch):
+    """stream_audio:true -> a run of audio_chunk blocks, then audio_end."""
+    import base64
+    _, port = srv
+    monkeypatch.setattr(server.audio, "require_piper", lambda: None)
+    monkeypatch.setattr(server.audio, "stream_speech",
+                        _fake_stream([b"aaa", b"bbb", b"ccc"],
+                                     progress=["synthesizing speech… 50%"]))
+    body = {"title": "T", "channel": "C", "key_points": ["k"], "summary": "hi",
+            "voice": "amy", "stream_audio": True}
+    events = _read_ndjson(port, body, _auth(), path="/speak/stream")
+    assert [e["type"] for e in events] == [
+        "progress", "audio_chunk", "audio_chunk", "audio_chunk", "audio_end"]
+    chunks = [e for e in events if e["type"] == "audio_chunk"]
+    assert [c["seq"] for c in chunks] == [0, 1, 2]        # ordered, no gaps
+    assert b"".join(base64.b64decode(c["mp3_base64"]) for c in chunks) == b"aaabbbccc"
+    assert events[-1]["chunks"] == 3 and events[-1]["bytes"] == 9
+
+
+def test_speak_stream_reports_failure_mid_stream(srv, monkeypatch):
+    _, port = srv
+    monkeypatch.setattr(server.audio, "require_piper", lambda: None)
+
+    def boom(text, voice, *, timeout=None, on_progress=None):
+        yield b"aaa"
+        raise TldrError("ffmpeg died")
+
+    monkeypatch.setattr(server.audio, "stream_speech", boom)
+    body = {"title": "T", "channel": "C", "key_points": [], "summary": "hi",
+            "voice": "amy", "stream_audio": True}
+    events = _read_ndjson(port, body, _auth(), path="/speak/stream")
+    assert [e["type"] for e in events] == ["audio_chunk", "error"]
+    assert events[-1]["status"] == 502 and "ffmpeg died" in events[-1]["error"]
+
+
+def test_preview_returns_mp3_and_caches(srv, monkeypatch):
+    _, port = srv
+    monkeypatch.setattr(server, "_preview_cache", {})
+    monkeypatch.setattr(server.audio, "require_piper", lambda: None)
+    calls = []
+
+    def counting(text, voice, *, timeout=None, on_progress=None):
+        calls.append(voice)
+        yield b"PREVIEW-MP3"
+
+    monkeypatch.setattr(server.audio, "stream_speech", counting)
+    for _ in range(2):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/preview",
+                                     data=json.dumps({"voice": "cori"}).encode(),
+                                     method="POST")
+        for k, v in _auth().items():
+            req.add_header(k, v)
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.status == 200
+            assert r.headers["Content-Type"] == "audio/mpeg"
+            assert r.read() == b"PREVIEW-MP3"
+    assert calls == ["cori"]           # second request served from the memo
+
+
+def test_preview_rejects_unknown_voice(srv):
+    _, port = srv
+    status, _, _ = _req(port, "POST", "/preview", {"voice": "../etc/passwd"}, _auth())
+    assert status == 400
+
+
+def test_preview_requires_token(srv):
+    _, port = srv
+    status, _, _ = _req(port, "POST", "/preview", {"voice": "amy"},
+                        {"Content-Type": "application/json"})
+    assert status == 401
+
+
+def test_preview_piper_missing_503(srv, monkeypatch):
+    _, port = srv
+    monkeypatch.setattr(server, "_preview_cache", {})
+
+    def no_piper():
+        raise TldrError("Piper not installed")
+
+    monkeypatch.setattr(server.audio, "require_piper", no_piper)
+    status, _, _ = _req(port, "POST", "/preview", {"voice": "amy"}, _auth())
+    assert status == 503
 
 
 def test_speak_rejects_unknown_voice(srv):

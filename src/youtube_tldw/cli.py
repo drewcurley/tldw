@@ -172,7 +172,7 @@ def _run_text(args, video_id: str, workdir: Path) -> Path:
         audio.synthesize_speech(
             audio.build_spoken_script(meta.title, meta.channel, result.key_points,
                                       result.summary),
-            tmp_mp3, args.voice, workdir,
+            tmp_mp3, args.voice,
         )
         _save_audio(args, meta, tmp_mp3)
     return out_path

@@ -13,6 +13,12 @@
       background: #c00; color: #fff; border: 0; border-radius: 8px; }
     .hint { font-size: 13px; color: #666; }
     #status { margin-left: 10px; color: #0a0; font-size: 14px; }
+    .voicerow { display: flex; gap: 8px; align-items: stretch; }
+    .voicerow select { flex: 1; min-width: 0; padding: 8px 10px; font: inherit;
+      border: 1px solid #bbb; border-radius: 8px; background: #fff; }
+    #preview { margin-top: 0; flex: 0 0 auto; background: #444; }
+    #preview[disabled] { opacity: .6; cursor: default; }
+    #previewStatus { color: #c00; }
   </style>
 </head>
 <body>
@@ -23,8 +29,13 @@
   <label for="token">Token</label>
   <input id="token" type="password" placeholder="paste the token from `tldw serve`" />
   <label for="voice">Default voice (for “Listen to summary”)</label>
-  <select id="voice" style="width:100%;padding:8px 10px;font:inherit;border:1px solid #bbb;border-radius:8px;"></select>
-  <p class="hint">You can also switch the voice per-summary in the popup.</p>
+  <div class="voicerow">
+    <select id="voice"></select>
+    <button id="preview" type="button" title="Hear a sample of this voice">▶ Preview</button>
+  </div>
+  <audio id="sample" hidden></audio>
+  <p class="hint">You can also switch the voice per-summary in the popup.
+    <span id="previewStatus"></span></p>
   <div><button id="save">Save</button><span id="status"></span></div>
   <script src="options.js"></script>
 </body>

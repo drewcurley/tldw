@@ -57,6 +57,7 @@ api.runtime.onConnect.addListener((port) => {
     if (msg.type === "summarize") handleSummarize(port, msg);
     else if (msg.type === "speak") handleSpeak(port, msg);
     else if (msg.type === "getSegments") handleSegments(port, msg);
+    else if (msg.type === "preview") handlePreview(port, msg);
     // "ping" is ignored; receiving it just keeps the worker alive
   });
 });
@@ -154,6 +155,7 @@ async function handleSpeak(port, msg) {
       body: JSON.stringify({
         title: payload.title, channel: payload.channel,
         key_points: payload.key_points, summary: payload.summary_md, voice,
+        stream_audio: msg.stream !== false,   // incremental mp3 blocks where MSE works
       }),
     });
     if (!resp.ok) {
@@ -162,7 +164,9 @@ async function handleSpeak(port, msg) {
       safePost(port, { type: "speakError", error: speakError(resp.status, detail) });
       return;
     }
-    // NDJSON: {type:progress} steps, then a final {type:audio, mp3_base64} or {type:error}.
+    // NDJSON: {type:progress} steps, then either a run of {type:audio_chunk} blocks
+    // ending in {type:audio_end}, or (older server) one final {type:audio}.
+    const parts = [];
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -179,6 +183,16 @@ async function handleSpeak(port, msg) {
         try { ev = JSON.parse(line); } catch (_) { continue; }
         if (ev.type === "progress") {
           safePost(port, { type: "speakProgress", message: ev.message, percent: ev.percent });
+        } else if (ev.type === "audio_chunk") {
+          // Hand it straight to the page so playback can start, and keep a copy so
+          // the finished clip still lands in the session cache.
+          safePost(port, { type: "audioChunk", b64: ev.mp3_base64, first: !parts.length });
+          parts.push(ev.mp3_base64);
+        } else if (ev.type === "audio_end") {
+          gotTerminal = true;
+          const dataUrl = "data:audio/mpeg;base64," + joinBase64(parts);
+          audioCache.set(key, dataUrl);
+          safePost(port, { type: "audioEnd", dataUrl });
         } else if (ev.type === "audio") {
           gotTerminal = true;
           const dataUrl = "data:audio/mpeg;base64," + ev.mp3_base64;
@@ -201,6 +215,74 @@ async function handleSpeak(port, msg) {
       safePost(port, { type: "speakError",
         error: "Can't reach the tldw server. Is it running?  tldw serve" });
     }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Concatenating mp3 blocks has to happen on the bytes, not the base64 text: each
+// block's base64 is independently padded, so joining the strings would corrupt it.
+function joinBase64(parts) {
+  if (parts.length === 1) return parts[0];
+  let len = 0;
+  const bufs = parts.map((b64) => {
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    len += u8.length;
+    return u8;
+  });
+  const all = new Uint8Array(len);
+  let at = 0;
+  for (const b of bufs) { all.set(b, at); at += b.length; }
+  return bytesToBase64(all);
+}
+
+function bytesToBase64(u8) {
+  let bin = "";
+  for (let i = 0; i < u8.length; i += 0x8000) {   // chunked: btoa chokes on huge spreads
+    bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+const previewCache = new Map();         // voice -> data: URL
+
+async function handlePreview(port, msg) {
+  const voice = msg.voice;
+  if (previewCache.has(voice)) {
+    safePost(port, { type: "preview", voice, dataUrl: previewCache.get(voice) });
+    return;
+  }
+  const { serverUrl, token } = await getSettings();
+  if (!token) {
+    safePost(port, { type: "previewError", voice,
+      error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
+    return;
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), SPEAK_TIMEOUT_MS);
+  try {
+    const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/preview", {
+      method: "POST", signal: ctrl.signal,
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({ voice }),
+    });
+    if (!resp.ok) {
+      let detail = "";
+      try { detail = (await resp.json()).error || ""; } catch (_) {}
+      safePost(port, { type: "previewError", voice, error: speakError(resp.status, detail) });
+      return;
+    }
+    const buf = new Uint8Array(await resp.arrayBuffer());
+    const dataUrl = "data:audio/mpeg;base64," + bytesToBase64(buf);
+    previewCache.set(voice, dataUrl);
+    safePost(port, { type: "preview", voice, dataUrl });
+  } catch (e) {
+    safePost(port, { type: "previewError", voice,
+      error: e.name === "AbortError"
+        ? "Voice preview timed out (first use downloads the voice)."
+        : "Can't reach the tldw server. Is it running?  tldw serve" });
   } finally {
     clearTimeout(timer);
   }
@@ -253,6 +335,12 @@ async function handleSegments(port, msg) {
         try { ev = JSON.parse(line); } catch (_) { continue; }
         if (ev.type === "progress") {
           safePost(port, { type: "segProgress", message: ev.message, percent: ev.percent });
+        } else if (ev.type === "segment_added") {
+          safePost(port, { type: "segmentAdded", segment: ev.segment });
+        } else if (ev.type === "segments_done") {
+          gotTerminal = true;
+          safePost(port, { type: "segmentsDone", title: ev.title,
+            channel: ev.channel, source_url: ev.source_url });
         } else if (ev.type === "segments") {
           gotTerminal = true;
           safePost(port, { type: "segments", segments: ev.segments, title: ev.title });

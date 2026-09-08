@@ -249,6 +249,7 @@ def select_video_segments(
     *,
     timeout: float,
     on_progress=None,
+    on_segment_found=None,
 ) -> VideoSelection:
     log = on_progress or (lambda m, p=None: None)
     header = _metadata_header(channel, title)
@@ -273,6 +274,8 @@ def select_video_segments(
             found += 1
             pct = min(15 + found * 10, 88)
             log(f"Found {found} clip(s) so far...", pct)
+            if on_segment_found and sel.ranges:
+                on_segment_found(*sel.ranges[0])  # (first_cue, last_cue)
 
         done = stream_ndjson_segments(
             prompt, header + listing, on_segment=on_seg, timeout=timeout

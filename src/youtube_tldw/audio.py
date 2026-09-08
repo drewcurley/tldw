@@ -9,11 +9,10 @@ import re
 import sys
 import threading
 import time
-import wave
 from pathlib import Path
 
 from . import TldrError
-from .proc import run
+from .proc import run, stream_filter
 
 _voice_cache = {}            # model path -> loaded PiperVoice (load is ~1-2s)
 _voice_lock = threading.Lock()
@@ -144,36 +143,70 @@ def ensure_voice(voice_id: str, *, timeout: float = 180, attempts: int = 3,
     )
 
 
-def synthesize_speech(
-    text: str, out_mp3: Path, voice_id: str, workdir: Path, *, timeout: float = 120,
-    on_progress=None,
-) -> None:
-    """Synthesize `text` to speech with Piper (in-process, for per-sentence progress),
-    then encode to mp3. on_progress is called (message, percent|None)."""
+# mp3 arrives from ffmpeg one ~200-byte frame at a time; coalesce before handing it
+# to the caller (each block becomes a base64 NDJSON line). The first block is small so
+# playback can start as early as possible; later ones amortize the framing overhead.
+FIRST_BLOCK_BYTES = 4 * 1024
+BLOCK_BYTES = 32 * 1024
+
+
+def _mp3_argv(sample_rate: int) -> list[str]:
+    """ffmpeg as a raw-PCM -> mp3 filter. All argv items are server-side constants."""
+    return ["ffmpeg", "-loglevel", "error",
+            "-f", "s16le", "-ar", str(int(sample_rate)), "-ac", "1", "-i", "pipe:0",
+            "-c:a", "libmp3lame", "-q:a", "2", "-f", "mp3", "pipe:1"]
+
+
+def stream_speech(
+    text: str, voice_id: str, *, timeout: float = 120, on_progress=None,
+):
+    """Yield mp3 blocks as Piper synthesizes `text` — first audio in well under a
+    second instead of after the whole script.
+
+    Piper emits one PCM chunk per sentence; those are piped straight into a
+    long-lived ffmpeg encoder, so the result is a single continuous mp3 bitstream
+    (no per-chunk encoder gaps) that concatenates back into a normal file.
+    on_progress is called (message, percent|None) — from the synthesis thread, so a
+    caller that also writes from the consuming thread must serialize the two.
+    """
     log = on_progress or (lambda _m, _p=None: None)
     require_piper()
     log("preparing voice…", None)
-    model = ensure_voice(voice_id, on_progress=on_progress)
+    model = ensure_voice(voice_id, on_progress=lambda m: log(m, None))
     log("loading voice…", None)
     voice = _load_voice(VOICE_DIR / f"{model}.onnx")
 
     n = max(1, len([s for s in _SENT.split(text) if s.strip()]))  # sentence count
     log("synthesizing speech…", 0)
-    frames, sr, sw, ch = [], 22050, 2, 1
-    for i, chunk in enumerate(voice.synthesize(text)):   # one chunk per sentence
-        frames.append(chunk.audio_int16_bytes)
-        sr, sw, ch = chunk.sample_rate, chunk.sample_width, chunk.sample_channels
-        done = min(1.0, (i + 1) / n)
-        log(f"synthesizing speech… {round(done * 100)}%", min(95, round(done * 95)))
 
-    wav = workdir / "speech.wav"
-    with wave.open(str(wav), "wb") as w:
-        w.setnchannels(ch); w.setsampwidth(sw); w.setframerate(sr)
-        w.writeframes(b"".join(frames))
-    log("encoding mp3…", 97)
-    run(["ffmpeg", "-y", "-i", str(wav), "-c:a", "libmp3lame", "-q:a", "2",
-         str(out_mp3)], timeout=timeout)
-    if not out_mp3.exists():
+    def feed(write) -> None:
+        for i, chunk in enumerate(voice.synthesize(text)):   # one chunk per sentence
+            write(chunk.audio_int16_bytes)
+            done = min(1.0, (i + 1) / n)
+            log(f"synthesizing speech… {round(done * 100)}%", min(99, round(done * 99)))
+
+    buf = bytearray()
+    limit = FIRST_BLOCK_BYTES
+    for block in stream_filter(_mp3_argv(voice.config.sample_rate), feed,
+                               timeout=timeout):
+        buf += block
+        if len(buf) >= limit:
+            yield bytes(buf)
+            buf.clear()
+            limit = BLOCK_BYTES
+    if buf:
+        yield bytes(buf)
+
+
+def synthesize_speech(
+    text: str, out_mp3: Path, voice_id: str, *, timeout: float = 120, on_progress=None,
+) -> None:
+    """Synthesize `text` to an mp3 file (the batch form of stream_speech)."""
+    with out_mp3.open("wb") as f:
+        for block in stream_speech(text, voice_id, timeout=timeout,
+                                   on_progress=on_progress):
+            f.write(block)
+    if not out_mp3.exists() or out_mp3.stat().st_size == 0:
         raise TldrError("Failed to produce speech audio.")
 
 

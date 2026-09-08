@@ -110,6 +110,26 @@ def test_select_video_single_pass(monkeypatch):
     assert sel.ranges == [(0, 1)]
 
 
+def test_select_video_on_segment_found_fires_streaming(monkeypatch):
+    """on_segment_found is called for each segment in the streaming path."""
+    found = []
+
+    def fake_stream(prompt, stdin, *, on_segment, timeout):
+        on_segment({"first_cue": 0, "last_cue": 1, "reason": "a"})
+        on_segment({"first_cue": 2, "last_cue": 2, "reason": "b"})
+        return {"chosen_ratio": 0.3, "rationale": "ok"}
+
+    monkeypatch.setattr(summarize, "stream_ndjson_segments", fake_stream)
+    monkeypatch.setattr(summarize, "is_claude_cli", lambda: True)
+
+    summarize.select_video_segments(
+        _cues(5), "C", "T", None, None, timeout=1,
+        on_progress=lambda m, p=None: None,
+        on_segment_found=lambda first, last: found.append((first, last)),
+    )
+    assert found == [(0, 1), (2, 2)]
+
+
 def test_select_video_chunked_clamps_to_window(monkeypatch):
     # Force chunking; Claude echoes an out-of-window index that must be clamped
     # to the chunk's own range so spans never point at an unrelated timeline part.
