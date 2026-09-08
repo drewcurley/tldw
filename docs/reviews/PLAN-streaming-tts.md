@@ -102,12 +102,19 @@ wrong-sounding voice had to be waited out.
   owned by one `setListenState()`. It had to become one function: `renderAudio`
   used to stamp "Regenerate" onto the button at the first streamed block, i.e.
   while generation was still running.
-- **Stop is a real abort, not a UI reset.** The page disconnects the port, the
-  worker aborts the fetch on `port.onDisconnect`, the server's next write fails,
-  and `speech.close()` unwinds into `stream_filter`, which kills ffmpeg and
-  unblocks Piper. Measured: ffmpeg gone 0.18s after hang-up, both concurrency
-  slots reacquirable, no leaked threads. Without the abort the server happily
-  finished the clip and held its slot.
+- **Stop is a real abort, not a UI reset.** The page sends an explicit `stopSpeak`,
+  the worker aborts the fetch, the server's next write fails, and `speech.close()`
+  unwinds into `stream_filter`, which kills ffmpeg and unblocks Piper. Measured:
+  ffmpeg gone 0.18s after hang-up, both concurrency slots reacquirable, no leaked
+  threads. Without the abort the server happily finished the clip and held its slot.
+- **The abort has to be explicit, not inferred from the disconnect.** `close()`
+  tears down the audio port, so cancelling on `port.onDisconnect` (the first
+  attempt) meant closing the panel — to pause the video, say — silently killed the
+  synthesis. It also threw away the finished clip that would otherwise land in
+  `audioCache` and make a re-Listen instant. Only the Stop button cancels now;
+  a bare disconnect lets the worker finish. Verified both ways against the real
+  `content.js`: closing the panel disconnects without sending `stopSpeak`,
+  pressing Stop sends it.
 - **Stopping a Regenerate restores the previous clip** rather than leaving an
   empty slot; a mid-stream error now does the same instead of stranding a partial
   player.

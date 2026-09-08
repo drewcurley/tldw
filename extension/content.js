@@ -399,7 +399,10 @@
   // a wrong-sounding voice can be swapped without waiting the synthesis out.
   function abortAudio() {
     if (!busy) return;
-    teardownAudio();               // disconnects the port; the worker aborts the fetch
+    // Say so explicitly — the worker deliberately keeps synthesizing through a bare
+    // disconnect (closing the panel), so only this message cancels the request.
+    try { audioPort.postMessage({ type: "stopSpeak" }); } catch (_) {}
+    teardownAudio();
     discardStream();
     finishAudioUI();
     const status = root && root.querySelector(".audiostatus");
