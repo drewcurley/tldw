@@ -131,6 +131,27 @@ APIs: Listen→Stop→re-pick voice→restart, finish→Regenerate, Stop-a-Regen
 and error-mid-stream all verified, including that the button still reads Stop while
 a streamed clip is playing.
 
+## Round 3 — two stalls in the streamed "play key moments" path
+
+Found while writing up the segment-streaming work that came in with round 1. Both
+are in that work, not in the TTS changes, and both were verified by driving the
+real `content.js` in a browser before and after the fix.
+
+- **The everyday path hung on the last clip.** `startSkip()` — the cache/prefetch
+  route that runs nearly every time — never set `segsComplete`, so `onSkipTick`
+  took the "more clips are still streaming" branch at the end of the final clip:
+  the video paused on "⏳ Loading next clip… (2/2+)" and stayed there. Every clip
+  also read "N+" as though more were coming. It now marks the list complete, so
+  the last clip ends in "✓ Key moments done".
+- **The streaming path cut its own supply line.** `startSkipStreaming()` closes the
+  modal on the first clip, and `close()` tears down the segment port — the only
+  channel for the clips Claude hadn't found yet. It played clip 1 and then waited
+  forever. `close({keepSeg: true})` now preserves the port and its keepalive ping
+  for that one case.
+- Releasing the panel's UI lock at that point then broke the listener, which
+  guarded on `busy`. That guard is really "is this message from a live request",
+  so it now keys on the port itself.
+
 ## Items (non-blocking)
 
 - **Firefox gets no streaming.** Its MSE has no `audio/mpeg`, so it keeps today's

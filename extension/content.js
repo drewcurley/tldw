@@ -174,11 +174,15 @@
     }
   }
 
-  function close() {
+  function close(opts) {
     clearTimers();
     teardownAudio();                  // tear down any in-flight TTS request + ping
-    teardownSeg();                    // and any in-flight segment fetch (NOT the
-                                      // skip engine, which runs after the modal closes)
+    // ...and any in-flight segment fetch (NOT the skip engine, which runs after the
+    // modal closes). keepSeg is the exception: streaming skip playback closes the
+    // modal on the FIRST clip and still needs the port — and its keepalive ping —
+    // for the clips Claude hasn't found yet. close() is also used directly as a
+    // click handler, where the event argument has no keepSeg and teardown happens.
+    if (!(opts && opts.keepSeg === true)) teardownSeg();
     requestActive = false;            // suppress late port errors after a manual close
     if (port) { try { port.disconnect(); } catch (_) {} port = null; }
     document.removeEventListener("keydown", onKey, true);
@@ -581,7 +585,9 @@
     segPort = api.runtime.connect({ name: "tldw" });
     segPing = setInterval(() => { try { segPort.postMessage({ type: "ping" }); } catch (_) {} }, 20000);
     segPort.onMessage.addListener((m) => {
-      if (!busy) return;
+      if (!segPort) return;        // torn down — a late message from a dead request.
+                                   // (Not `busy`: streaming skip playback releases the
+                                   // panel's UI lock while clips are still arriving.)
       if (m.type === "segProgress") { updateAudioStatus(m.message, m.percent); return; }
       if (m.type === "segmentAdded") {
         if (!skipSegs) {
@@ -612,7 +618,7 @@
       } else if (m.type === "segError") { teardownSeg(); finishAudioUI(); showAudioError(m.error); }
     });
     segPort.onDisconnect.addListener(() => {
-      if (!busy) return;
+      if (!segPort) return;        // our own teardown, not a worker that went away
       teardownSeg(); finishAudioUI();
       showAudioError("Lost connection to the worker. Try again.");
     });
@@ -645,6 +651,8 @@
     skipVideo = video;
     skipSegs = segments.slice().sort((a, b) => a.start - b.start);
     skipIdx = 0;
+    segsComplete = true;      // the whole list is in hand (cache/prefetch/batch path),
+                              // so the last clip must finish rather than wait for more
     close();                                       // close the modal so you can watch
     skipHandler = onSkipTick;
     video.addEventListener("timeupdate", skipHandler);
@@ -666,7 +674,8 @@
     segsComplete = false;
     skipPaused = false;
     removePill();
-    close();
+    close({ keepSeg: true });
+    busy = false;                  // modal is gone; don't leave the panel's UI locked
     skipHandler = onSkipTick;
     video.addEventListener("timeupdate", skipHandler);
     showPill();
