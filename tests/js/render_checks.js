@@ -55,6 +55,39 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
     (h) => h.includes('href="http://x/[12:34]"') && h.split("data-t").length === 2);
 }
 
+// --- the key shield's "is this from our modal?" test ---
+// Events crossing a shadow boundary are retargeted, so composedPath is the only
+// reliable way to tell. Getting this wrong either lets keystrokes reach YouTube
+// (space pauses the video while you type) or swallows the page's own shortcuts.
+{
+  let host = { contains: (n) => n === "inside-host" };
+  eval(grab("  function fromModal(e)", "\n  // Swallow every key"));
+  check("keystroke from inside the modal is recognised",
+    fromModal({ composedPath: () => ["textarea", "shadowroot", host, "body", "document"] }), true);
+  check("keystroke from the page is not claimed",
+    fromModal({ composedPath: () => ["video", "body", "document"] }), false);
+  check("falls back to contains() when composedPath is unavailable",
+    fromModal({ target: "inside-host" }), true);
+  check("fallback rejects an outside target",
+    fromModal({ target: "somewhere-else" }), false);
+}
+
+// --- the shield must be installed where it can actually win ---
+// YouTube binds space/arrows as capture-phase listeners on `document`; only a
+// window capture listener runs earlier. A revert to document-level, or to the
+// input's own handler, silently reintroduces the pause-while-typing bug.
+{
+  check("keydown shield is on window, capturing",
+    /window\.addEventListener\("keydown", onKey, true\)/.test(src), true);
+  check("keyup and keypress are shielded too",
+    /window\.addEventListener\("keyup", shieldKey, true\)/.test(src)
+      && /window\.addEventListener\("keypress", shieldKey, true\)/.test(src), true);
+  check("shield is removed on close",
+    /window\.removeEventListener\("keydown", onKey, true\)/.test(src), true);
+  check("chat input has no keydown handler of its own (it could never win)",
+    /askinput[\s\S]{0,400}addEventListener\("keydown"/.test(src), false);
+}
+
 if (failures.length) {
   console.log("FAILURES:\n" + failures.join("\n"));
   process.exit(1);
