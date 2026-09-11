@@ -35,6 +35,11 @@ Listen (TTS) and Play-key-moments.
 - Open any YouTube `/watch` page → click the **TL;DW** toolbar button.
 - A modal shows the title, key points, and summary (~20s; transcript fetch + Claude).
 - **Copy** grabs the markdown; **Esc** or click-outside closes.
+- **💬 Ask about this video** opens a chat under the summary. Questions are
+  answered from the video's transcript, which the server already has cached, so
+  the first answer starts in a few seconds. Answers cite moments as `[12:34]` —
+  click one to jump the player there. Anything the model adds from outside the
+  video is labelled "Not in the video:". ⏹ Stop abandons an answer mid-stream.
 - **🔊 Listen to summary** synthesizes the summary to speech (local Piper TTS) and
   plays it in the modal. Playback starts on the first second of audio and the rest
   streams in behind it, so a long summary doesn't sit silent while it renders.

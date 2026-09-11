@@ -10,6 +10,7 @@ import pytest
 
 from youtube_tldw import (
     BadUrlError,
+    ClaudeError,
     NoTranscriptError,
     TldrError,
     TranscriptTooLongError,
@@ -21,6 +22,15 @@ from youtube_tldw.summarize import TextResult
 
 TOKEN = "test-token-123"
 EXT_ORIGIN = "chrome-extension://abcdefghijklmnop"
+
+
+@pytest.fixture(autouse=True)
+def _clear_caches():
+    for cache in (server._transcript_cache, server._seg_cache):
+        cache.clear()
+    yield
+    for cache in (server._transcript_cache, server._seg_cache):
+        cache.clear()
 
 
 @pytest.fixture
@@ -439,6 +449,169 @@ def test_speak_requires_token(srv):
                         {"title": "T", "channel": "C", "summary": "s"},
                         {"Content-Type": "application/json"})
     assert status == 401
+
+
+def _ask_body(**over):
+    body = {"url": "https://youtu.be/dQw4w9WgXcQ", "question": "what about DNS?"}
+    body.update(over)
+    return body
+
+
+def _stub_transcript(monkeypatch, cues=("hello",)):
+    """Serve a transcript without touching yt-dlp, and count the fetches."""
+    from youtube_tldw.transcript import Cue
+    meta = VideoMeta("dQw4w9WgXcQ", "Cool Title", "Chan", 600_000, {}, {})
+    parsed = [Cue(i * 1000, i * 1000 + 900, t) for i, t in enumerate(cues)]
+    calls = []
+
+    def fake_fetch(vid, lang="en", *, on_progress=None, pcts=(3, 7, 13)):
+        calls.append(vid)
+        return meta, parsed
+
+    monkeypatch.setattr(server.core, "fetch_transcript", fake_fetch)
+    return calls
+
+
+def test_ask_streams_progress_then_deltas(srv, monkeypatch):
+    _, port = srv
+    _stub_transcript(monkeypatch)
+    monkeypatch.setattr(server.ask, "stream_answer",
+                        lambda meta, cues, history, q, *, timeout=None, on_delta=None:
+                        [on_delta(t) for t in ("It ", "covers ", "DNS [12:34].")] and "")
+    events = _read_ndjson(port, _ask_body(), _auth(), path="/ask/stream")
+    types = [e["type"] for e in events]
+    assert types[-1] == "answer_done"
+    assert "progress" in types
+    deltas = "".join(e["text"] for e in events if e["type"] == "delta")
+    assert deltas == "It covers DNS [12:34]."
+
+
+def test_ask_reuses_the_cached_transcript(srv, monkeypatch):
+    """A question right after a summary must not re-fetch the video."""
+    _, port = srv
+    calls = _stub_transcript(monkeypatch)
+    monkeypatch.setattr(server.ask, "stream_answer",
+                        lambda *a, **k: k["on_delta"]("ok") or "ok")
+    _read_ndjson(port, _ask_body(), _auth(), path="/ask/stream")
+    assert calls == ["dQw4w9WgXcQ"]           # first question fetches
+    _read_ndjson(port, _ask_body(question="and again?"), _auth(), path="/ask/stream")
+    assert calls == ["dQw4w9WgXcQ"]           # second one is served from cache
+
+
+def test_ask_passes_history_through_to_the_model(srv, monkeypatch):
+    _, port = srv
+    _stub_transcript(monkeypatch)
+    seen = {}
+
+    def capture(meta, cues, history, q, *, timeout=None, on_delta=None):
+        seen["history"], seen["question"] = history, q
+        on_delta("ok")
+        return "ok"
+
+    monkeypatch.setattr(server.ask, "stream_answer", capture)
+    history = [{"role": "user", "content": "who made it?"},
+               {"role": "assistant", "content": "a team"}]
+    _read_ndjson(port, _ask_body(history=history), _auth(), path="/ask/stream")
+    assert seen["history"] == history and seen["question"] == "what about DNS?"
+
+
+def test_ask_reports_model_failure_mid_answer(srv, monkeypatch):
+    _, port = srv
+    _stub_transcript(monkeypatch)
+
+    def boom(meta, cues, history, q, *, timeout=None, on_delta=None):
+        on_delta("partial ")
+        raise ClaudeError("model exploded")
+
+    monkeypatch.setattr(server.ask, "stream_answer", boom)
+    events = _read_ndjson(port, _ask_body(), _auth(), path="/ask/stream")
+    assert events[-1]["type"] == "error" and events[-1]["status"] == 502
+    assert any(e["type"] == "delta" for e in events)     # partial text was delivered
+
+
+def test_ask_rejects_bad_requests(srv, monkeypatch):
+    _, port = srv
+    _stub_transcript(monkeypatch)
+    for body, expect in [
+        ({"question": "q?"}, 400),                                    # no url
+        (_ask_body(question=""), 400),                                # blank question
+        (_ask_body(question="   "), 400),
+        (_ask_body(history="not a list"), 400),
+        (_ask_body(lang="../etc"), 400),
+        ({"url": "https://example.com/evil", "question": "q?"}, 400),  # not youtube
+        (_ask_body(question="x" * 5000), 413),
+    ]:
+        status, _, _ = _req(port, "POST", "/ask/stream", body, _auth())
+        assert status == expect, body
+
+
+def test_ask_requires_token(srv):
+    _, port = srv
+    status, _, _ = _req(port, "POST", "/ask/stream", _ask_body(),
+                        {"Content-Type": "application/json"})
+    assert status == 401
+
+
+def test_ask_stops_when_the_client_disconnects(srv, monkeypatch):
+    """Stop / closed tab must unwind the model call, not just stop writing to a
+    dead socket while `claude` keeps generating."""
+    _, port = srv
+    _stub_transcript(monkeypatch)
+    state = {"aborted": False, "ran_to_end": False}
+
+    def slow(meta, cues, history, q, *, timeout=None, on_delta=None):
+        try:
+            for _ in range(400):
+                on_delta("word " * 200)     # raises _ClientGone once the peer is gone
+                time.sleep(0.01)
+        except BaseException:
+            state["aborted"] = True
+            raise
+        state["ran_to_end"] = True
+        return "done"
+
+    monkeypatch.setattr(server.ask, "stream_answer", slow)
+    payload = json.dumps(_ask_body()).encode()
+    request = (b"POST /ask/stream HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+               b"Authorization: Bearer " + TOKEN.encode() + b"\r\n"
+               b"Origin: " + EXT_ORIGIN.encode() + b"\r\n"
+               b"Content-Type: application/json\r\n"
+               b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.sendall(request)
+    assert sock.recv(4096)
+    sock.close()
+
+    deadline = time.monotonic() + 10
+    while not state["aborted"] and not state["ran_to_end"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert state["aborted"], "the model call was never unwound"
+    assert not state["ran_to_end"], "kept generating after the client left"
+
+
+def test_transcript_cache_ttl_is_hours_and_capped(monkeypatch):
+    """Long enough for a conversation, bounded so an all-day server can't grow."""
+    assert server._CACHE_TTL >= 2 * 3600
+    cache = {}
+    now = time.monotonic()
+    for i in range(server._CACHE_MAX_ENTRIES + 20):
+        cache[f"v{i}"] = (now + 1000 + i, None, None)   # all still fresh
+    server._prune(cache)
+    assert len(cache) == server._CACHE_MAX_ENTRIES
+    assert "v0" not in cache and f"v{server._CACHE_MAX_ENTRIES + 19}" in cache
+
+
+def test_cache_get_touch_renews_the_ttl(monkeypatch):
+    meta = VideoMeta("vid", "T", "C", 1000, {}, {})
+    server._cache_put("vid", meta, ["cue"])
+    with server._cache_lock:
+        first = server._transcript_cache["vid"][0]
+    time.sleep(0.01)
+    assert server._cache_get("vid", touch=True) == (meta, ["cue"])
+    with server._cache_lock:
+        assert server._transcript_cache["vid"][0] > first
+    with server._cache_lock:
+        del server._transcript_cache["vid"]
 
 
 def test_token_persists_across_calls(monkeypatch, tmp_path):

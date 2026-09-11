@@ -25,27 +25,48 @@ from pathlib import Path
 # "play key moments" can skip the duplicate yt-dlp + subtitle-parse round-trip.
 # Segment cache: populated by a background prefetch triggered at the end of text
 # summary, so clicking "play key moments" usually gets an instant response.
-_CACHE_TTL = 900  # 15 minutes — shared TTL for both caches
+# Shared TTL for both caches. Hours, not minutes: the transcript is what follow-up
+# questions run against, and a conversation can long outlive the summary that
+# populated it. These live in this process's memory (not on disk), so they cost RAM
+# and vanish on restart — hence the entry cap, since a day of browsing would
+# otherwise accumulate every video visited.
+_CACHE_TTL = 4 * 3600
+_CACHE_MAX_ENTRIES = 64
 _cache_lock = threading.Lock()
 _transcript_cache: dict = {}    # video_id -> (expires_at, meta, cues)
 _seg_cache: dict = {}           # video_id -> (expires_at, meta, segments)
 _seg_prefetch_events: dict = {} # video_id -> threading.Event (while prefetch is running)
 
 
+def _prune(cache: dict) -> None:
+    """Drop expired entries, then the soonest-to-expire until under the cap."""
+    now = time.monotonic()
+    for k in [k for k, v in cache.items() if v[0] < now]:
+        del cache[k]
+    if len(cache) > _CACHE_MAX_ENTRIES:
+        for k, _ in sorted(cache.items(), key=lambda kv: kv[1][0])[
+                :len(cache) - _CACHE_MAX_ENTRIES]:
+            del cache[k]
+
+
 def _cache_put(video_id: str, meta, cues: list) -> None:
     with _cache_lock:
         _transcript_cache[video_id] = (time.monotonic() + _CACHE_TTL, meta, cues)
-        now = time.monotonic()
-        expired = [k for k, v in _transcript_cache.items() if v[0] < now]
-        for k in expired:
-            del _transcript_cache[k]
+        _prune(_transcript_cache)
 
 
-def _cache_get(video_id: str):
-    """Return (meta, cues) if a fresh entry exists, else None."""
+def _cache_get(video_id: str, *, touch: bool = False):
+    """Return (meta, cues) if a fresh entry exists, else None.
+
+    touch=True renews the TTL — an active Q&A conversation keeps its own transcript
+    alive rather than expiring out from under the next question.
+    """
     with _cache_lock:
         entry = _transcript_cache.get(video_id)
         if entry and entry[0] > time.monotonic():
+            if touch:
+                _transcript_cache[video_id] = (time.monotonic() + _CACHE_TTL,
+                                               entry[1], entry[2])
             return entry[1], entry[2]
         return None
 
@@ -53,10 +74,7 @@ def _cache_get(video_id: str):
 def _seg_cache_put(video_id: str, meta, segments: list) -> None:
     with _cache_lock:
         _seg_cache[video_id] = (time.monotonic() + _CACHE_TTL, meta, segments)
-        now = time.monotonic()
-        expired = [k for k, v in _seg_cache.items() if v[0] < now]
-        for k in expired:
-            del _seg_cache[k]
+        _prune(_seg_cache)
 
 
 def _seg_cache_get(video_id: str):
@@ -108,12 +126,15 @@ from . import (
     __version__,
 )
 from . import metadata as md
-from . import audio, core, textmode
+from . import ask, audio, core, textmode
 from .summarize import SINGLE_PASS_CHARS
+from .urls import canonical_video_id
 from .timing import format_length, parse_duration
 
 MAX_BODY_BYTES = 16 * 1024
 MAX_SPEAK_BYTES = 64 * 1024   # /speak carries the summary text
+MAX_ASK_BYTES = 64 * 1024     # /ask carries the question + conversation so far
+ASK_TIMEOUT = 300.0           # one answer; the transcript is already in hand
 PREVIEW_TEXT = "Hi — this is how your T L D W summaries will sound."
 _preview_cache: dict[str, bytes] = {}   # voice model -> mp3 (13 voices, ~40KB each)
 _preview_lock = threading.Lock()
@@ -154,6 +175,11 @@ _STATUS = {
     ClaudeError: 502,
     TldrTimeoutError: 504,
 }
+
+
+class _ClientGone(Exception):
+    """Raised out of a streaming callback once the client has hung up, so the work
+    behind it unwinds instead of running to completion into a dead socket."""
 
 
 def _origin_allowed(origin: str | None, pinned: str | None) -> bool:
@@ -226,6 +252,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/preview":
             self._guarded(self._run_preview)
             return
+        if path == "/ask/stream":
+            self._guarded(self._run_ask, max_bytes=MAX_ASK_BYTES)
+            return
         if path not in ("/summarize", "/summarize/stream", "/segments/stream") and not speak:
             self._send_json(404, {"error": "not found"})
             return
@@ -256,12 +285,12 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             self.server.sem.release()
 
-    def _guarded(self, handler) -> None:
-        """auth -> small body -> concurrency slot, then run `handler(body)`."""
+    def _guarded(self, handler, *, max_bytes: int = MAX_BODY_BYTES) -> None:
+        """auth -> bounded body -> concurrency slot, then run `handler(body)`."""
         if not self._authorized():
             self._send_json(401, {"error": "missing or invalid token"})
             return
-        body = self._read_body(MAX_BODY_BYTES)
+        body = self._read_body(max_bytes)
         if body is None:
             return  # _read_body already responded
         if not self.server.sem.acquire(blocking=False):
@@ -417,7 +446,6 @@ class _Handler(BaseHTTPRequestHandler):
             tlog(m)
             emit({"type": "progress", "message": m, "percent": pct})
 
-        from .urls import canonical_video_id
         from . import BadUrlError
         try:
             vid = canonical_video_id(url)
@@ -600,6 +628,99 @@ class _Handler(BaseHTTPRequestHandler):
                   "mp3_base64": base64.b64encode(b"".join(blocks)).decode("ascii")})
         else:
             self._send_bytes(200, "audio/mpeg", b"".join(blocks))
+
+    def _run_ask(self, body: dict) -> None:
+        """Stream an answer to a follow-up question about a video's transcript."""
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "invalid body"}); return
+        url = body.get("url")
+        question = body.get("question")
+        if not isinstance(url, str):
+            self._send_json(400, {"error": "missing 'url'"}); return
+        if not isinstance(question, str) or not question.strip():
+            self._send_json(400, {"error": "missing 'question'"}); return
+        if len(question) > ask.MAX_QUESTION_CHARS:
+            self._send_json(413, {"error": "question too long"}); return
+        history = body.get("history", [])
+        if not isinstance(history, list):
+            self._send_json(400, {"error": "history must be a list"}); return
+        lang = body.get("lang", "en")
+        if not isinstance(lang, str) or not _LANG_RE.match(lang):
+            self._send_json(400, {"error": "invalid lang"}); return
+        try:
+            vid = canonical_video_id(url)          # BadUrlError before any work
+        except TldrError as exc:
+            self._send_json(400, {"error": str(exc)}); return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self._cors_headers()
+        self.end_headers()
+        start = time.monotonic()
+        tlog = self._logger(start)
+        gone = threading.Event()
+        wlock = threading.Lock()
+
+        def emit(obj):
+            if gone.is_set():
+                return
+            line = (json.dumps(obj) + "\n").encode("utf-8")
+            with wlock:
+                try:
+                    self.wfile.write(line)
+                    self.wfile.flush()
+                except OSError:
+                    gone.set()   # client hung up (Stop, or the tab went away)
+
+        def progress(m, pct=None):
+            tlog(m)
+            emit({"type": "progress", "message": m, "percent": pct})
+
+        try:
+            # Touch on read: an active conversation keeps its transcript alive.
+            hit = _cache_get(vid, touch=True)
+            if hit:
+                meta, cues = hit
+                tlog(f"cached transcript for {vid} ({len(cues)} cues)")
+            else:
+                progress("Fetching the transcript…", 5)
+                meta, cues = core.fetch_transcript(vid, lang, on_progress=progress)
+                _cache_put(vid, meta, cues)
+            if gone.is_set():
+                return
+            progress("Thinking…", 20)
+
+            def on_delta(text: str) -> None:
+                emit({"type": "delta", "text": text})
+                if gone.is_set():
+                    raise _ClientGone      # stop the model, don't just stop writing
+
+            answered = ask.stream_answer(
+                meta, cues, history, question, timeout=ASK_TIMEOUT,
+                on_delta=on_delta)
+        except _ClientGone:
+            print(f"  ask stopped by client after {time.monotonic()-start:.1f}s",
+                  flush=True)
+            return
+        except TldrError as exc:
+            status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
+            print(f"  ask failed ({status}) in {time.monotonic()-start:.1f}s: {exc}",
+                  flush=True)
+            emit({"type": "error", "status": status, "error": str(exc)})
+            return
+        except Exception as exc:
+            print(f"  unexpected ask error: {exc!r}", flush=True)
+            emit({"type": "error", "status": 500, "error": "internal error"})
+            return
+        if gone.is_set():
+            print(f"  ask stopped by client after {time.monotonic()-start:.1f}s",
+                  flush=True)
+            return
+        print(f"  answered ({len(answered)} chars) in {time.monotonic()-start:.1f}s",
+              flush=True)
+        emit({"type": "answer_done"})
 
     def _run_preview(self, body: dict) -> None:
         """A short spoken sample of one voice, for the voice pickers. Memoized."""

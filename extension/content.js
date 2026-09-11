@@ -30,6 +30,11 @@
   // first block instead of waiting for the whole script. Firefox's MSE has no
   // audio/mpeg, so `stream` stays null there and the buffered dataUrl path is used.
   let stream = null;          // { ms, buf, url, audio, pending, ended }
+  // Follow-up Q&A. History is [{role, content}] and lives for the page session, so
+  // re-opening the panel (or jumping to a cited moment) doesn't lose the thread.
+  let chat = null;            // { videoId, history } once a conversation has started
+  let askPort = null, askPing = null, askSafety = null, asking = false;
+  let askLive = null;         // { text, bubble } while an answer is streaming
   let lastSegments = null;    // { videoId, segments } — re-skip without re-fetching
   // Skip-playback engine state.
   let skipVideo = null, skipSegs = null, skipIdx = 0, skipHandler = null;
@@ -56,12 +61,25 @@
     String(s).replace(/[&<>"']/g, (c) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-  // Safe minimal markdown: escape first, then **bold** and blank-line paragraphs.
+  // Safe minimal markdown: escape first, then **bold**, *italic*, "- " bullet lists
+  // and blank-line paragraphs. Answers lean on emphasis and bullets, so both render.
+  const inlineMd = (t) => t
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")          // bold first
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");         // then italic
+
   function renderSummary(md) {
     return esc(md)
       .split(/\n{2,}/)
-      .map((p) => "<p>" + p.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-        .replace(/\n/g, "<br>") + "</p>")
+      .filter((b) => b.trim())
+      .map((block) => {
+        const lines = block.split("\n").filter((l) => l.trim());
+        if (lines.length && lines.every((l) => /^\s*[-*]\s+/.test(l))) {
+          return "<ul>" + lines
+            .map((l) => "<li>" + inlineMd(l.replace(/^\s*[-*]\s+/, "")) + "</li>")
+            .join("") + "</ul>";
+        }
+        return "<p>" + inlineMd(block).replace(/\n/g, "<br>") + "</p>";
+      })
       .join("");
   }
 
@@ -124,7 +142,31 @@
         .audiostatus { font-size: 12px; color: #888; }
         .audiostatus.audioerr { color: #c0392b; }
         .audioslot audio { width: 100%; margin-bottom: 12px; }
-        .listen.stopping { border-color: #c00; color: #c00; }
+        .stopping { border-color: #c00; color: #c00; }
+        .askwrap { margin-top: 20px; border-top: 1px solid rgba(128,128,128,.25);
+          padding-top: 14px; }
+        .asktoggle { font-size: 13px; }
+        .asklog { display: flex; flex-direction: column; gap: 10px; margin: 12px 0; }
+        .asklog:empty { margin: 0; }
+        .msg { max-width: 92%; padding: 8px 12px; border-radius: 12px; font-size: 14px; }
+        .msg p { margin: 0 0 8px; } .msg p:last-child { margin: 0; }
+        .msg ul, .body ul { margin: 6px 0; padding-left: 20px; }
+        .msg li, .body li { margin: 2px 0; }
+        .msg.you { align-self: flex-end; background: rgba(128,128,128,.16);
+          border-bottom-right-radius: 4px; }
+        .msg.bot { align-self: flex-start; background: rgba(128,128,128,.08);
+          border-bottom-left-radius: 4px; }
+        .msg.bot.pending::after { content: "▋"; opacity: .5; }
+        .ts { color: #c00; cursor: pointer; font-variant-numeric: tabular-nums;
+          text-decoration: underline dotted; text-underline-offset: 2px; }
+        @media (prefers-color-scheme: dark) { .ts { color: #ff7b72; } }
+        .askrow { display: flex; gap: 8px; align-items: flex-end; }
+        .askinput { flex: 1; min-width: 0; font: inherit; font-size: 14px;
+          padding: 8px 10px; border-radius: 9px; resize: none; max-height: 140px;
+          border: 1px solid rgba(128,128,128,.4); background: transparent;
+          color: inherit; }
+        .askstatus { font-size: 12px; color: #888; min-height: 14px; margin-top: 6px; }
+        .askstatus.askerr { color: #c0392b; }
         .vpreview { padding: 4px 9px; font-size: 13px; line-height: 1.2; }
         .vpreview[disabled] { opacity: .55; cursor: default; }
         .circ { flex: 0 0 auto; display: none; }
@@ -177,6 +219,8 @@
   function close(opts) {
     clearTimers();
     teardownAudio();                  // tear down any in-flight TTS request + ping
+                                      // (an in-flight Q&A answer is deliberately
+                                      // left running — see submitQuestion)
     // ...and any in-flight segment fetch (NOT the skip engine, which runs after the
     // modal closes). keepSeg is the exception: streaming skip playback closes the
     // modal on the FIRST clip and still needs the port — and its keepalive ping —
@@ -188,6 +232,7 @@
     document.removeEventListener("keydown", onKey, true);
     if (host && host.parentNode) host.parentNode.removeChild(host);
     host = root = null;
+    if (askLive) askLive.bubble = null;   // don't render deltas into a detached node
     if (lastFocused && lastFocused.focus) { try { lastFocused.focus(); } catch (_) {} }
   }
 
@@ -305,7 +350,19 @@
       <div class="audioslot"></div>
       ${points ? `<h2>Key points</h2><ul class="points">${points}</ul>` : ""}
       <h2>Summary</h2><div class="body">${renderSummary(p.summary_md || "")}</div>
-      ${p.rationale ? `<div class="rationale">${esc(p.rationale)}</div>` : ""}`;
+      ${p.rationale ? `<div class="rationale">${esc(p.rationale)}</div>` : ""}
+      <div class="askwrap">
+        <button class="asktoggle" aria-expanded="false">💬 Ask about this video</button>
+        <div class="askpanel" hidden>
+          <div class="asklog" role="log" aria-live="polite" aria-label="Conversation"></div>
+          <div class="askrow">
+            <textarea class="askinput" rows="1" aria-label="Ask a question about this video"
+              placeholder="Ask a question about this video…"></textarea>
+            <button class="asksend">Send</button>
+          </div>
+          <div class="askstatus" aria-live="polite"></div>
+        </div>
+      </div>`;
     const copy = root.querySelector(".copy");
     copy.hidden = false;
     copy.onclick = () => {
@@ -316,6 +373,7 @@
     setupVoiceSelect();
     root.querySelector(".listen").onclick = requestAudio;
     root.querySelector(".vpreview").onclick = previewVoice;
+    setupAsk(p);
     root.querySelector(".playkey").onclick = requestSegments;
     // Restore a previously generated clip for this video this session.
     if (lastAudio && lastAudio.videoId === p.video_id && lastAudio.dataUrl) {
@@ -503,6 +561,200 @@
     if (!stream) return;
     stream.ended = true;
     pumpStream();
+  }
+
+  // --- Follow-up Q&A ------------------------------------------------------------
+
+  function setupAsk(p) {
+    const toggle = root.querySelector(".asktoggle");
+    const panel = root.querySelector(".askpanel");
+    const input = root.querySelector(".askinput");
+    const send = root.querySelector(".asksend");
+    const log = root.querySelector(".asklog");
+
+    if (!chat || chat.videoId !== p.video_id) chat = { videoId: p.video_id, history: [] };
+    if (chat.history.length || asking) {              // re-opened mid-conversation
+      chat.history.forEach((m) => addMessage(m.role === "user" ? "you" : "bot", m.content));
+      if (asking && askLive) {
+        // An answer kept streaming while the panel was closed — re-attach it.
+        askLive.bubble = addMessage("bot", askLive.text);
+        askLive.bubble.classList.add("pending");
+        setAskState("answering");
+      }
+      openAsk();
+    }
+
+    toggle.onclick = () => (panel.hidden ? openAsk(true) : closeAsk());
+    send.onclick = () => (asking ? stopAsk() : submitQuestion());
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitQuestion(); }
+      e.stopPropagation();        // Escape/typing belongs to the box, not the modal
+    });
+    input.addEventListener("input", () => {          // grow with the question
+      input.style.height = "auto";
+      input.style.height = Math.min(input.scrollHeight, 140) + "px";
+    });
+    log.addEventListener("click", (e) => {
+      const ts = e.target.closest && e.target.closest(".ts");
+      if (ts) seekTo(Number(ts.dataset.t));
+    });
+
+    function openAsk(focus) {
+      panel.hidden = false;
+      toggle.setAttribute("aria-expanded", "true");
+      toggle.textContent = "💬 Hide questions";
+      if (focus) input.focus();
+    }
+    function closeAsk() {
+      panel.hidden = true;
+      toggle.setAttribute("aria-expanded", "false");
+      toggle.textContent = "💬 Ask about this video";
+    }
+  }
+
+  function addMessage(who, text) {
+    const log = root && root.querySelector(".asklog");
+    if (!log) return null;
+    const el = document.createElement("div");
+    el.className = "msg " + who;
+    el.innerHTML = who === "bot" ? renderAnswer(text) : renderSummary(text);
+    log.appendChild(el);
+    el.scrollIntoView({ block: "nearest" });
+    return el;
+  }
+
+  // Markdown, then turn [12:34] citations into seek links. renderSummary escapes
+  // first and only emits <p>/<strong>/<br>, but split on tags anyway so a future
+  // renderer that emits attributes can't have one rewritten from inside.
+  function renderAnswer(text) {
+    return renderSummary(text)
+      .split(/(<[^>]*>)/)
+      .map((part, i) => (i % 2 ? part : part.replace(
+        /\[(\d{1,2}):([0-5]\d)(?::([0-5]\d))?\]/g,
+        (m, a, b, c) => {
+          const secs = c ? (+a) * 3600 + (+b) * 60 + (+c) : (+a) * 60 + (+b);
+          const label = c ? `${a}:${b}:${c}` : `${a}:${b}`;
+          return `<a class="ts" data-t="${secs}" title="Jump to ${label} in the video"` +
+                 ` role="button" tabindex="0">${label}</a>`;
+        })))
+      .join("");
+  }
+
+  function seekTo(seconds) {
+    const video = document.querySelector("video.html5-main-video")
+      || document.querySelector("video");
+    if (!video || !isFinite(seconds)) return;
+    close();                            // get the modal out of the way to watch
+    try { video.currentTime = seconds; video.play(); } catch (_) {}
+  }
+
+  function submitQuestion() {
+    if (asking || busy || !lastPayload) return;
+    const input = root.querySelector(".askinput");
+    const question = input.value.trim();
+    if (!question) return;
+    input.value = "";
+    input.style.height = "auto";
+    addMessage("you", question);
+    chat.history.push({ role: "user", content: question });
+
+    asking = true;
+    setAskState("answering");
+    const bubble = addMessage("bot", "");
+    bubble.classList.add("pending");
+    askLive = { text: "", bubble };
+
+    askPort = api.runtime.connect({ name: "tldw" });
+    askPing = setInterval(() => { try { askPort.postMessage({ type: "ping" }); } catch (_) {} }, 20000);
+    askPort.onMessage.addListener((m) => {
+      if (!asking) return;
+      bumpAskSafety();
+      if (m.type === "askProgress") { setAskStatus(m.message); return; }
+      if (m.type === "askDelta") {
+        askLive.text += m.text;
+        if (askLive.bubble) {            // null while the panel is closed
+          askLive.bubble.innerHTML = renderAnswer(askLive.text);
+          askLive.bubble.scrollIntoView({ block: "nearest" });
+        }
+        return;
+      }
+      if (m.type === "askDone") {
+        finishBubble();
+        chat.history.push({ role: "assistant", content: askLive.text });
+        askLive = null;
+        teardownAsk(); setAskState("idle"); setAskStatus("");
+      } else if (m.type === "askError") {
+        // Keep a partial answer if one streamed in; drop an empty bubble.
+        if (askLive.text) chat.history.push({ role: "assistant", content: askLive.text });
+        else if (askLive.bubble) askLive.bubble.remove();
+        finishBubble();
+        askLive = null;
+        teardownAsk(); setAskState("idle"); setAskStatus(m.error, true);
+      }
+    });
+    askPort.onDisconnect.addListener(() => {
+      if (!asking) return;
+      finishBubble();
+      askLive = null;
+      teardownAsk(); setAskState("idle");
+      setAskStatus("Lost connection to the worker. Try again.", true);
+    });
+    bumpAskSafety();
+    askPort.postMessage({
+      type: "ask", url: lastPayload.source_url,
+      question, history: chat.history.slice(0, -1),   // the new question travels alone
+    });
+  }
+
+  function finishBubble() {
+    const b = askLive && askLive.bubble;
+    if (b) b.classList.remove("pending");
+  }
+
+  function stopAsk() {
+    if (!asking) return;
+    try { askPort.postMessage({ type: "stopAsk" }); } catch (_) {}
+    if (askLive) {
+      finishBubble();
+      // Keep a partial answer, drop an empty bubble.
+      if (askLive.text) chat.history.push({ role: "assistant", content: askLive.text });
+      else if (askLive.bubble) askLive.bubble.remove();
+      askLive = null;
+    }
+    teardownAsk(); setAskState("idle"); setAskStatus("Stopped.");
+  }
+
+  function teardownAsk() {
+    asking = false;
+    if (askPing) { clearInterval(askPing); askPing = null; }
+    if (askSafety) { clearTimeout(askSafety); askSafety = null; }
+    if (askPort) { try { askPort.disconnect(); } catch (_) {} askPort = null; }
+  }
+
+  function bumpAskSafety() {
+    if (askSafety) clearTimeout(askSafety);
+    askSafety = setTimeout(() => {
+      if (!asking) return;
+      teardownAsk(); setAskState("idle");
+      setAskStatus("That question is taking too long. Is `tldw serve` running?", true);
+    }, 300000);
+  }
+
+  function setAskState(state) {
+    const send = root && root.querySelector(".asksend");
+    const input = root && root.querySelector(".askinput");
+    if (!send) return;
+    const answering = state === "answering";
+    send.textContent = answering ? "⏹ Stop" : "Send";
+    send.classList.toggle("stopping", answering);
+    if (input) input.disabled = answering;
+  }
+
+  function setAskStatus(msg, isError) {
+    const el = root && root.querySelector(".askstatus");
+    if (!el) return;
+    el.textContent = msg || "";
+    el.classList.toggle("askerr", !!isError);
   }
 
   // --- Voice preview ------------------------------------------------------------

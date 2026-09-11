@@ -10,6 +10,7 @@ const api = globalThis.browser ?? globalThis.chrome;
 const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "", voice: "amy" };
 const CLIENT_TIMEOUT_MS = 150000;
 const SEG_TIMEOUT_MS = 320000;          // segment selection can take 2-3 min (Claude JSON)
+const ASK_TIMEOUT_MS = 300000;          // one answer over an already-fetched transcript
 const SPEAK_TIMEOUT_MS = 600000;        // long summaries synthesize for minutes;
                                         // playback starts in ~1s regardless
 const cache = new Map();                // videoId -> summary payload
@@ -59,6 +60,7 @@ api.runtime.onConnect.addListener((port) => {
     else if (msg.type === "speak") handleSpeak(port, msg);
     else if (msg.type === "getSegments") handleSegments(port, msg);
     else if (msg.type === "preview") handlePreview(port, msg);
+    else if (msg.type === "ask") handleAsk(port, msg);
     // "ping" is ignored; receiving it just keeps the worker alive
   });
 });
@@ -254,6 +256,90 @@ function bytesToBase64(u8) {
     bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
   }
   return btoa(bin);
+}
+
+// Follow-up Q&A. The transcript never leaves the server; this carries only the
+// question and the conversation so far, and streams the answer back in deltas.
+async function handleAsk(port, msg) {
+  const { url, question, history } = msg;
+  const { serverUrl, token } = await getSettings();
+  if (!token) {
+    safePost(port, { type: "askError",
+      error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
+    return;
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ASK_TIMEOUT_MS);
+  // Same rule as speak: only an explicit stop cancels. A bare disconnect (closing
+  // the panel mid-answer) lets it finish.
+  let stopped = false;
+  port.onMessage.addListener((m) => {
+    if (m && m.type === "stopAsk") { stopped = true; ctrl.abort(); }
+  });
+  let gotTerminal = false;
+  try {
+    const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/ask/stream", {
+      method: "POST", signal: ctrl.signal,
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({ url, question, history }),
+    });
+    if (!resp.ok) {
+      let detail = "";
+      try { detail = (await resp.json()).error || ""; } catch (_) {}
+      safePost(port, { type: "askError", error: askError(resp.status, detail) });
+      return;
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch (_) { continue; }
+        if (ev.type === "progress") {
+          safePost(port, { type: "askProgress", message: ev.message });
+        } else if (ev.type === "delta") {
+          safePost(port, { type: "askDelta", text: ev.text });
+        } else if (ev.type === "answer_done") {
+          gotTerminal = true;
+          safePost(port, { type: "askDone" });
+        } else if (ev.type === "error") {
+          gotTerminal = true;
+          safePost(port, { type: "askError", error: askError(ev.status, ev.error) });
+        }
+      }
+    }
+    if (!gotTerminal && !stopped) {
+      safePost(port, { type: "askError", error: "The answer stream ended unexpectedly. Try again." });
+    }
+  } catch (e) {
+    if (stopped) {
+      // Deliberate stop — the page has already reset itself.
+    } else if (e.name === "AbortError") {
+      safePost(port, { type: "askError", error: "That question took too long. Try again." });
+    } else {
+      safePost(port, { type: "askError",
+        error: "Can't reach the tldw server. Is it running?  tldw serve" });
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function askError(status, detail) {
+  if (status === 401) return "Token mismatch. Re-check the token in the extension's Options.";
+  if (status === 429) return "Server busy, try again in a moment.";
+  if (status === 413) return "That question is too long.";
+  if (status === 422) return detail || "This video has no transcript to answer from.";
+  if (status === 504) return "That question took too long. Try again.";
+  return detail || ("Couldn't answer (server error " + status + ").");
 }
 
 const previewCache = new Map();         // voice -> data: URL
