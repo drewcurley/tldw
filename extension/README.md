@@ -35,6 +35,13 @@ Listen (TTS) and Play-key-moments.
 - Open any YouTube `/watch` page → click the **TL;DW** toolbar button.
 - A modal shows the title, key points, and summary (~20s; transcript fetch + Claude).
 - **Copy** grabs the markdown; **Esc** or click-outside closes.
+Closing the panel while something is running no longer cancels it. Summaries, key
+moments, speech and answers all keep going in the background — a summary that lands
+while the panel is closed shows a small notice you can click to read it, and
+re-opening mid-run re-attaches to the work already in flight rather than starting
+it again. Options has a **"If you close the panel while it's still working"**
+setting if you'd rather it stopped and discarded.
+
 - **💬 Ask about this video** opens a chat under the summary. Questions are
   answered from the video's transcript, which the server already has cached, so
   the first answer starts in a few seconds. Answers cite moments as `[12:34]` —

@@ -5,8 +5,12 @@ const fs = require("fs");
 const src = fs.readFileSync(process.argv[2], "utf8");
 const grab = (start, end) => {
   const i = src.indexOf(start);
-  if (i < 0) throw new Error("marker not found in content.js: " + start);
-  return src.slice(i, src.indexOf(end, i));
+  if (i < 0) throw new Error("start marker not found in content.js: " + start);
+  const j = src.indexOf(end, i);
+  // A missing end marker used to slice to EOF and eval the rest of the file, which
+  // surfaces as an unrelated syntax error. Fail on the real cause instead.
+  if (j < 0) throw new Error("end marker not found in content.js: " + end);
+  return src.slice(i, j);
 };
 eval(grab("const esc = (s) =>", "function renderSummary")
    + grab("function renderSummary", "\n\n  // --- ")
@@ -86,6 +90,37 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
     /window\.removeEventListener\("keydown", onKey, true\)/.test(src), true);
   check("chat input has no keydown handler of its own (it could never win)",
     /askinput[\s\S]{0,400}addEventListener\("keydown"/.test(src), false);
+}
+
+// --- close() policy: abort vs keep running in the background ---
+{
+  eval(grab("  function closePolicy(opts, pref)", "\n  let askLive"));
+  check("default keeps in-flight work running",
+    closePolicy(undefined, "continue").background, true);
+  check("unset preference also keeps working (safe default)",
+    closePolicy(undefined, undefined).background, true);
+  check("abort preference stops the work", closePolicy(undefined, "abort").background, false);
+  check("keepSeg is independent of the preference",
+    closePolicy({ keepSeg: true }, "abort").keepSeg
+      && !closePolicy({ keepSeg: true }, "abort").background, true);
+  check("a click event argument is not mistaken for keepSeg",
+    closePolicy({ type: "click", target: {} }, "continue").keepSeg, false);
+}
+
+// --- the keepalive must survive a background close ---
+// clearTimers() kills pingTimer, and that ping is the only thing keeping the MV3
+// worker alive. Calling it on the background path is exactly the bug being fixed.
+{
+  const body = src.slice(src.indexOf("  function close(opts)"), src.indexOf("  function unmount()"));
+  const bg = body.slice(0, body.indexOf("// Abort:"));
+  check("background close does not clear the keepalive timers",
+    /clearTimers\(\)/.test(bg), false);
+  check("abort close does clear them",
+    /clearTimers\(\)/.test(body.slice(body.indexOf("// Abort:"))), true);
+  check("abort sends the explicit stops a bare disconnect would not",
+    /stopSpeak/.test(body) && /stopAsk/.test(body), true);
+  check("background close leaves the summarize port connected",
+    /port\.disconnect/.test(bg), false);
 }
 
 if (failures.length) {
