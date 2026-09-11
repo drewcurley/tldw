@@ -199,16 +199,53 @@
       if (e.target === e.currentTarget) close();
     });
     root.querySelector(".panel").focus();
-    document.addEventListener("keydown", onKey, true);
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("keyup", shieldKey, true);
+    window.addEventListener("keypress", shieldKey, true);
     return root.querySelector(".content");
+  }
+
+  // Is this key event coming from inside our modal? Events crossing a shadow
+  // boundary are retargeted, so the page sees our host <div> as the target — which
+  // is precisely why YouTube's "is the user typing?" check doesn't recognize our
+  // textarea and applies its shortcuts to it.
+  function fromModal(e) {
+    const path = e.composedPath ? e.composedPath() : [];
+    return path.length ? path.indexOf(host) !== -1 : !!(host && host.contains(e.target));
+  }
+
+  // Swallow every key typed inside the modal before the page can act on it.
+  //
+  // This has to run on `window` in the capture phase. YouTube binds space and the
+  // arrows as capture-phase listeners on `document` (they're scroll keys, so it
+  // grabs them early), which run BEFORE the event reaches our input — a
+  // stopPropagation() from the input's own handler is too late, so every space you
+  // type pauses the video. Letter shortcuts like `m` bubble, so those were already
+  // being stopped; the two together are why the behaviour looked inconsistent.
+  // Capture order is window -> document, so this is the one place ahead of both.
+  function shieldKey(e) {
+    if (host && fromModal(e)) e.stopPropagation();
   }
 
   function onKey(e) {
     if (!host) return;
+    const mine = fromModal(e);
+    if (mine) e.stopPropagation();
     if (e.key === "Escape") { e.stopPropagation(); close(); return; }
+
+    // The chat box's own keydown handler can't run any more (this shield stops the
+    // event before it gets there), so Enter-to-send lives here.
+    const target = (e.composedPath && e.composedPath()[0]) || e.target;
+    const typing = mine && target &&
+      (target.tagName === "TEXTAREA" || target.tagName === "INPUT");
+    if (typing) {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitQuestion(); }
+      return;                          // never trap Tab away from a text box
+    }
     if (e.key === "Tab") {
       const f = root.querySelectorAll(
-        "button:not([hidden]):not([disabled]), select:not([disabled]), audio");
+        "button:not([hidden]):not([disabled]), select:not([disabled]), " +
+        "textarea:not([disabled]), audio");
       if (!f.length) return;
       const first = f[0], last = f[f.length - 1];
       if (e.shiftKey && root.activeElement === first) { e.preventDefault(); last.focus(); }
@@ -229,7 +266,9 @@
     if (!(opts && opts.keepSeg === true)) teardownSeg();
     requestActive = false;            // suppress late port errors after a manual close
     if (port) { try { port.disconnect(); } catch (_) {} port = null; }
-    document.removeEventListener("keydown", onKey, true);
+    window.removeEventListener("keydown", onKey, true);
+    window.removeEventListener("keyup", shieldKey, true);
+    window.removeEventListener("keypress", shieldKey, true);
     if (host && host.parentNode) host.parentNode.removeChild(host);
     host = root = null;
     if (askLive) askLive.bubble = null;   // don't render deltas into a detached node
@@ -586,10 +625,6 @@
 
     toggle.onclick = () => (panel.hidden ? openAsk(true) : closeAsk());
     send.onclick = () => (asking ? stopAsk() : submitQuestion());
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitQuestion(); }
-      e.stopPropagation();        // Escape/typing belongs to the box, not the modal
-    });
     input.addEventListener("input", () => {          // grow with the question
       input.style.height = "auto";
       input.style.height = Math.min(input.scrollHeight, 140) + "px";

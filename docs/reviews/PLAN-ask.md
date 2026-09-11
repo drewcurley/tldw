@@ -104,16 +104,48 @@ new route, and a net *reduction* in duplicated subprocess and fetch code. Invest
 CEO/Purchasing: no new vendor, no API key, still local-only. Marketing: it demos in
 one line — ask the video a question, click the timestamp, land on the moment.
 
+## Round 2 — typing in the chat drove the video
+
+Spaces typed into the chat box paused and unpaused the video, while letter
+shortcuts like `m` did nothing. The asymmetry is the diagnosis:
+
+- Events crossing a shadow boundary are **retargeted**, so the page sees our host
+  `<div>` as the target. YouTube's "is the user typing?" check looks at that, sees
+  a plain div, and happily applies its shortcuts to our textarea.
+- The chat input's own `stopPropagation()` ran in the **target phase**, which is
+  late. It killed YouTube's *bubble-phase* handlers — hence `m` going quiet — but
+  space and the arrows are scroll keys YouTube grabs in the **capture phase** on
+  `document`, which runs before the event ever reaches our input.
+
+Capture order is window → document, so the shield moved to a `window` capture
+listener that swallows every key originating inside the modal (keydown, keyup and
+keypress). Enter-to-send moved into it, since the input's own handler can no longer
+run, and the focus trap now includes the textarea.
+
+`m` still does nothing while the chat is focused. That is the intended end state:
+typing a message should not drive the player.
+
+Covered by `tests/test_extension_render.py`: `fromModal` retargeting logic
+(composedPath and the `contains` fallback) plus guards that the listener stays on
+window/capture and that the input never regrows a handler of its own. Both
+mutation-checked — reverting the listener to `document`, or making `fromModal`
+always false, fails the suite.
+
 ## Items (non-blocking)
 
 - **Each question is a fresh `claude -p` invocation**, so it re-sends the transcript
   and pays the CLI's own startup context (~20k input tokens before the transcript).
   ~10s per answer. `claude --resume` would keep the context server-side; worth
   measuring before adopting, since it trades statelessness for speed.
-- **The browser-driven UI check didn't run this round** — the preview pane refused
-  localhost, unlike previous rounds. The pure rendering logic is covered in node;
-  the DOM wiring follows the same port/state pattern verified twice already, but it
-  has not been exercised in a live page.
+- **No browser-driven verification** — the preview pane refused localhost and
+  external navigation, and its policy check never cleared. Rendering, citation
+  parsing and the shield's targeting logic are covered in node, but nothing was
+  exercised in a live page, and the key shield in particular has not been tested
+  against YouTube's actual listeners. If a space still reaches the player, the
+  remaining possibility is a YouTube listener on `window` capture registered before
+  ours, which no amount of `stopPropagation` can outrun; the fallback would be to
+  stop using a shadow root for the chat input so the page's own typing check
+  recognizes it.
 - **`background.js` now has four near-identical NDJSON read loops.** Worth one
   shared helper next time one of them changes.
 - Very long transcripts still go to the model whole; there's no retrieval step. Fine
