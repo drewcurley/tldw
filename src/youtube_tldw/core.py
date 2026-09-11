@@ -31,6 +31,31 @@ class Summary:
     cues: list = field(default_factory=list)  # exposed for server-side transcript caching
 
 
+def fetch_transcript(video_id: str, lang: str = "en", *, on_progress=None,
+                    pcts: tuple = (3, 7, 13)):
+    """Fetch a video's metadata + parsed cues. Owns and cleans its own tempdir.
+
+    Raises NoTranscriptError when the video has no usable track. `pcts` places the
+    three progress steps on the caller's own progress bar.
+    """
+    log = on_progress or (lambda _m, _p=None: None)
+    log(f"video {video_id}: fetching metadata...", pcts[0])
+    workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-tx-"))
+    try:
+        meta = md.fetch_metadata(video_id)
+        lang_key, is_auto = md.choose_track(meta, lang)  # NoTranscriptError
+        kind = "auto-captions" if is_auto else "subtitles"
+        log(f'"{meta.title}" by {meta.channel} ({format_dur(meta.duration_ms)}) '
+            f"-- using {kind} ({lang_key})", pcts[1])
+        cues = transcript.parse_subtitles(
+            md.download_subtitle(video_id, lang_key, is_auto, workdir))
+        log(f"parsed {len(cues)} cues, "
+            f"{sum(len(c.text.split()) for c in cues)} words", pcts[2])
+        return meta, cues
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def select_segments(
     url: str,
     ratio: float | None = None,
@@ -59,19 +84,8 @@ def select_segments(
         meta, cues = _prefetched
         log(f"using cached transcript ({len(cues)} cues, skipping re-fetch)", 22)
     else:
-        log(f"video {video_id}: fetching metadata...", 6)
-        workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-seg-"))
-        try:
-            meta = md.fetch_metadata(video_id)
-            lang_key, is_auto = md.choose_track(meta, lang)  # NoTranscriptError
-            kind = "auto-captions" if is_auto else "subtitles"
-            log(f'"{meta.title}" -- using {kind} ({lang_key})', 14)
-            cues = transcript.parse_subtitles(
-                md.download_subtitle(video_id, lang_key, is_auto, workdir))
-            log(f"parsed {len(cues)} cues, "
-                f"{sum(len(c.text.split()) for c in cues)} words", 22)
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+        meta, cues = fetch_transcript(video_id, lang, on_progress=log,
+                                      pcts=(6, 14, 22))
 
     # Per-segment callback: convert each (first_cue, last_cue) to a span and emit
     # immediately so the client can start playback before the full list arrives.
@@ -124,35 +138,21 @@ def summarize_url(
     """
     log = on_progress or (lambda _m, _p=None, _c=False: None)
     video_id = canonical_video_id(url)  # BadUrlError
-    log(f"video {video_id}: fetching metadata...", 3)
-    workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-core-"))
-    try:
-        meta = md.fetch_metadata(video_id)
-        lang_key, is_auto = md.choose_track(meta, lang)  # NoTranscriptError
-        kind = "auto-captions" if is_auto else "subtitles"
-        log(f'"{meta.title}" by {meta.channel} ({format_dur(meta.duration_ms)}) '
-            f"-- using {kind} ({lang_key})", 7)
-        content = md.download_subtitle(video_id, lang_key, is_auto, workdir)
-        cues = transcript.parse_subtitles(content)  # NoTranscriptError
-        words = sum(len(c.text.split()) for c in cues)
-        log(f"parsed {len(cues)} cues, {words} words", 13)
-        if max_chars is not None:
-            chars = sum(len(c.text) + 1 for c in cues)
-            if chars > max_chars:
-                raise TranscriptTooLongError(
-                    "This transcript is too long for the browser flow; "
-                    "use the `tldw` CLI for very long videos."
-                )
-        # The long step owns ~80% of the bar: starts at 15%, and creep=True tells the
-        # client to ease forward toward ~96% from here until the result lands.
-        log("summarizing with Claude (this can take 30-90s for a long video)...", 15,
-            True)
-        result = summarize.summarize_text(
-            cues, meta.channel, meta.title, ratio, timeout=timeout
-        )
-        return Summary(meta, result, len(cues), cues)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+    meta, cues = fetch_transcript(video_id, lang, on_progress=log)
+    if max_chars is not None:
+        chars = sum(len(c.text) + 1 for c in cues)
+        if chars > max_chars:
+            raise TranscriptTooLongError(
+                "This transcript is too long for the browser flow; "
+                "use the `tldw` CLI for very long videos."
+            )
+    # The long step owns ~80% of the bar: starts at 15%, and creep=True tells the
+    # client to ease forward toward ~96% from here until the result lands.
+    log("summarizing with Claude (this can take 30-90s for a long video)...", 15, True)
+    result = summarize.summarize_text(
+        cues, meta.channel, meta.title, ratio, timeout=timeout
+    )
+    return Summary(meta, result, len(cues), cues)
 
 
 def format_dur(ms: int) -> str:

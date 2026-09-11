@@ -146,6 +146,20 @@ extension playable mp3 within about a second instead of after the whole script.
 Text-mode TTS needs Piper installed: `pipx inject youtube-tldw piper-tts`
 (or `pip install -e ".[tts]"` for a dev checkout).
 
+## Asking follow-up questions
+
+The extension's modal has an **Ask about this video** panel that answers questions
+against the transcript `tldw serve` already holds. The transcript stays on the
+server — the browser sends only the question and the conversation so far.
+
+Answers are transcript-first: they cite the moments they drew from as `[12:34]`
+(clickable, seeks the player), and anything the model adds from its own knowledge
+is labelled `Not in the video:`. Each question is one `claude -p` call, so expect a
+few seconds to the first words.
+
+Transcripts are cached in the server's memory for 4 hours, and an active
+conversation renews its own — so questions don't re-fetch the video.
+
 ## Output
 
 ```
