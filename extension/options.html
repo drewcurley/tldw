@@ -16,6 +16,8 @@
     .voicerow { display: flex; gap: 8px; align-items: stretch; }
     .voicerow select { flex: 1; min-width: 0; padding: 8px 10px; font: inherit;
       border: 1px solid #bbb; border-radius: 8px; background: #fff; }
+    #closeAction { width: 100%; padding: 8px 10px; font: inherit; background: #fff;
+      border: 1px solid #bbb; border-radius: 8px; }
     #preview { margin-top: 0; flex: 0 0 auto; background: #444; }
     #preview[disabled] { opacity: .6; cursor: default; }
     #previewStatus { color: #c00; }
@@ -34,6 +36,14 @@
     <button id="preview" type="button" title="Hear a sample of this voice">▶ Preview</button>
   </div>
   <audio id="sample" hidden></audio>
+  <label for="closeAction">If you close the panel while it's still working</label>
+  <select id="closeAction">
+    <option value="continue">Keep working in the background</option>
+    <option value="abort">Stop and discard</option>
+  </select>
+  <p class="hint">Summaries, key-moment picking, speech and answers all keep running
+    if you close the panel to go watch the video — you'll get a notice when a summary
+    lands. Choose “Stop and discard” to cancel the work instead.</p>
   <p class="hint">You can also switch the voice per-summary in the popup.
     <span id="previewStatus"></span></p>
   <div><button id="save">Save</button><span id="status"></span></div>

@@ -131,6 +131,40 @@ window/capture and that the input never regrows a handler of its own. Both
 mutation-checked — reverting the listener to `document`, or making `fromModal`
 always false, fails the suite.
 
+## Round 3 — closing the panel killed the run
+
+Clicking off the modal during a summary killed it. Nothing aborted the request:
+`close()` called `clearTimers()`, which clears `pingTimer` — and that 20s ping is
+the only thing keeping the MV3 service worker alive. Without it Chrome suspends the
+worker mid-fetch and the result never arrives. `background.js` has warned about
+exactly this at the top of the file since the beginning.
+
+So "keep going in the background" is not "decline to abort" — it is "keep the port
+and its heartbeat connected after the UI unmounts".
+
+- New `closeAction` preference (`continue` default / `abort`), in Options, read once
+  into the content script and kept in sync via `storage.onChanged` because `close()`
+  has to decide synchronously.
+- `close()` splits into a background path (keep every port and ping, unmount only)
+  and an abort path (send the explicit `stopSpeak`/`stopAsk` that a bare disconnect
+  deliberately doesn't trigger, then tear everything down). `closePolicy()` is a
+  pure function so the decision is directly testable.
+- A summary finishing while the panel is closed no longer yanks the modal open over
+  the video — it's stashed and announced with a clickable notice.
+- Re-opening mid-run re-attaches to the in-flight port instead of starting a second
+  identical request, and the audio / key-moment controls render in their real state
+  rather than as buttons that silently no-op.
+
+Covered by `tests/test_extension_render.py`: the `closePolicy` truth table
+(including that a click event's argument isn't mistaken for `keepSeg`) plus guards
+that the background path never calls `clearTimers()` or disconnects the port, and
+that the abort path does both and sends the explicit stops. Mutation-checked both
+ways — reinstating `clearTimers()` on the background path, or ignoring the
+preference, fails the suite.
+
+Also fixed the test harness itself: `grab()` validated only its start marker, so a
+stale end marker sliced to EOF and surfaced as an unrelated syntax error.
+
 ## Items (non-blocking)
 
 - **Each question is a fresh `claude -p` invocation**, so it re-sends the transcript

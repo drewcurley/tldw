@@ -146,6 +146,18 @@ extension playable mp3 within about a second instead of after the whole script.
 Text-mode TTS needs Piper installed: `pipx inject youtube-tldw piper-tts`
 (or `pip install -e ".[tts]"` for a dev checkout).
 
+## Closing the panel mid-run
+
+Work started from the panel keeps running if you close it — useful when you close
+the modal just to go pause or scrub the video. A summary that finishes while the
+panel is closed announces itself with a small clickable notice; re-opening while
+it's still working re-attaches to that run instead of starting a second one. Set
+**"If you close the panel while it's still working"** to *Stop and discard* in the
+extension's Options to cancel instead.
+
+(The panel's keepalive ping is what holds the extension's service worker open, so
+"keep going" means keeping that port connected — not merely declining to abort.)
+
 ## Asking follow-up questions
 
 The extension's modal has an **Ask about this video** panel that answers questions

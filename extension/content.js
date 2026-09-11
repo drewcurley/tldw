@@ -34,6 +34,29 @@
   // re-opening the panel (or jumping to a cited moment) doesn't lose the thread.
   let chat = null;            // { videoId, history } once a conversation has started
   let askPort = null, askPing = null, askSafety = null, asking = false;
+  // What closing the panel should do to work that's still running. Read once and
+  // kept in sync, because close() has to decide synchronously.
+  let closeAction = "continue";          // "continue" | "abort"
+  let backgrounded = false;              // panel closed while a summary was running
+  let currentVideoId = null;
+  api.storage.local.get({ closeAction: "continue" })
+    .then((s) => { closeAction = s.closeAction === "abort" ? "abort" : "continue"; })
+    .catch(() => {});
+  if (api.storage.onChanged) {
+    api.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && changes.closeAction) {
+        closeAction = changes.closeAction.newValue === "abort" ? "abort" : "continue";
+      }
+    });
+  }
+
+  // The one decision close() makes, kept pure so it can be tested directly.
+  function closePolicy(opts, pref) {
+    return {
+      keepSeg: !!(opts && opts.keepSeg === true),
+      background: pref !== "abort",
+    };
+  }
   let askLive = null;         // { text, bubble } while an answer is streaming
   let lastSegments = null;    // { videoId, segments } — re-skip without re-fetching
   // Skip-playback engine state.
@@ -254,18 +277,41 @@
   }
 
   function close(opts) {
+    const policy = closePolicy(opts, closeAction);
+    if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
+    if (creepTimer) { clearInterval(creepTimer); creepTimer = null; }
+
+    if (policy.background) {
+      // Leave every in-flight port — and its keepalive ping — connected. That ping
+      // is the ONLY thing keeping the MV3 worker alive; drop it and Chrome suspends
+      // the worker mid-fetch, which is exactly what used to kill a summary when you
+      // clicked away. The result lands in the worker's cache either way.
+      if (requestActive) backgrounded = true;
+      resetStream();                  // drop the MediaSource; the finished clip is
+                                      // still cached for an instant re-Listen
+      unmount();
+      return;
+    }
+
+    // Abort: stop the work, explicitly where a bare disconnect wouldn't (speak and
+    // ask both keep going through a plain disconnect by design).
+    if (busy && audioPort) { try { audioPort.postMessage({ type: "stopSpeak" }); } catch (_) {} }
+    if (asking && askPort) { try { askPort.postMessage({ type: "stopAsk" }); } catch (_) {} }
     clearTimers();
-    teardownAudio();                  // tear down any in-flight TTS request + ping
-                                      // (an in-flight Q&A answer is deliberately
-                                      // left running — see submitQuestion)
+    teardownAudio();
+    teardownAsk();
     // ...and any in-flight segment fetch (NOT the skip engine, which runs after the
     // modal closes). keepSeg is the exception: streaming skip playback closes the
     // modal on the FIRST clip and still needs the port — and its keepalive ping —
-    // for the clips Claude hasn't found yet. close() is also used directly as a
-    // click handler, where the event argument has no keepSeg and teardown happens.
-    if (!(opts && opts.keepSeg === true)) teardownSeg();
+    // for the clips Claude hasn't found yet.
+    if (!policy.keepSeg) teardownSeg();
+    backgrounded = false;
     requestActive = false;            // suppress late port errors after a manual close
     if (port) { try { port.disconnect(); } catch (_) {} port = null; }
+    unmount();
+  }
+
+  function unmount() {
     window.removeEventListener("keydown", onKey, true);
     window.removeEventListener("keyup", shieldKey, true);
     window.removeEventListener("keypress", shieldKey, true);
@@ -278,18 +324,27 @@
   function startSummarize(url, videoId) {
     showLoading();
     requestActive = true;
+    currentVideoId = videoId;
+    backgrounded = false;
     port = api.runtime.connect({ name: "tldw" });
     port.onMessage.addListener((m) => {
       if (!requestActive) return;
       if (m.type === "progress") { updateProgress(m.message, m.percent, m.creep); return; }
       requestActive = false;
-      if (m.type === "result") showResult(m.payload, m.cached);
-      else if (m.type === "error") showError(m.error);
+      if (m.type === "result") {
+        if (backgrounded) { lastPayload = m.payload; endBackground("TL;DW summary ready"); }
+        else showResult(m.payload, m.cached);
+      } else if (m.type === "error") {
+        if (backgrounded) endBackground(m.error, true);
+        else showError(m.error);
+      }
     });
     port.onDisconnect.addListener(() => {
       if (!requestActive) return;
       requestActive = false;
-      showError("Lost connection to the extension worker. Click TL;DW to try again.");
+      const msg = "Lost connection to the extension worker. Click TL;DW to try again.";
+      if (backgrounded) endBackground(msg, true);
+      else showError(msg);
     });
     port.postMessage({ type: "summarize", url, videoId });
     // Heartbeat: the page never suspends, so pinging every 20s keeps the MV3 service
@@ -300,7 +355,9 @@
     safetyTimer = setTimeout(() => {
       if (!requestActive) return;
       requestActive = false;
-      showError("This is taking too long. Make sure `tldw serve` is running, then try again.");
+      const msg = "This is taking too long. Make sure `tldw serve` is running, then try again.";
+      if (backgrounded) endBackground(msg, true);
+      else showError(msg);
     }, 160000);
   }
 
@@ -352,6 +409,37 @@
     if (safetyTimer) { clearTimeout(safetyTimer); safetyTimer = null; }
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
     if (creepTimer) { clearInterval(creepTimer); creepTimer = null; }
+  }
+
+  // A summary that finished while the panel was closed. Don't yank the modal back
+  // open over whatever they're watching — stash it, say so, and let them choose.
+  function endBackground(message, isError) {
+    clearTimers();
+    if (port) { try { port.disconnect(); } catch (_) {} port = null; }
+    backgrounded = false;
+    requestActive = false;
+    toast(message, isError);
+  }
+
+  function toast(message, isError) {
+    const old = document.getElementById("tldw-toast");
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    const el = document.createElement("div");
+    el.id = "tldw-toast";
+    el.setAttribute("role", "status");
+    el.style.cssText =
+      "position:fixed;z-index:2147483647;bottom:84px;right:24px;max-width:320px;" +
+      "background:" + (isError ? "#4a1f1f" : "#1e1f24") + ";color:#e9e9ea;" +
+      "font:14px system-ui,-apple-system,sans-serif;padding:10px 14px;border-radius:10px;" +
+      "box-shadow:0 6px 24px rgba(0,0,0,.45);cursor:pointer;line-height:1.4;";
+    el.textContent = message + (isError ? "" : " — click to read");
+    const dismiss = () => { if (el.parentNode) el.parentNode.removeChild(el); };
+    el.onclick = () => {
+      dismiss();
+      if (!isError && lastPayload) showResult(lastPayload, true);
+    };
+    document.body.appendChild(el);
+    setTimeout(dismiss, isError ? 12000 : 20000);
   }
 
   function showError(msg) {
@@ -413,6 +501,25 @@
     root.querySelector(".listen").onclick = requestAudio;
     root.querySelector(".vpreview").onclick = previewVoice;
     setupAsk(p);
+    // Audio or key-moment work may still be running from before the panel was
+    // closed. `busy` blocks a fresh request, so reflect that instead of rendering
+    // buttons that silently do nothing when clicked.
+    if (busy) {
+      const play = root.querySelector(".playkey");
+      const sel = root.querySelector(".voice");
+      const prev = root.querySelector(".vpreview");
+      if (play) play.disabled = true;
+      if (sel) sel.disabled = true;
+      if (prev) prev.disabled = true;
+      if (audioPort) {
+        setListenState("generating");          // still synthesizing — Stop works
+        updateAudioStatus("Still generating audio…");
+      } else {
+        const listen = root.querySelector(".listen");
+        if (listen) listen.disabled = true;
+        updateAudioStatus("Still finding key moments…");
+      }
+    }
     root.querySelector(".playkey").onclick = requestSegments;
     // Restore a previously generated clip for this video this session.
     if (lastAudio && lastAudio.videoId === p.video_id && lastAudio.dataUrl) {
@@ -1175,7 +1282,10 @@
     if (msg.type === "TLDW_INVOKE") {
       // Re-open instantly if we already summarized this video this page-session.
       if (lastPayload && lastPayload.video_id === msg.videoId) showResult(lastPayload, true);
-      else startSummarize(msg.url, msg.videoId);
+      else if (requestActive && currentVideoId === msg.videoId) {
+        backgrounded = false;          // re-attach to the run already in flight
+        showLoading();                 // its port keeps driving the progress bar
+      } else startSummarize(msg.url, msg.videoId);
     } else if (msg.type === "TLDW_ERROR") showError(msg.error);
   });
 })();
