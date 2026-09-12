@@ -224,6 +224,25 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
     /enableDownload\(m\.dataUrl\)/.test(src), true);
 }
 
+// --- the sponsor ask must stay an ask, not a nag ---
+{
+  const body = stripComments(src.slice(src.indexOf("  function maybeThank("),
+                                       src.indexOf("  // --- Follow-up Q&A")));
+  check("needs real mileage before it appears",
+    /stats\.videos \|\| 0\) < SPONSOR_AFTER_VIDEOS/.test(body), true);
+  check("a dismissal is permanent",
+    /sponsorDismissed/.test(body) && /sponsorDismissed: true/.test(body), true);
+  check("it retires itself even if never dismissed",
+    /sponsorShown >= SPONSOR_MAX_SHOWS/.test(body), true);
+  check("following the link counts as dismissing",
+    /sbtn"\)\.onclick[\s\S]{0,120}sponsorDismissed: true/.test(body), true);
+  check("the threshold is a real milestone, not a first-run popup",
+    /SPONSOR_AFTER_VIDEOS = (\d+)/.exec(src)[1], (n) => Number(n) >= 10);
+  check("no stats means no ask", /!stats \|\|/.test(body), true);
+  check("the video count is escaped like any other model-supplied value",
+    /esc\(String\(stats\.videos\)\)/.test(body), true);
+}
+
 if (failures.length) {
   console.log("FAILURES:\n" + failures.join("\n"));
   process.exit(1);

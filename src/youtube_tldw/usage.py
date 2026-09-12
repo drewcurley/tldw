@@ -162,6 +162,41 @@ def _append(row: dict) -> None:
             pass
 
 
+def note_video(video_id: str, video_ms: int, summary_words: int, wpm: int = 200) -> None:
+    """Record that a video was reduced to a readable summary.
+
+    Its own row rather than a field on a model call: the interesting quantity is
+    per video, and the time saved is the whole point of the tool — worth recording
+    even though it costs no tokens.
+    """
+    try:
+        read_ms = int(summary_words / max(1, wpm) * 60_000)
+        _append({"ts": time.time(), "kind": "video", "step": "video",
+                 "video_id": video_id, "video_ms": int(video_ms),
+                 "read_ms": read_ms, "words": int(summary_words)})
+    except Exception as exc:
+        print(f"  (usage accounting failed: {exc!r})", flush=True)
+
+
+def stats(path=None) -> dict:
+    """How many videos, and how much watching they replaced.
+
+    Keyed by video id so re-summarizing the same video doesn't count twice; the
+    most recent run for a video wins.
+    """
+    latest: dict = {}
+    for row in read_rows(path):
+        if row.get("kind") == "video" and row.get("video_id"):
+            latest[row["video_id"]] = row
+    watch_ms = sum(int(r.get("video_ms") or 0) for r in latest.values())
+    read_ms = sum(int(r.get("read_ms") or 0) for r in latest.values())
+    return {"videos": len(latest),
+            "watch_ms": watch_ms,
+            "read_ms": read_ms,
+            "saved_ms": max(0, watch_ms - read_ms),
+            "saved_hours": round(max(0, watch_ms - read_ms) / 3_600_000, 1)}
+
+
 def read_rows(path=None) -> list:
     """Every recorded call, oldest first. Bad lines are skipped, not fatal."""
     target = path or USAGE_FILE

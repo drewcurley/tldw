@@ -369,11 +369,19 @@ def _run_usage(argv: list[str]) -> int:
         return (int(r.get("input_tokens") or 0) + int(r.get("cache_creation_tokens") or 0)
                 + int(r.get("cache_read_tokens") or 0))
 
-    total_cost = sum(float(r.get("cost_usd") or 0) for r in rows)
-    print(f"{len(rows)} model call(s) over "
-          f"{len({r.get('video_id') for r in rows if r.get('video_id')})} video(s)"
-          f" — ${total_cost:.2f} total")
+    calls = [r for r in rows if r.get("kind") != "video"]
+    total_cost = sum(float(r.get("cost_usd") or 0) for r in calls)
+    st = usage_mod.stats(path)
+    if st["videos"]:
+        hrs = st["saved_ms"] / 3_600_000
+        hrs_text = f"{hrs:.0f}" if abs(hrs - round(hrs)) < 0.05 else f"{hrs:.1f}"
+        print(f"{st['videos']} video(s) TL;DW'd — about "
+              f"{hrs_text} hours you didn't have to watch "
+              f"({format_length(st['watch_ms'])} of video down to "
+              f"{format_length(st['read_ms'])} of reading).")
+    print(f"{len(calls)} model call(s) — ${total_cost:.2f} total")
     print()
+    rows = calls                       # cost tables cover model calls only
 
     if args.by_video:
         per: dict = {}
