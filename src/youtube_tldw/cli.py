@@ -430,6 +430,15 @@ def _run_usage(argv: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles still default to a legacy code page (cp1252), where printing
+    # the "…" and "—" in our progress lines raises UnicodeEncodeError and takes the
+    # whole run down. Ask for UTF-8 and degrade rather than crash if it's refused.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
     argv = sys.argv[1:] if argv is None else argv
     # Dispatch `config` and `serve` before argparse so `tldw <url>` stays unchanged.
     if argv and argv[0] == "config":
