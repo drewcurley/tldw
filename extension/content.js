@@ -169,7 +169,9 @@
           min-height: 14px; }
         .audiostatus { font-size: 12px; color: #888; }
         .audiostatus.audioerr { color: #c0392b; }
-        .audioslot audio { width: 100%; margin-bottom: 12px; }
+        .playerrow { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+        .playerrow audio { flex: 1; min-width: 0; }
+        .dl { flex: 0 0 auto; padding: 6px 10px; font-size: 15px; line-height: 1.2; }
         .stopping { border-color: #c00; color: #c00; }
         .askwrap { margin-top: 20px; border-top: 1px solid rgba(128,128,128,.25);
           padding-top: 14px; }
@@ -601,6 +603,7 @@
         lastAudio = { videoId: lastPayload && lastPayload.video_id, dataUrl: m.dataUrl };
         if (stream) endAudioStream();          // already playing — just close the buffer
         else renderAudio(m.dataUrl);           // no MSE here; play the finished clip
+        enableDownload(m.dataUrl);             // the mp3 is complete now
       } else if (m.type === "audio") {
         teardownAudio(); finishAudioUI(); renderAudio(m.dataUrl);
       } else if (m.type === "speakError") {
@@ -1266,15 +1269,69 @@
     if (svg) svg.classList.remove("on", "indet");       // hidden until next request
   }
 
+  // Mirrors naming.sanitize_field on the server: drop control and filesystem-illegal
+  // characters, protect the " - " joiner the template uses, collapse whitespace,
+  // and never end up with a leading/trailing dot or space.
+  function sanitizeField(value, maxLen) {
+    let out = String(value || "")
+      .replace(/[\x00-\x1f<>:"/\\|?*]/g, " ")
+      .replace(/ - /g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (out.length > maxLen) out = out.slice(0, maxLen).trim();
+    out = out.replace(/^[. ]+/, "").replace(/[. ]+$/, "");
+    return out || "untitled";
+  }
+
+  function audioFileName(title, channel) {
+    return sanitizeField(title, 120) + " - " + sanitizeField(channel, 60) +
+      " - tldw version.mp3";
+  }
+
+  // Only offered once a COMPLETE mp3 exists — mid-stream the player is backed by a
+  // MediaSource, which isn't a file you can hand to the user.
+  function enableDownload(dataUrl) {
+    const dl = root && root.querySelector(".audioslot .dl");
+    if (!dl || !lastPayload || !dataUrl) return;
+    const name = audioFileName(lastPayload.title, lastPayload.channel);
+    dl.hidden = false;
+    dl.title = "Download “" + name + "”";
+    dl.onclick = () => {
+      // Go through a Blob rather than handing the anchor the data: URL — browsers
+      // are far more willing to download blob:, and it can be released after.
+      const bytes = b64ToBytes(dataUrl.slice(dataUrl.indexOf(",") + 1));
+      const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mpeg" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+    };
+  }
+
   function renderAudio(src, restore) {
     const slot = root && root.querySelector(".audioslot");
     if (!slot) return null;
     slot.innerHTML = "";                                 // replace, never stack
+    const row = document.createElement("div");
+    row.className = "playerrow";
     const a = document.createElement("audio");
     a.controls = true; a.src = src;
     a.setAttribute("aria-label", "Spoken summary");
-    slot.appendChild(a);
+    // Native <audio controls> renders its own shadow UI, so this can't live inside
+    // the control bar next to the volume icon — it sits alongside the player.
+    const dl = document.createElement("button");
+    dl.className = "dl";
+    dl.hidden = true;
+    dl.textContent = "⬇";
+    dl.setAttribute("aria-label", "Download this summary as an mp3");
+    row.appendChild(a);
+    row.appendChild(dl);
+    slot.appendChild(row);
     if (!busy) setListenState("done");        // mid-stream the button is still Stop
+    if (src.startsWith("data:")) enableDownload(src);   // a finished clip
     if (!restore) {
       // A blob: URL is a live MediaSource, not a clip worth restoring later.
       if (src.startsWith("data:")) {

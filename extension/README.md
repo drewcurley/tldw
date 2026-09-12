@@ -47,6 +47,11 @@ setting if you'd rather it stopped and discarded.
   the first answer starts in a few seconds. Answers cite moments as `[12:34]` —
   click one to jump the player there. Anything the model adds from outside the
   video is labelled "Not in the video:". ⏹ Stop abandons an answer mid-stream.
+Once a clip has finished synthesizing, a **⬇** button appears beside the player and
+saves it as `{video title} - {channel} - tldw version.mp3`. (It sits next to the
+player rather than inside the control bar — native `<audio controls>` renders its
+own shadow UI, which page script can't add to.)
+
 - **🔊 Listen to summary** synthesizes the summary to speech (local Piper TTS) and
   plays it in the modal. Playback starts on the first second of audio and the rest
   streams in behind it, so a long summary doesn't sit silent while it renders.

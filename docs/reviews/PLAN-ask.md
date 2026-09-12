@@ -216,6 +216,32 @@ forbids inside the comment explaining the fix. Comment-stripping is now applied 
 every structural check rather than bolted onto one, and the close-body checks key
 off code landmarks (`stopSpeak`) instead of comment text.
 
+## Round 6 — download the synthesized mp3
+
+A **⬇** next to the player, once a complete clip exists, saving
+`{video title} - {channel} - tldw version.mp3`.
+
+- **It can't go inside the control bar.** Native `<audio controls>` draws its own
+  shadow UI, so there's no way for page script to place a button beside the volume
+  icon. The alternative would be replacing the native controls wholesale, which
+  costs their keyboard handling and accessibility for a cosmetic gain. It sits
+  immediately alongside the player instead.
+- **Only for a finished file.** Mid-stream the player is backed by a MediaSource,
+  which isn't a file that can be handed over; the button stays hidden until
+  `audio_end` (or a restored/cached clip) provides the complete mp3.
+- **Downloads via a Blob**, not the `data:` URL directly — browsers are far more
+  willing to download `blob:` from a content script, and the object URL is released
+  afterwards.
+- `sanitizeField` mirrors `naming.sanitize_field` server-side: control and
+  filesystem-illegal characters out, the `" - "` joiner protected so a title can't
+  fake a field boundary, whitespace collapsed, length capped, `untitled` fallback.
+
+Tested in node: the filename table (illegal characters, embedded `" - "`, empty and
+all-illegal fields, truncation, leading/trailing dots) plus a byte-exact base64
+round-trip — verified against a real ffmpeg-produced mp3 as well as a synthetic
+payload of NULs, high bytes and newlines, since a decode slip would produce a
+corrupt file that still "downloads successfully". Mutation-checked.
+
 ## Items (non-blocking)
 
 - **Each question is a fresh `claude -p` invocation**, so it re-sends the transcript
