@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from youtube_tldw import TldrError, claude_client
+from youtube_tldw import ClaudeError, TldrError, claude_client
 from youtube_tldw.proc import ProcResult
 
 
@@ -123,3 +123,34 @@ def test_validator_rejection_triggers_retry(monkeypatch):
     )
     out = claude_client.ask_json("p", "data", validate=validate)
     assert out == {"good": 1} and calls["n"] == 2
+
+
+class _Res:
+    def __init__(self, code, out="", err=""):
+        self.returncode, self.stdout, self.stderr = code, out, err
+
+
+def test_failure_surfaces_the_envelope_message():
+    """A non-zero exit still prints the usual JSON envelope; the `result` field is
+    the actionable part. Without this the user sees 2KB of JSON."""
+    envelope = json.dumps({
+        "is_error": True, "subtype": "success", "type": "result",
+        "result": "Not logged in · Please run /login",
+        "usage": {"input_tokens": 0}, "session_id": "abc",
+    })
+    msg = claude_client._explain_failure("claude", _Res(1, envelope))
+    assert "Not logged in" in msg and "Please run /login" in msg
+    assert "session_id" not in msg           # the blob itself stays out of it
+
+
+def test_failure_falls_back_to_the_stderr_tail():
+    msg = claude_client._explain_failure("claude", _Res(127, "", "boom\nsplat"))
+    assert "exit 127" in msg and "splat" in msg
+
+
+def test_is_error_envelope_reports_the_message_not_the_subtype():
+    """subtype is often "success" even when is_error is true — useless on its own."""
+    envelope = json.dumps({"is_error": True, "subtype": "success",
+                           "result": "Credit balance too low"})
+    with pytest.raises(ClaudeError, match="Credit balance too low"):
+        claude_client._extract_result_text(envelope)
