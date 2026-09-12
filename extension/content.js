@@ -284,7 +284,11 @@
   function close(opts) {
     const policy = closePolicy(opts, closeAction);
     if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
-    if (creepTimer) { clearInterval(creepTimer); creepTimer = null; }
+    // creepTimer is deliberately NOT cleared on the background path below: it only
+    // advances progressPct and calls applyWidth(), which is a no-op while unmounted,
+    // so the bar goes on tracking real elapsed time instead of freezing at the
+    // moment you closed the panel. clearTimers() still retires it on completion.
+    if (!policy.background && creepTimer) { clearInterval(creepTimer); creepTimer = null; }
 
     if (policy.background) {
       // Leave every in-flight port — and its keepalive ping — connected. That ping
@@ -1301,10 +1305,16 @@
         // the long Claude step sends ONE progress event and then goes quiet for a
         // minute, so without this the bar sits at "Starting… 0%" until the result.
         backgrounded = false;
+        // showLoading() resets progressPct, and replaying lastProgress would only
+        // restore the server's last reported figure (15% for the Claude step) —
+        // rewinding whatever the creep had reached since. Carry it across.
+        const carried = progressPct;
         showLoading();
+        progressPct = carried;
         if (lastProgress) {
           updateProgress(lastProgress.message, lastProgress.percent, lastProgress.creep);
         }
+        applyWidth();
       } else startSummarize(msg.url, msg.videoId);
     } else if (msg.type === "TLDW_ERROR") showError(msg.error);
   });
