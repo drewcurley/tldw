@@ -1,6 +1,6 @@
 """youtube-tldw: turn a YouTube video into a succinct text or video TL;DW."""
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 
 class TldrError(Exception):
