@@ -32,6 +32,11 @@ streamed as it renders), **skip the real player** through only the key moments, 
 ## Requirements
 
 - **Python 3.11+**
+- **macOS, Linux, or Windows.** Verified on Windows 11 (ARM64): the full test suite,
+  the CLI, and the extension's server all run there. One gap — **text-to-speech is
+  unavailable on Windows ARM64**, because Piper's native espeak phonemizer has no
+  arm64 wheel; the tool says so clearly and everything else still works. Windows x64
+  is unaffected.
 - **A model backend** — see [Choose your model](#choose-your-model). The simplest are
   a local model (Ollama) or any provider via the `llm` CLI; Claude is the default if
   you have the `claude` CLI.
@@ -162,7 +167,9 @@ piped straight into a long-lived ffmpeg encoder — so `tldw serve` can hand the
 extension playable mp3 within about a second instead of after the whole script.
 
 Text-mode TTS needs Piper installed: `pipx inject youtube-tldw piper-tts`
-(or `pip install -e ".[tts]"` for a dev checkout).
+(or `pip install -e ".[tts]"` for a dev checkout). Piper ships no Windows ARM64
+wheel for its native phonemizer, so speech is unavailable there — `tldw` detects
+that up front and tells you, rather than failing partway through a render.
 
 ## Closing the panel mid-run
 
