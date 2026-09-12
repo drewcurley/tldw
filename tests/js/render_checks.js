@@ -16,6 +16,10 @@ eval(grab("const esc = (s) =>", "function renderSummary")
    + grab("function renderSummary", "\n\n  // --- ")
    + grab("  function renderAnswer(text)", "\n  function seekTo"));
 
+// Structural checks match against code, never prose: a comment explaining a fix
+// invariably contains the very call the check forbids.
+const stripComments = (t) => t.replace(/\/\/[^\n]*/g, "");
+
 const failures = [];
 const check = (name, got, want) => {
   const ok = typeof want === "function" ? want(got) : got === want;
@@ -111,12 +115,14 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
 // clearTimers() kills pingTimer, and that ping is the only thing keeping the MV3
 // worker alive. Calling it on the background path is exactly the bug being fixed.
 {
-  const body = src.slice(src.indexOf("  function close(opts)"), src.indexOf("  function unmount()"));
-  const bg = body.slice(0, body.indexOf("// Abort:"));
+  const body = stripComments(
+    src.slice(src.indexOf("  function close(opts)"), src.indexOf("  function unmount()")));
+  const bg = body.slice(0, body.indexOf("policy.keepSeg") >= 0
+    ? body.indexOf("stopSpeak") : body.length);
   check("background close does not clear the keepalive timers",
     /clearTimers\(\)/.test(bg), false);
   check("abort close does clear them",
-    /clearTimers\(\)/.test(body.slice(body.indexOf("// Abort:"))), true);
+    /clearTimers\(\)/.test(body.slice(body.indexOf("stopSpeak"))), true);
   check("abort sends the explicit stops a bare disconnect would not",
     /stopSpeak/.test(body) && /stopAsk/.test(body), true);
   check("background close leaves the summarize port connected",
@@ -132,7 +138,6 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
                               src.indexOf("  function showLoading()"));
   // Only the prologue matters — mount() legitimately *registers* close() as the
   // backdrop and ✕ handler further down.
-  const stripComments = (t) => t.replace(/\/\/[^\n]*/g, "");
   const prologue = stripComments(
     mountBody.slice(0, mountBody.indexOf("host = document.createElement")));
   check("mount() does not run the close() policy before rendering",
@@ -144,6 +149,17 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
   check("a new run retires the previous run's port itself",
     /port\.disconnect/.test(startBody) && /clearTimers\(\)/.test(startBody), true);
 
+  // The bar climbs ~1%/s during the Claude step, so resetting it to the server's
+  // last reported figure visibly rewinds. It must carry, and must keep advancing
+  // while the panel is shut.
+  check("re-attach carries the progress the creep had reached",
+    /const carried = progressPct;[\s\S]{0,200}progressPct = carried;/.test(src), true);
+  {
+    const closeBody = stripComments(src.slice(src.indexOf("  function close(opts)"),
+                                              src.indexOf("  function unmount()")));
+    check("a background close leaves the creep running",
+      /!policy\.background && creepTimer/.test(closeBody), true);
+  }
   check("progress is remembered so a re-attach can restore it",
     /lastProgress = m;/.test(src), true);
   check("re-attach replays the remembered progress",

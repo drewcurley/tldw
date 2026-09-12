@@ -196,6 +196,26 @@ before matching (the first version tripped on the word `close()` inside the comm
 explaining the fix), and scope to a function's prologue rather than its whole body
 (`mount()` legitimately *registers* `close` as the backdrop handler).
 
+## Round 5 — the progress bar rewound on re-open
+
+Re-opening during the Claude step showed 16% after the bar had crept to 22%, every
+time. 16 is not elapsed seconds: `setProgress(15)` restored the server's last
+reported figure for that step, one creep tick added 0.6, and `Math.round(15.6)` is
+16. The bar climbs ~1%/s there, which is why it reads like a timer.
+
+- **Carry the crept progress across a re-attach.** Replaying `lastProgress` alone
+  restores only what the *server* last said, discarding everything the creep had
+  added since. `progressPct` is now carried across `showLoading()`'s reset.
+- **Let the creep run while the panel is closed.** It only advances `progressPct`
+  and calls `applyWidth()`, which is already a no-op while unmounted, so the bar
+  now tracks real elapsed time instead of freezing at the moment of closing.
+  `clearTimers()` still retires it on completion or abort.
+
+Harness note: two rounds running, a structural guard matched the very call it
+forbids inside the comment explaining the fix. Comment-stripping is now applied to
+every structural check rather than bolted onto one, and the close-body checks key
+off code landmarks (`stopSpeak`) instead of comment text.
+
 ## Items (non-blocking)
 
 - **Each question is a fresh `claude -p` invocation**, so it re-sends the transcript
