@@ -165,6 +165,37 @@ preference, fails the suite.
 Also fixed the test harness itself: `grab()` validated only its start marker, so a
 stale end marker sliced to EOF and surfaced as an unrelated syntax error.
 
+## Round 4 — re-opening mid-run showed a dead 0% spinner
+
+Reported: close the panel during "summarizing with Claude", re-open it, and the
+modal sits on "Starting… 0%" forever; the server finishes, nothing updates, but
+closing and re-opening once more shows the full summary instantly.
+
+Two independent faults, both mine from round 3.
+
+- **`mount()` called `close()`.** `close()` is where the abort-vs-background
+  decision lives, so the re-attach path did `backgrounded = false` and then
+  immediately `showLoading()` → `mount()` → `close()` → `backgrounded = true` again.
+  The result arrived, took the backgrounded branch, and was stashed silently — which
+  is exactly why the *next* open had it ready. `mount()` now calls `unmount()`; a
+  new run retires the previous run's port itself, which is the only thing `close()`
+  was doing for it.
+- **A re-attach reset the progress bar.** `showLoading()` starts at "Starting… 0%",
+  and the long Claude step emits ONE progress event (with `creep`) and then goes
+  quiet for a minute, so there was nothing to move it off zero. The last progress
+  event is now remembered and replayed on re-attach, which restores the message,
+  the percentage and the creep animation.
+
+Guarded in `tests/test_extension_render.py`: `mount()`'s prologue must not invoke
+the close policy, `startSummarize` must retire the old port itself, and the
+re-attach must replay the remembered progress. Mutation-checked — restoring
+`close()` in `mount()` fails the suite.
+
+Two things this round says about the harness: a static guard has to strip comments
+before matching (the first version tripped on the word `close()` inside the comment
+explaining the fix), and scope to a function's prologue rather than its whole body
+(`mount()` legitimately *registers* `close` as the backdrop handler).
+
 ## Items (non-blocking)
 
 - **Each question is a fresh `claude -p` invocation**, so it re-sends the transcript
