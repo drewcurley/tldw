@@ -23,7 +23,7 @@ from typing import Callable
 
 from . import ClaudeError, TldrError, TldrTimeoutError
 from . import config, usage
-from .proc import run
+from .proc import _resolve, run
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 _DEFAULT_TIMEOUT = 300.0
@@ -42,7 +42,8 @@ def _extract_result_text(stdout: str) -> str:
     except json.JSONDecodeError as exc:
         raise ClaudeError("Could not parse Claude's response envelope.") from exc
     if envelope.get("is_error"):
-        raise ClaudeError(f"Claude reported an error: {envelope.get('subtype')}")
+        detail = envelope.get("result") or envelope.get("subtype") or "unknown error"
+        raise ClaudeError(f"Claude reported an error: {detail}")
     result = envelope.get("result")
     if not isinstance(result, str) or not result.strip():
         raise ClaudeError("Claude returned an empty result.")
@@ -68,6 +69,27 @@ def _record_envelope(stdout: str, step: str) -> None:
         return
     if isinstance(envelope, dict) and envelope.get("usage"):
         usage.record(usage.parse_usage(envelope, step))
+
+
+def _explain_failure(name: str, result) -> str:
+    """Turn a failed backend invocation into something a person can act on.
+
+    The claude CLI exits non-zero *and* prints its usual JSON envelope, whose
+    `result` field carries the real message ("Not logged in - Please run /login").
+    Without this the user gets two kilobytes of JSON, which is how a first run ends
+    in a bug report instead of a login.
+    """
+    for blob in (result.stdout, result.stderr):
+        try:
+            envelope = json.loads((blob or "").strip())
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(envelope, dict):
+            msg = envelope.get("result") or envelope.get("error")
+            if isinstance(msg, str) and msg.strip():
+                return f"`{name}` failed: {msg.strip()}"
+    tail = ((result.stderr or result.stdout) or "").strip().splitlines()[-3:]
+    return f"`{name}` failed (exit {result.returncode}): " + " ".join(tail)
 
 
 def _backend() -> tuple[list[str], Callable[[str], str]]:
@@ -137,8 +159,8 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
         argv += ["--resume", str(resume)]
     full = prompt + "\n\n" + stdin_payload
 
-    proc = subprocess.Popen(  # noqa: S603
-        argv,
+    proc = subprocess.Popen(  # noqa: S603 - resolved argv, shell=False
+        _resolve(argv),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -160,6 +182,8 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
 
     deadline = time.monotonic() + timeout
     saw_delta = False
+    killed = False
+    drained = False
     try:
         for raw in proc.stdout:
             if time.monotonic() > deadline:
@@ -192,13 +216,29 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
                     if isinstance(block, dict) and block.get("type") == "text")
                 if whole:
                     yield whole
+        drained = True          # stdout reached EOF: the process is on its way out
     finally:
         proc.stdout.close()
-        if proc.poll() is None:
-            proc.kill()   # consumer abandoned us (client hung up) or we're unwinding
-        ret = proc.wait(timeout=5)
+        if drained:
+            # Let it exit on its own. poll() can still read None while a finished
+            # process is being reaped, and killing it then turned a clean exit into
+            # a reported "failure".
+            try:
+                ret = proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                killed = True
+                ret = proc.wait(timeout=5)
+        else:
+            # Unwinding early — a timeout, or the consumer hung up (Stop). Kill now:
+            # waiting on a process that is still streaming would stall the abort.
+            proc.kill()
+            killed = True
+            ret = proc.wait(timeout=5)
 
-    if ret and ret not in (0, -9):
+    # A process we killed on purpose isn't a failure. Don't test for a specific
+    # code: POSIX reports -9 for SIGKILL, Windows reports 1 from TerminateProcess.
+    if ret and not killed:
         tail = proc.stderr.read().strip().splitlines()[-3:]
         raise ClaudeError(f"`claude` failed (exit {ret}): " + " | ".join(tail))
 
@@ -277,11 +317,14 @@ def ask_text(
     """Buffered plain-text answer — the fallback when the backend can't stream."""
     argv, extract = _backend()
     try:
-        result = run(argv, stdin=prompt + "\n\n" + stdin_payload, timeout=timeout)
+        result = run(argv, stdin=prompt + "\n\n" + stdin_payload, timeout=timeout,
+                     check=False)
     except TldrTimeoutError:
         raise                                    # surfaces as 504
     except TldrError as exc:
-        raise ClaudeError(str(exc)) from exc     # non-zero exit etc. -> 502
+        raise ClaudeError(str(exc)) from exc     # not installed etc. -> 502
+    if result.returncode != 0:
+        raise ClaudeError(_explain_failure(argv[0], result))
     _record_envelope(result.stdout, step)
     return extract(result.stdout)
 
@@ -310,11 +353,13 @@ def ask_json(
                 "markdown fences."
             )
         try:
-            result = run(argv, stdin=full, timeout=timeout)
+            result = run(argv, stdin=full, timeout=timeout, check=False)
         except TldrTimeoutError:
             raise  # surfaces as 504, not swallowed by the retry
         except TldrError as exc:
-            raise ClaudeError(str(exc)) from exc  # non-zero exit etc. -> 502
+            raise ClaudeError(str(exc)) from exc  # not installed etc. -> 502
+        if result.returncode != 0:
+            raise ClaudeError(_explain_failure(argv[0], result))
         _record_envelope(result.stdout, step if attempt == 0 else f"{step}-retry")
         try:
             data = _parse_inner_json(extract(result.stdout))

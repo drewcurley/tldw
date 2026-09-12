@@ -7,6 +7,8 @@ NEVER use shell=True and NEVER build command strings from untrusted input.
 
 from __future__ import annotations
 
+import os
+import re
 import shutil
 import subprocess
 import threading
@@ -33,6 +35,34 @@ def require(*binaries: str) -> None:
         )
 
 
+# cmd.exe re-parses its command line, so these would stop being inert data.
+_CMD_META = re.compile(r"[&|<>^]")
+
+
+def _resolve(argv: list[str]) -> list[str]:
+    """Resolve argv[0] to a concrete executable path.
+
+    On Windows, npm-installed tools — the `claude` CLI among them — are `.cmd`
+    shims, and CreateProcess cannot execute those: Popen fails with WinError 193.
+    They have to go through cmd.exe, which re-parses the command line, so this
+    refuses any argument cmd could read as a metacharacter rather than passing it
+    along. Everything we send down this path is a server-side constant, so the
+    refusal should never fire; if it ever does, a loud error is the right answer.
+    """
+    exe = shutil.which(argv[0])
+    if exe is None:
+        return argv            # let the caller raise its normal "not installed"
+    if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
+        bad = next((a for a in argv[1:] if _CMD_META.search(a)), None)
+        if bad is not None:
+            raise TldrError(
+                f"Refusing to run `{argv[0]}` through cmd.exe with an argument "
+                f"containing shell metacharacters: {bad!r}"
+            )
+        return ["cmd", "/d", "/s", "/c", exe, *argv[1:]]
+    return [exe, *argv[1:]]
+
+
 def run(
     argv: list[str],
     *,
@@ -49,7 +79,7 @@ def run(
         raise ValueError("argv must be a non-empty list")
     try:
         proc = subprocess.run(  # noqa: S603 - argv list, shell=False by default
-            argv,
+            _resolve(argv),
             input=stdin,
             capture_output=True,
             text=True,
@@ -89,7 +119,8 @@ def stream_filter(
         raise ValueError("argv must be a non-empty list")
     try:
         proc = subprocess.Popen(  # noqa: S603 - argv list, shell=False by default
-            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            _resolve(argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
         )
     except FileNotFoundError as exc:
         raise TldrError(f"`{argv[0]}` is not installed or not on PATH.") from exc

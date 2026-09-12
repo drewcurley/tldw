@@ -5,6 +5,7 @@ TL;DW to natural speech with Piper (local neural TTS, no API keys).
 from __future__ import annotations
 
 import importlib.util
+import platform
 import re
 import sys
 import threading
@@ -87,11 +88,38 @@ def _speakify(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_piper_state = None      # None = unchecked, True = usable, str = why it isn't
+
+
 def require_piper() -> None:
+    """Fail early, and for the right reason, when speech isn't going to work.
+
+    find_spec alone isn't enough: piper can be installed and still unusable, because
+    its espeak phonemizer is a native extension with no wheel for every platform
+    (Windows on ARM, at the time of writing). That used to surface as an ImportError
+    from deep inside synthesis — a 500 with a traceback instead of "TTS isn't
+    available here". The real check imports onnxruntime, so it runs once and the
+    answer is cached.
+    """
+    global _piper_state
     if importlib.util.find_spec("piper") is None:
         raise TldrError(
             "Text-mode --render-audio needs Piper TTS. Install it with "
             "`pipx inject youtube-tldw piper-tts` (or `pip install piper-tts`)."
+        )
+    if _piper_state is None:
+        try:
+            from piper import PiperVoice  # noqa: F401
+            from piper import espeakbridge  # noqa: F401 — the native phonemizer
+            _piper_state = True
+        except Exception as exc:                 # ImportError, OSError, ...
+            _piper_state = f"{type(exc).__name__}: {exc}"
+    if _piper_state is not True:
+        raise TldrError(
+            f"Piper TTS is installed but not usable on this machine "
+            f"({platform.machine()}): {_piper_state}. Speech needs Piper's native "
+            "espeak phonemizer, which has no wheel for every platform — Windows on "
+            "ARM has none today. Everything except text-to-speech still works."
         )
 
 

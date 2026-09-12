@@ -430,6 +430,17 @@ def _run_usage(argv: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows still defaults redirected output to a legacy code page (cp1252). The
+    # "…" and "—" in our progress lines survive that, but as cp1252 bytes — mojibake
+    # anywhere the output is piped or captured. Anything cp1252 can't represent at
+    # all (an arrow, an emoji) would raise UnicodeEncodeError and end the run, so
+    # this is also insurance against the first such character anyone adds.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
     argv = sys.argv[1:] if argv is None else argv
     # Dispatch `config` and `serve` before argparse so `tldw <url>` stays unchanged.
     if argv and argv[0] == "config":
