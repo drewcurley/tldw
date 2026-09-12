@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "youtube-tldw"
-version = "1.1.0"
+version = "1.2.0"
 description = "Summarize a YouTube video into a text or video TL;DW."
 requires-python = ">=3.11"
 dependencies = ["pillow>=10.3,<12"]
