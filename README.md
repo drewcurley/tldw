@@ -1,5 +1,7 @@
 # youtube-tldw
 
+[![Sponsor](https://img.shields.io/badge/Sponsor-%F0%9F%92%9B-ff69b4?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/drewcurley)
+
 Turn a YouTube video into a succinct **TL;DW** — either as Markdown text or as a
 recut MP4 of just the key moments.
 
@@ -171,6 +173,13 @@ few seconds to the first words.
 
 Transcripts are cached in the server's memory for 4 hours, and an active
 conversation renews its own — so questions don't re-fetch the video.
+
+## Supporting it
+
+TL;DW is free, runs entirely on your machine, and uses your own Claude plan — it
+costs nothing to run and nothing to give away. If it saves you time,
+[sponsoring it](https://github.com/sponsors/drewcurley) is welcome and never
+required. `tldw usage` will tell you how many hours it has saved you.
 
 ## Token usage and cost
 

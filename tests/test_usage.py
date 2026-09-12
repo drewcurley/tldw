@@ -110,7 +110,7 @@ def test_usage_report_summarizes(tmp_path, capsys):
     ])
     assert cli.main(["usage", "--file", str(f)]) == 0
     out = capsys.readouterr().out
-    assert "3 model call(s) over 2 video(s)" in out
+    assert "3 model call(s)" in out
     assert "$0.63 total" in out
     assert "summarize" in out and "ask" in out
     assert "per video:" in out                 # the number that matters
@@ -118,6 +118,59 @@ def test_usage_report_summarizes(tmp_path, capsys):
     assert cli.main(["usage", "--file", str(f), "--by-video"]) == 0
     out = capsys.readouterr().out
     assert "v1" in out and "v2" in out
+
+
+def test_stats_count_videos_and_time_saved(tmp_path):
+    f = tmp_path / "u.jsonl"
+    _write(f, [
+        {"ts": 1e9, "kind": "video", "video_id": "v1",
+         "video_ms": 20 * 60_000, "read_ms": 3 * 60_000},
+        {"ts": 1e9, "kind": "video", "video_id": "v2",
+         "video_ms": 40 * 60_000, "read_ms": 5 * 60_000},
+        {"ts": 1e9, "kind": "summarize", "video_id": "v1", "cost_usd": 0.4},
+    ])
+    st = usage.stats(f)
+    assert st["videos"] == 2                       # the model call isn't a video
+    assert st["watch_ms"] == 60 * 60_000
+    assert st["saved_ms"] == 52 * 60_000
+    assert st["saved_hours"] == pytest.approx(0.9, abs=0.05)
+
+
+def test_stats_do_not_double_count_a_resummarized_video(tmp_path):
+    f = tmp_path / "u.jsonl"
+    _write(f, [
+        {"ts": 1e9, "kind": "video", "video_id": "v1",
+         "video_ms": 20 * 60_000, "read_ms": 3 * 60_000},
+        {"ts": 2e9, "kind": "video", "video_id": "v1",
+         "video_ms": 20 * 60_000, "read_ms": 2 * 60_000},
+    ])
+    st = usage.stats(f)
+    assert st["videos"] == 1
+    assert st["read_ms"] == 2 * 60_000             # the later run wins
+
+
+def test_note_video_records_read_time_from_word_count(tmp_path, monkeypatch):
+    monkeypatch.setattr(usage, "USAGE_FILE", tmp_path / "u.jsonl")
+    usage.note_video("v1", 18 * 60_000, 1200)      # 1200 words at 200wpm = 6 min
+    row = usage.read_rows()[0]
+    assert row["kind"] == "video" and row["video_id"] == "v1"
+    assert row["read_ms"] == 6 * 60_000
+    assert usage.stats()["saved_ms"] == 12 * 60_000
+
+
+def test_usage_report_leads_with_time_saved(tmp_path, capsys):
+    f = tmp_path / "u.jsonl"
+    _write(f, [
+        {"ts": 1e9, "kind": "video", "video_id": "v1",
+         "video_ms": 45 * 60_000, "read_ms": 5 * 60_000},
+        {"ts": 1e9, "kind": "summarize", "video_id": "v1", "step": "summarize",
+         "cost_usd": 0.4, "output_tokens": 900},
+    ])
+    assert cli.main(["usage", "--file", str(f)]) == 0
+    out = capsys.readouterr().out
+    assert "1 video(s) TL;DW'd" in out
+    assert "hours you didn't have to watch" in out
+    assert "1 model call(s)" in out                # the video row isn't a call
 
 
 def test_usage_report_with_no_data(tmp_path, capsys):

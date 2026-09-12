@@ -36,6 +36,9 @@
   let askPort = null, askPing = null, askSafety = null, asking = false;
   // What closing the panel should do to work that's still running. Read once and
   // kept in sync, because close() has to decide synchronously.
+  const SPONSOR_URL = "https://github.com/sponsors/drewcurley";
+  const SPONSOR_AFTER_VIDEOS = 25;     // ask only once there's real value to point at
+  const SPONSOR_MAX_SHOWS = 3;         // then stop on its own, dismissed or not
   let closeAction = "continue";          // "continue" | "abort"
   let backgrounded = false;              // panel closed while a summary was running
   let currentVideoId = null;
@@ -196,6 +199,13 @@
           border: 1px solid rgba(128,128,128,.4); background: transparent;
           color: inherit; }
         .askstatus { font-size: 12px; color: #888; min-height: 14px; margin-top: 6px; }
+        .sponsor { margin-top: 18px; padding: 12px 14px; border-radius: 10px;
+          background: rgba(128,128,128,.1); font-size: 13px; line-height: 1.5; }
+        .sponsor .srow { display: flex; gap: 10px; align-items: center;
+          margin-top: 10px; flex-wrap: wrap; }
+        .sponsor a.sbtn { text-decoration: none; padding: 5px 12px; border-radius: 7px;
+          border: 1px solid rgba(128,128,128,.4); color: inherit; font-size: 13px; }
+        .sponsor button { font-size: 12px; padding: 4px 8px; }
         .askstatus.askerr { color: #c0392b; }
         .vpreview { padding: 4px 9px; font-size: 13px; line-height: 1.2; }
         .vpreview[disabled] { opacity: .55; cursor: default; }
@@ -498,6 +508,7 @@
       ${points ? `<h2>Key points</h2><ul class="points">${points}</ul>` : ""}
       <h2>Summary</h2><div class="body">${renderSummary(p.summary_md || "")}</div>
       ${p.rationale ? `<div class="rationale">${esc(p.rationale)}</div>` : ""}
+      <div class="sponsor" hidden></div>
       <div class="askwrap">
         <button class="asktoggle" aria-expanded="false">💬 Ask about this video</button>
         <div class="askpanel" hidden>
@@ -521,6 +532,7 @@
     root.querySelector(".listen").onclick = requestAudio;
     root.querySelector(".vpreview").onclick = previewVoice;
     setupAsk(p);
+    maybeThank(p.stats);
     // Audio or key-moment work may still be running from before the panel was
     // closed. `busy` blocks a fresh request, so reflect that instead of rendering
     // buttons that silently do nothing when clicked.
@@ -728,6 +740,42 @@
     if (!stream) return;
     stream.ended = true;
     pumpStream();
+  }
+
+  // --- One thank-you, at a milestone that means something ------------------------
+  //
+  // Deliberately not a nag: it needs real mileage behind it, it's dismissible for
+  // good, and it retires itself after a few showings even if never dismissed. This
+  // is a tool people use daily — interrupting that repeatedly would cost more
+  // goodwill than the ask could ever be worth.
+  function maybeThank(stats) {
+    const box = root && root.querySelector(".sponsor");
+    if (!box || !stats || (stats.videos || 0) < SPONSOR_AFTER_VIDEOS) return;
+    api.storage.local.get({ sponsorDismissed: false, sponsorShown: 0 }).then((s) => {
+      if (s.sponsorDismissed || s.sponsorShown >= SPONSOR_MAX_SHOWS) return;
+      const hours = Number(stats.saved_hours || 0);
+      const hoursText = hours >= 1
+        ? `about ${hours % 1 === 0 ? hours : hours.toFixed(1)} hours`
+        : "a good chunk of time";
+      box.innerHTML = `
+        <div>You've TL;DW'd <strong>${esc(String(stats.videos))} videos</strong> —
+          ${esc(hoursText)} you didn't have to watch.</div>
+        <div class="srow">
+          <a class="sbtn" href="${esc(SPONSOR_URL)}" target="_blank"
+             rel="noopener noreferrer">💛 Sponsor on GitHub</a>
+          <button class="sdismiss">No thanks — don't ask again</button>
+        </div>`;
+      box.hidden = false;
+      box.querySelector(".sdismiss").onclick = () => {
+        box.hidden = true;
+        api.storage.local.set({ sponsorDismissed: true }).catch(() => {});
+      };
+      // Following the link is as good as dismissing it.
+      box.querySelector(".sbtn").onclick = () => {
+        api.storage.local.set({ sponsorDismissed: true }).catch(() => {});
+      };
+      api.storage.local.set({ sponsorShown: (s.sponsorShown || 0) + 1 }).catch(() => {});
+    }).catch(() => {});
   }
 
   // --- Follow-up Q&A ------------------------------------------------------------

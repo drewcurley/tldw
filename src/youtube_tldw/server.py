@@ -375,6 +375,8 @@ class _Handler(BaseHTTPRequestHandler):
                 summary = core.summarize_url(
                     url, ratio, lang, timeout=REQUEST_TIMEOUT,
                     max_chars=SINGLE_PASS_CHARS, on_progress=self._logger(start))
+                usage.note_video(summary.meta.video_id, summary.meta.duration_ms,
+                                 textmode.summary_word_count(summary.result))
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
             print(f"  failed ({status}) in {time.monotonic()-start:.1f}s: {exc}", flush=True)
@@ -407,6 +409,8 @@ class _Handler(BaseHTTPRequestHandler):
                 summary = core.summarize_url(
                     url, ratio, lang, timeout=REQUEST_TIMEOUT,
                     max_chars=SINGLE_PASS_CHARS, on_progress=progress)
+                usage.note_video(summary.meta.video_id, summary.meta.duration_ms,
+                                 textmode.summary_word_count(summary.result))
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
             print(f"  failed ({status}) in {time.monotonic()-start:.1f}s: {exc}", flush=True)
@@ -422,7 +426,7 @@ class _Handler(BaseHTTPRequestHandler):
             # Kick off segment selection in the background so "play key moments" is
             # ready by the time the user reads the summary.
             _start_seg_prefetch(summary.meta, summary.cues)
-        emit({"type": "result", **_to_payload(summary)})
+        emit({"type": "result", **_to_payload(summary), "stats": usage.stats()})
 
     def _validate_speak(self, body: dict):
         """Return (script, voice) or None (after sending the proper error status)."""
