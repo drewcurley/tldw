@@ -5,6 +5,10 @@
 Turn a YouTube video into a succinct **TL;DW** — either as Markdown text or as a
 recut MP4 of just the key moments.
 
+From the browser extension you can also **listen** to the summary (local neural TTS,
+streamed as it renders), **skip the real player** through only the key moments, and
+**ask follow-up questions** about the video with clickable `[12:34]` citations.
+
 **Use any model you like** → [Choose your model](#choose-your-model):
 
 - **Local** (Ollama / any local server) — fully offline, no keys, no cost
@@ -21,6 +25,9 @@ recut MP4 of just the key moments.
    **video mode** → the model picks the key cue ranges, `ffmpeg` cuts them from the
    source and stitches them with crossfades (a deliberate visual signal that
    content was skipped), and saves an `.mp4`.
+5. **`tldw serve` + the extension** → the same pipeline over a loopback HTTP API,
+   which additionally keeps the transcript cached so follow-up questions are answered
+   without re-fetching the video.
 
 ## Requirements
 
@@ -97,6 +104,15 @@ tldw "https://youtu.be/VIDEO_ID" --mode video --max-length 5m --burn-captions
 # Force a target compression and keep the original download
 tldw "https://youtu.be/VIDEO_ID" --mode video --ratio 0.2 --keep-source
 ```
+
+### Commands
+
+| Command | What it does |
+|---------|--------------|
+| `tldw URL [options]` | Summarize one video to text or a recut video. |
+| `tldw serve` | Loopback HTTP API for the browser extension. |
+| `tldw usage` | Tokens, cost, and hours saved — see [Token usage and cost](#token-usage-and-cost). |
+| `tldw config` | Persistent settings (default output dir, model backend). |
 
 ### Options
 
@@ -254,10 +270,18 @@ use the CLI instead.
 
 ## Browser extension
 
-One toolbar click on a YouTube page summarizes the video in an on-page modal, and from
-there you can also **🔊 Listen** (text-to-speech of the summary) or **⏭ Play key
-moments** (auto-skip the real YouTube player through just the key segments). Powered by
-a small local server:
+One toolbar click on a YouTube page summarizes the video in an on-page modal. From
+there you can also:
+
+- **🔊 Listen** — local neural TTS of the summary, which starts playing about a second
+  in rather than after the whole clip renders. **▶ Preview** auditions a voice, **⏹ Stop**
+  abandons a render, and **⬇** saves the finished mp3.
+- **⏭ Play key moments** — auto-skip the real YouTube player through just the key
+  segments.
+- **💬 Ask about this video** — follow-up questions answered from the transcript, citing
+  `[12:34]` moments you can click to jump the player there.
+
+Powered by a small local server:
 
 ```bash
 tldw serve            # prints a bearer token (saved + reused); binds 127.0.0.1:8765
@@ -281,6 +305,10 @@ their own model (no hosted/shared server).
 pip install -e ".[dev]"
 pytest
 ```
+
+The extension's HTML-building and state logic is covered by tests that shell out to
+`node` (`tests/test_extension_render.py`); they skip automatically if `node` isn't
+installed.
 
 All external tools (the model backend, `yt-dlp`, `ffmpeg`) run through a single
 `subprocess` chokepoint with `shell=False`; untrusted data (titles, transcripts,

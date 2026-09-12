@@ -2,7 +2,8 @@
 
 An MV3 extension (Chromium **and** Firefox) that summarizes the YouTube video you're
 watching by calling your **local `tldw` server** — summary in an on-page modal, plus
-Listen (TTS) and Play-key-moments.
+Listen (streaming TTS, with an mp3 download), Play-key-moments, and follow-up
+questions about the video.
 
 ## Setup
 
@@ -35,33 +36,31 @@ Listen (TTS) and Play-key-moments.
 - Open any YouTube `/watch` page → click the **TL;DW** toolbar button.
 - A modal shows the title, key points, and summary (~20s; transcript fetch + Claude).
 - **Copy** grabs the markdown; **Esc** or click-outside closes.
-Closing the panel while something is running no longer cancels it. Summaries, key
-moments, speech and answers all keep going in the background — a summary that lands
-while the panel is closed shows a small notice you can click to read it, and
-re-opening mid-run re-attaches to the work already in flight rather than starting
-it again. Options has a **"If you close the panel while it's still working"**
-setting if you'd rather it stopped and discarded.
-
-- **💬 Ask about this video** opens a chat under the summary. Questions are
-  answered from the video's transcript, which the server already has cached, so
-  the first answer starts in a few seconds. Answers cite moments as `[12:34]` —
-  click one to jump the player there. Anything the model adds from outside the
-  video is labelled "Not in the video:". ⏹ Stop abandons an answer mid-stream.
-Once a clip has finished synthesizing, a **⬇** button appears beside the player and
-saves it as `{video title} - {channel} - tldw version.mp3`. (It sits next to the
-player rather than inside the control bar — native `<audio controls>` renders its
-own shadow UI, which page script can't add to.)
-
 - **🔊 Listen to summary** synthesizes the summary to speech (local Piper TTS) and
   plays it in the modal. Playback starts on the first second of audio and the rest
-  streams in behind it, so a long summary doesn't sit silent while it renders.
-  Pick a voice (US/UK, male/female) right there — **▶ Preview** plays a sample of
-  the selected voice — or set a default in options. First use of a voice downloads
-  its model (~once).
+  streams in behind it, so a long summary doesn't sit silent while it renders. Pick a
+  voice (US/UK, male/female) right there — **▶ Preview** auditions one — or set a
+  default in options. **⏹ Stop** abandons a render and frees the voice picker. Once a
+  clip is complete, **⬇** saves it as `{video title} - {channel} - tldw version.mp3`.
+  First use of a voice downloads its model (~once).
 - **⏭ Play key moments** finds the key segments (transcript + Claude — no download,
   no recut) and **auto-skips the YouTube player through just those moments**, in full
   quality in your own player. A floating pill shows progress (e.g. "Key moment 2/5")
   with a ✕ to stop.
+- **💬 Ask about this video** opens a chat under the summary. Questions are answered
+  from the transcript the server already has cached, so the first answer starts in a
+  few seconds. Answers cite moments as `[12:34]` — click one to jump the player
+  there. Anything the model adds from outside the video is labelled "Not in the
+  video:". **⏹ Stop** abandons an answer mid-stream.
+
+### Closing the panel mid-run
+
+Closing the panel doesn't cancel what's running. Summaries, key moments, speech and
+answers all keep going in the background — useful when you close the modal just to
+pause or scrub the video. A summary that finishes while the panel is closed shows a
+small notice you can click to read it, and re-opening mid-run re-attaches to the work
+already in flight rather than starting it over. Options has an **"If you close the
+panel while it's still working"** setting if you'd rather it stopped and discarded.
 
 ## How it stays local & safe
 
