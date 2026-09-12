@@ -39,6 +39,7 @@
   let closeAction = "continue";          // "continue" | "abort"
   let backgrounded = false;              // panel closed while a summary was running
   let currentVideoId = null;
+  let lastProgress = null;               // last progress event of the running summary
   api.storage.local.get({ closeAction: "continue" })
     .then((s) => { closeAction = s.closeAction === "abort" ? "abort" : "continue"; })
     .catch(() => {});
@@ -107,7 +108,11 @@
   }
 
   function mount() {
-    close();
+    // unmount(), NOT close(): close() decides what to do with in-flight work, and
+    // re-mounting is not a decision about that. It used to call close(), so
+    // re-opening the panel mid-run immediately re-flagged the run as backgrounded
+    // and the result was stashed instead of rendered into the modal you just opened.
+    unmount();
     lastFocused = document.activeElement;
     host = document.createElement("div");
     host.id = "tldw-host";
@@ -322,6 +327,11 @@
   }
 
   function startSummarize(url, videoId) {
+    // A new run abandons whatever the last one left connected (mount() no longer
+    // does this, and it must not — see the comment there).
+    clearTimers();
+    if (port) { try { port.disconnect(); } catch (_) {} port = null; }
+    lastProgress = null;
     showLoading();
     requestActive = true;
     currentVideoId = videoId;
@@ -329,7 +339,11 @@
     port = api.runtime.connect({ name: "tldw" });
     port.onMessage.addListener((m) => {
       if (!requestActive) return;
-      if (m.type === "progress") { updateProgress(m.message, m.percent, m.creep); return; }
+      if (m.type === "progress") {
+        lastProgress = m;          // replayed if the panel is re-opened mid-run
+        updateProgress(m.message, m.percent, m.creep);
+        return;
+      }
       requestActive = false;
       if (m.type === "result") {
         if (backgrounded) { lastPayload = m.payload; endBackground("TL;DW summary ready"); }
@@ -1283,8 +1297,14 @@
       // Re-open instantly if we already summarized this video this page-session.
       if (lastPayload && lastPayload.video_id === msg.videoId) showResult(lastPayload, true);
       else if (requestActive && currentVideoId === msg.videoId) {
-        backgrounded = false;          // re-attach to the run already in flight
-        showLoading();                 // its port keeps driving the progress bar
+        // Re-attach to the run already in flight. Restore where it had got to:
+        // the long Claude step sends ONE progress event and then goes quiet for a
+        // minute, so without this the bar sits at "Starting… 0%" until the result.
+        backgrounded = false;
+        showLoading();
+        if (lastProgress) {
+          updateProgress(lastProgress.message, lastProgress.percent, lastProgress.creep);
+        }
       } else startSummarize(msg.url, msg.videoId);
     } else if (msg.type === "TLDW_ERROR") showError(msg.error);
   });

@@ -123,6 +123,33 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
     /port\.disconnect/.test(bg), false);
 }
 
+// --- re-opening the panel mid-run must not re-flag the run as backgrounded ---
+// mount() used to call close(). close() decides what to do with in-flight work, so
+// re-opening immediately marked the run backgrounded again and the summary was
+// stashed silently instead of rendering into the modal that had just been opened.
+{
+  const mountBody = src.slice(src.indexOf("  function mount()"),
+                              src.indexOf("  function showLoading()"));
+  // Only the prologue matters — mount() legitimately *registers* close() as the
+  // backdrop and ✕ handler further down.
+  const stripComments = (t) => t.replace(/\/\/[^\n]*/g, "");
+  const prologue = stripComments(
+    mountBody.slice(0, mountBody.indexOf("host = document.createElement")));
+  check("mount() does not run the close() policy before rendering",
+    /close\(\)/.test(prologue), false);
+  check("mount() unmounts instead", /unmount\(\)/.test(prologue), true);
+
+  const startBody = src.slice(src.indexOf("  function startSummarize("),
+                              src.indexOf("  function endBackground("));
+  check("a new run retires the previous run's port itself",
+    /port\.disconnect/.test(startBody) && /clearTimers\(\)/.test(startBody), true);
+
+  check("progress is remembered so a re-attach can restore it",
+    /lastProgress = m;/.test(src), true);
+  check("re-attach replays the remembered progress",
+    /backgrounded = false;[\s\S]{0,400}updateProgress\(lastProgress\.message/.test(src), true);
+}
+
 if (failures.length) {
   console.log("FAILURES:\n" + failures.join("\n"));
   process.exit(1);
