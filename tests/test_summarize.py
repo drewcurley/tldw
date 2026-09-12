@@ -90,7 +90,7 @@ def test_format_cues_listing():
 def test_summarize_text_single_pass(monkeypatch):
     seen = {}
 
-    def fake_ask(prompt, payload, *, validate, timeout):
+    def fake_ask(prompt, payload, *, validate, timeout, step=None):
         seen["payload"] = payload
         return validate({"key_points": ["k"], "summary": "s", "chosen_ratio": 0.2})
 
@@ -102,7 +102,7 @@ def test_summarize_text_single_pass(monkeypatch):
 
 
 def test_select_video_single_pass(monkeypatch):
-    def fake_ask(prompt, payload, *, validate, timeout):
+    def fake_ask(prompt, payload, *, validate, timeout, step=None):
         return validate({"segments": [{"first_cue": 0, "last_cue": 1}]})
 
     monkeypatch.setattr(summarize, "ask_json", fake_ask)
@@ -114,7 +114,7 @@ def test_select_video_on_segment_found_fires_streaming(monkeypatch):
     """on_segment_found is called for each segment in the streaming path."""
     found = []
 
-    def fake_stream(prompt, stdin, *, on_segment, timeout):
+    def fake_stream(prompt, stdin, *, on_segment, timeout, step=None):
         on_segment({"first_cue": 0, "last_cue": 1, "reason": "a"})
         on_segment({"first_cue": 2, "last_cue": 2, "reason": "b"})
         return {"chosen_ratio": 0.3, "rationale": "ok"}
@@ -135,7 +135,7 @@ def test_select_video_chunked_clamps_to_window(monkeypatch):
     # to the chunk's own range so spans never point at an unrelated timeline part.
     monkeypatch.setattr(summarize, "SINGLE_PASS_CHARS", 5)
 
-    def fake_ask(prompt, payload, *, validate, timeout):
+    def fake_ask(prompt, payload, *, validate, timeout, step=None):
         return validate({"segments": [{"first_cue": 0, "last_cue": 999}]})
 
     monkeypatch.setattr(summarize, "ask_json", fake_ask)
@@ -151,7 +151,7 @@ def test_summarize_text_map_reduce(monkeypatch):
     monkeypatch.setattr(summarize, "SINGLE_PASS_CHARS", 5)
     calls = {"n": 0}
 
-    def fake_ask(prompt, payload, *, validate, timeout):
+    def fake_ask(prompt, payload, *, validate, timeout, step=None):
         calls["n"] += 1
         return validate({"key_points": ["k"], "summary": "s"})
 

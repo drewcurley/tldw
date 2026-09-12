@@ -6,6 +6,7 @@ import argparse
 import os
 import shutil
 import sys
+import time
 import tempfile
 from pathlib import Path
 
@@ -340,11 +341,93 @@ def _run_config(args: list[str]) -> int:
     return 1
 
 
+def _run_usage(argv: list[str]) -> int:
+    """`tldw usage` — what the model calls have actually cost."""
+    from . import usage as usage_mod
+    p = argparse.ArgumentParser(
+        prog="tldw usage",
+        description="Token and cost totals for recorded model calls.")
+    p.add_argument("--days", type=float, default=None,
+                   help="only calls from the last N days")
+    p.add_argument("--by-video", action="store_true",
+                   help="one line per video instead of the summary")
+    p.add_argument("--file", default=None, help="read a specific usage.jsonl")
+    args = p.parse_args(argv)
+
+    path = Path(args.file) if args.file else None
+    rows = usage_mod.read_rows(path)
+    if args.days is not None:
+        cutoff = time.time() - args.days * 86400
+        rows = [r for r in rows if float(r.get("ts") or 0) >= cutoff]
+    if not rows:
+        print("No usage recorded yet." if not args.days
+              else f"No usage recorded in the last {args.days:g} day(s).")
+        print(f"(reading {path or usage_mod.USAGE_FILE})")
+        return 0
+
+    def billed(r):
+        return (int(r.get("input_tokens") or 0) + int(r.get("cache_creation_tokens") or 0)
+                + int(r.get("cache_read_tokens") or 0))
+
+    total_cost = sum(float(r.get("cost_usd") or 0) for r in rows)
+    print(f"{len(rows)} model call(s) over "
+          f"{len({r.get('video_id') for r in rows if r.get('video_id')})} video(s)"
+          f" — ${total_cost:.2f} total")
+    print()
+
+    if args.by_video:
+        per: dict = {}
+        for r in rows:
+            vid = r.get("video_id") or "(none)"
+            e = per.setdefault(vid, {"calls": 0, "in": 0, "out": 0, "cost": 0.0})
+            e["calls"] += 1
+            e["in"] += billed(r)
+            e["out"] += int(r.get("output_tokens") or 0)
+            e["cost"] += float(r.get("cost_usd") or 0)
+        print(f"{'video':<14} {'calls':>5} {'in':>12} {'out':>8} {'cost':>9}")
+        for vid, e in sorted(per.items(), key=lambda kv: -kv[1]["cost"]):
+            print(f"{vid:<14} {e['calls']:>5} {e['in']:>12,} {e['out']:>8,} "
+                  f"${e['cost']:>8.4f}")
+        return 0
+
+    print(f"{'step':<16} {'calls':>5} {'in (avg)':>12} {'cached':>12} "
+          f"{'out (avg)':>10} {'$ avg':>9} {'$ total':>9}")
+    by_step: dict = {}
+    for r in rows:
+        by_step.setdefault(r.get("step") or "?", []).append(r)
+    for step, rs in sorted(by_step.items(), key=lambda kv: -sum(
+            float(r.get("cost_usd") or 0) for r in kv[1])):
+        n = len(rs)
+        print(f"{step:<16} {n:>5} {sum(billed(r) for r in rs)//n:>12,} "
+              f"{sum(int(r.get('cache_read_tokens') or 0) for r in rs)//n:>12,} "
+              f"{sum(int(r.get('output_tokens') or 0) for r in rs)//n:>10,} "
+              f"${sum(float(r.get('cost_usd') or 0) for r in rs)/n:>8.4f} "
+              f"${sum(float(r.get('cost_usd') or 0) for r in rs):>8.4f}")
+
+    # What a video costs end to end is the question worth answering.
+    per_video: dict = {}
+    for r in rows:
+        if r.get("video_id"):
+            per_video.setdefault(r["video_id"], 0.0)
+            per_video[r["video_id"]] += float(r.get("cost_usd") or 0)
+    if per_video:
+        costs = sorted(per_video.values())
+        mid = costs[len(costs) // 2]
+        p95 = costs[min(len(costs) - 1, int(len(costs) * 0.95))]
+        print()
+        print(f"per video: median ${mid:.4f} · mean "
+              f"${sum(costs)/len(costs):.4f} · p95 ${p95:.4f} · max ${costs[-1]:.4f}")
+    print(f"\n(from {path or usage_mod.USAGE_FILE})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     # Dispatch `config` and `serve` before argparse so `tldw <url>` stays unchanged.
     if argv and argv[0] == "config":
         return _run_config(argv[1:])
+    if argv and argv[0] == "usage":
+        return _run_usage(argv[1:])
     if argv and argv[0] == "serve":
         from . import server
         sargs = _serve_parser().parse_args(argv[1:])

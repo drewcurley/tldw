@@ -172,6 +172,21 @@ few seconds to the first words.
 Transcripts are cached in the server's memory for 4 hours, and an active
 conversation renews its own — so questions don't re-fetch the video.
 
+## Token usage and cost
+
+Every model call is recorded to `~/.config/youtube-tldw/usage.jsonl` — step, token
+counts (including how much was served from cache), cost and duration — and summarized
+on the server log as it happens. Piper TTS and yt-dlp cost nothing; the only model
+calls are the summary, segment selection, and questions.
+
+```bash
+tldw usage
+```
+
+`--by-video` breaks it down per video, `--days N` limits the window. Follow-up
+questions resume the video's existing model session, so only the new question is
+sent rather than the whole transcript again.
+
 ## Output
 
 ```

@@ -36,6 +36,9 @@ _cache_lock = threading.Lock()
 _transcript_cache: dict = {}    # video_id -> (expires_at, meta, cues)
 _seg_cache: dict = {}           # video_id -> (expires_at, meta, segments)
 _seg_prefetch_events: dict = {} # video_id -> threading.Event (while prefetch is running)
+# video_id -> (expires_at, session_id): the model-side conversation for this video.
+# Resuming it means a follow-up question doesn't re-send the transcript.
+_ask_sessions: dict = {}
 
 
 def _prune(cache: dict) -> None:
@@ -86,6 +89,18 @@ def _seg_cache_get(video_id: str):
         return None
 
 
+def _session_get(video_id: str):
+    with _cache_lock:
+        entry = _ask_sessions.get(video_id)
+        return entry[1] if entry and entry[0] > time.monotonic() else None
+
+
+def _session_put(video_id: str, session_id: str) -> None:
+    with _cache_lock:
+        _ask_sessions[video_id] = (time.monotonic() + _CACHE_TTL, session_id)
+        _prune(_ask_sessions)
+
+
 def _start_seg_prefetch(meta, cues: list) -> None:
     """Start background segment selection. No-op if one is already running for this video.
     Stores a threading.Event in _seg_prefetch_events so _run_segments can wait instead
@@ -100,11 +115,12 @@ def _start_seg_prefetch(meta, cues: list) -> None:
     def _run():
         from . import metadata as _md
         try:
-            _meta, segs = core.select_segments(
-                _md.watch_url(vid), None, "en",
-                timeout=SEGMENTS_TIMEOUT,
-                _prefetched=(meta, cues),
-            )
+            with usage.interaction("segments", vid):
+                _meta, segs = core.select_segments(
+                    _md.watch_url(vid), None, "en",
+                    timeout=SEGMENTS_TIMEOUT,
+                    _prefetched=(meta, cues),
+                )
             _seg_cache_put(vid, _meta, segs)
             print(f"  prefetched {len(segs)} segments for {vid}", flush=True)
         except Exception as exc:
@@ -126,7 +142,7 @@ from . import (
     __version__,
 )
 from . import metadata as md
-from . import ask, audio, core, textmode
+from . import ask, audio, core, textmode, usage
 from .summarize import SINGLE_PASS_CHARS
 from .urls import canonical_video_id
 from .timing import format_length, parse_duration
@@ -180,6 +196,14 @@ _STATUS = {
 class _ClientGone(Exception):
     """Raised out of a streaming callback once the client has hung up, so the work
     behind it unwinds instead of running to completion into a dead socket."""
+
+
+def _vid_of(url: str) -> str:
+    """Best-effort video id for usage attribution; never raises."""
+    try:
+        return canonical_video_id(url)
+    except TldrError:
+        return ""
 
 
 def _origin_allowed(origin: str | None, pinned: str | None) -> bool:
@@ -347,9 +371,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _run_buffered(self, url, ratio, lang) -> None:
         start = time.monotonic()
         try:
-            summary = core.summarize_url(
-                url, ratio, lang, timeout=REQUEST_TIMEOUT,
-                max_chars=SINGLE_PASS_CHARS, on_progress=self._logger(start))
+            with usage.interaction("summarize", _vid_of(url)):
+                summary = core.summarize_url(
+                    url, ratio, lang, timeout=REQUEST_TIMEOUT,
+                    max_chars=SINGLE_PASS_CHARS, on_progress=self._logger(start))
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
             print(f"  failed ({status}) in {time.monotonic()-start:.1f}s: {exc}", flush=True)
@@ -378,9 +403,10 @@ class _Handler(BaseHTTPRequestHandler):
             emit({"type": "progress", "message": m, "percent": pct, "creep": creep})
 
         try:
-            summary = core.summarize_url(
-                url, ratio, lang, timeout=REQUEST_TIMEOUT,
-                max_chars=SINGLE_PASS_CHARS, on_progress=progress)
+            with usage.interaction("summarize", _vid_of(url)):
+                summary = core.summarize_url(
+                    url, ratio, lang, timeout=REQUEST_TIMEOUT,
+                    max_chars=SINGLE_PASS_CHARS, on_progress=progress)
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
             print(f"  failed ({status}) in {time.monotonic()-start:.1f}s: {exc}", flush=True)
@@ -516,11 +542,12 @@ class _Handler(BaseHTTPRequestHandler):
             emit({"type": "segment_added", "segment": seg})
 
         try:
-            meta, segments = core.select_segments(
-                url, ratio, lang, max_length_ms=max_ms,
-                timeout=SEGMENTS_TIMEOUT, on_progress=progress,
-                on_segment_ready=_on_segment_ready,
-                _prefetched=prefetched)
+            with usage.interaction("segments", vid or ""):
+                meta, segments = core.select_segments(
+                    url, ratio, lang, max_length_ms=max_ms,
+                    timeout=SEGMENTS_TIMEOUT, on_progress=progress,
+                    on_segment_ready=_on_segment_ready,
+                    _prefetched=prefetched)
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
             print(f"  segments failed ({status}) in {time.monotonic()-start:.1f}s: {exc}",
@@ -678,6 +705,8 @@ class _Handler(BaseHTTPRequestHandler):
             tlog(m)
             emit({"type": "progress", "message": m, "percent": pct})
 
+        ask_scope = usage.interaction("ask", vid)
+        ask_scope.__enter__()
         try:
             # Touch on read: an active conversation keeps its transcript alive.
             hit = _cache_get(vid, touch=True)
@@ -697,9 +726,13 @@ class _Handler(BaseHTTPRequestHandler):
                 if gone.is_set():
                     raise _ClientGone      # stop the model, don't just stop writing
 
+            resume = _session_get(vid)
+            if resume:
+                tlog("resuming this video's conversation (no transcript re-sent)")
             answered = ask.stream_answer(
                 meta, cues, history, question, timeout=ASK_TIMEOUT,
-                on_delta=on_delta)
+                on_delta=on_delta, session_id=resume,
+                on_session=lambda sid: _session_put(vid, sid))
         except _ClientGone:
             print(f"  ask stopped by client after {time.monotonic()-start:.1f}s",
                   flush=True)
@@ -714,6 +747,8 @@ class _Handler(BaseHTTPRequestHandler):
             print(f"  unexpected ask error: {exc!r}", flush=True)
             emit({"type": "error", "status": 500, "error": "internal error"})
             return
+        finally:
+            ask_scope.__exit__(None, None, None)
         if gone.is_set():
             print(f"  ask stopped by client after {time.monotonic()-start:.1f}s",
                   flush=True)

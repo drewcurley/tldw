@@ -26,10 +26,11 @@ EXT_ORIGIN = "chrome-extension://abcdefghijklmnop"
 
 @pytest.fixture(autouse=True)
 def _clear_caches():
-    for cache in (server._transcript_cache, server._seg_cache):
+    caches = (server._transcript_cache, server._seg_cache, server._ask_sessions)
+    for cache in caches:
         cache.clear()
     yield
-    for cache in (server._transcript_cache, server._seg_cache):
+    for cache in caches:
         cache.clear()
 
 
@@ -476,8 +477,8 @@ def test_ask_streams_progress_then_deltas(srv, monkeypatch):
     _, port = srv
     _stub_transcript(monkeypatch)
     monkeypatch.setattr(server.ask, "stream_answer",
-                        lambda meta, cues, history, q, *, timeout=None, on_delta=None:
-                        [on_delta(t) for t in ("It ", "covers ", "DNS [12:34].")] and "")
+                        lambda meta, cues, history, q, **k:
+                        [k["on_delta"](t) for t in ("It ", "covers ", "DNS [12:34].")] and "")
     events = _read_ndjson(port, _ask_body(), _auth(), path="/ask/stream")
     types = [e["type"] for e in events]
     assert types[-1] == "answer_done"
@@ -503,7 +504,8 @@ def test_ask_passes_history_through_to_the_model(srv, monkeypatch):
     _stub_transcript(monkeypatch)
     seen = {}
 
-    def capture(meta, cues, history, q, *, timeout=None, on_delta=None):
+    def capture(meta, cues, history, q, *, timeout=None, on_delta=None,
+                session_id=None, on_session=None):
         seen["history"], seen["question"] = history, q
         on_delta("ok")
         return "ok"
@@ -519,7 +521,8 @@ def test_ask_reports_model_failure_mid_answer(srv, monkeypatch):
     _, port = srv
     _stub_transcript(monkeypatch)
 
-    def boom(meta, cues, history, q, *, timeout=None, on_delta=None):
+    def boom(meta, cues, history, q, *, timeout=None, on_delta=None,
+             session_id=None, on_session=None):
         on_delta("partial ")
         raise ClaudeError("model exploded")
 
@@ -545,6 +548,35 @@ def test_ask_rejects_bad_requests(srv, monkeypatch):
         assert status == expect, body
 
 
+def test_ask_resumes_this_video_conversation(srv, monkeypatch):
+    """First question opens a session; the next one resumes it instead of
+    re-sending the transcript."""
+    _, port = srv
+    _stub_transcript(monkeypatch)
+    seen = []
+
+    def answer(meta, cues, history, q, *, timeout=None, on_delta=None,
+               session_id=None, on_session=None):
+        seen.append(session_id)
+        if on_session:
+            on_session("sess-abc")
+        on_delta("ok")
+        return "ok"
+
+    monkeypatch.setattr(server.ask, "stream_answer", answer)
+    _read_ndjson(port, _ask_body(), _auth(), path="/ask/stream")
+    _read_ndjson(port, _ask_body(question="follow up?"), _auth(), path="/ask/stream")
+    assert seen == [None, "sess-abc"]
+
+    # A different video must not inherit it.
+    other = _ask_body(url="https://youtu.be/aircAruvnKk", question="other?")
+    monkeypatch.setattr(server.core, "fetch_transcript",
+                        lambda vid, lang="en", **k: (
+                            VideoMeta(vid, "T", "C", 1000, {}, {}), []))
+    _read_ndjson(port, other, _auth(), path="/ask/stream")
+    assert seen[-1] is None
+
+
 def test_ask_requires_token(srv):
     _, port = srv
     status, _, _ = _req(port, "POST", "/ask/stream", _ask_body(),
@@ -559,7 +591,8 @@ def test_ask_stops_when_the_client_disconnects(srv, monkeypatch):
     _stub_transcript(monkeypatch)
     state = {"aborted": False, "ran_to_end": False}
 
-    def slow(meta, cues, history, q, *, timeout=None, on_delta=None):
+    def slow(meta, cues, history, q, *, timeout=None, on_delta=None,
+             session_id=None, on_session=None):
         try:
             for _ in range(400):
                 on_delta("word " * 200)     # raises _ClientGone once the peer is gone
