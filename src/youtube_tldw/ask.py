@@ -10,6 +10,7 @@ from its own knowledge, so an answer can always be checked against the video.
 
 from __future__ import annotations
 
+from . import TldrError
 from .claude_client import ask_text, stream_text
 from .timing import format_clock
 
@@ -63,6 +64,18 @@ def trim_history(history) -> list[dict]:
     return clean[-MAX_HISTORY_TURNS:]
 
 
+_FOLLOW_UP_PROMPT = """Another question about the same video. The transcript and the
+rules you were given still apply: answer from the transcript and cite the moments
+you use as [m:ss], and label anything from your own knowledge with
+"Not in the video:". Reply with the answer only."""
+
+
+def follow_up_payload(question: str) -> str:
+    """A resumed session already holds the transcript and the conversation, so a
+    follow-up carries nothing but the question."""
+    return "QUESTION\n" + question.strip()[:MAX_QUESTION_CHARS]
+
+
 def build_payload(meta, cues, history, question: str) -> str:
     """The stdin payload: metadata, transcript, prior turns, then the question."""
     parts = [f"TITLE: {meta.title}", f"CHANNEL: {meta.channel}", "",
@@ -78,17 +91,48 @@ def build_payload(meta, cues, history, question: str) -> str:
 
 
 def stream_answer(meta, cues, history, question: str, *,
-                  timeout: float = ANSWER_TIMEOUT, on_delta=None) -> str:
+                  timeout: float = ANSWER_TIMEOUT, on_delta=None,
+                  session_id: str | None = None, on_session=None) -> str:
     """Answer `question` about this video, streaming the text as it arrives.
 
     on_delta(text) fires per piece. Backends that can't stream (a custom
     TLDW_LLM_CMD) answer in one shot, delivered as a single delta.
+
+    session_id resumes the conversation this video already has with the model. That
+    session holds the transcript and the prior turns, so only the new question is
+    sent — the difference between re-sending a whole transcript and not. on_session
+    receives the session id to resume next time. A stale id falls back to a full
+    call rather than failing the question.
     """
-    payload = build_payload(meta, cues, history, question)
     emit = on_delta or (lambda _t: None)
+    seen = {}
+
+    def meta_cb(info):
+        if info.get("session_id"):
+            seen["session_id"] = info["session_id"]
+
+    def run(resume):
+        payload = (follow_up_payload(question) if resume
+                   else build_payload(meta, cues, history, question))
+        try:
+            return stream_text(_PROMPT if not resume else _FOLLOW_UP_PROMPT, payload,
+                               on_delta=emit, timeout=timeout, step="ask",
+                               resume=resume, on_meta=meta_cb)
+        except NotImplementedError:
+            answer = ask_text(_PROMPT, build_payload(meta, cues, history, question),
+                              timeout=timeout, step="ask")
+            emit(answer)
+            return answer
+
     try:
-        return stream_text(_PROMPT, payload, on_delta=emit, timeout=timeout)
-    except NotImplementedError:
-        answer = ask_text(_PROMPT, payload, timeout=timeout)
-        emit(answer)
-        return answer
+        answer = run(session_id)
+    except TldrError:
+        if not session_id:
+            raise
+        # The session is gone (pruned, or a different working directory). Start over
+        # with the full transcript rather than losing the question.
+        seen.pop("session_id", None)
+        answer = run(None)
+    if on_session and seen.get("session_id"):
+        on_session(seen["session_id"])
+    return answer

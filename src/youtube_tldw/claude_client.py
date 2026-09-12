@@ -22,7 +22,7 @@ import time
 from typing import Callable
 
 from . import ClaudeError, TldrError, TldrTimeoutError
-from . import config
+from . import config, usage
 from .proc import run
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -55,6 +55,19 @@ def _raw_extract(stdout: str) -> str:
     if not text:
         raise ClaudeError("The LLM command returned no output.")
     return text
+
+
+def _record_envelope(stdout: str, step: str) -> None:
+    """Log the token counts a claude CLI envelope carries. Custom backends report
+    none, so there is simply nothing to record for them."""
+    if not is_claude_cli():
+        return
+    try:
+        envelope = json.loads(stdout.strip())
+    except (ValueError, AttributeError):
+        return
+    if isinstance(envelope, dict) and envelope.get("usage"):
+        usage.record(usage.parse_usage(envelope, step))
 
 
 def _backend() -> tuple[list[str], Callable[[str], str]]:
@@ -100,7 +113,8 @@ def _delta_text(event: dict) -> str:
     return ""
 
 
-def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float):
+def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
+                   step: str = "", resume: str | None = None, on_meta=None):
     """Yield the model's text deltas as the claude CLI produces them.
 
     Shared plumbing for every streaming caller: argv is a constant, the prompt and
@@ -116,6 +130,11 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float):
     # deltas; without it the CLI only emits one whole `assistant` message at the end.
     argv = ["claude", "-p", "--output-format", "stream-json", "--verbose",
             "--include-partial-messages"]
+    if resume:
+        # Continue an existing conversation: the transcript and the rules are
+        # already in that session, so only the new question rides on stdin. The id
+        # comes from a previous run of this same CLI, never from a request.
+        argv += ["--resume", str(resume)]
     full = prompt + "\n\n" + stdin_payload
 
     proc = subprocess.Popen(  # noqa: S603
@@ -150,6 +169,14 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float):
                 event = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if event.get("type") == "result":
+                u = usage.parse_usage(event, step)
+                u.resumed = bool(resume)
+                usage.record(u)
+                if on_meta:
+                    on_meta({"session_id": u.session_id, "usage": u})
+            elif event.get("type") == "system" and event.get("session_id") and on_meta:
+                on_meta({"session_id": event["session_id"]})   # available early
             text = _delta_text(event)
             if text:
                 saw_delta = True
@@ -195,7 +222,8 @@ def stream_ndjson_segments(
     """
     text_buf = ""
     done_data: dict = {}
-    for text in _stream_deltas(prompt, stdin_payload, timeout=timeout):
+    for text in _stream_deltas(prompt, stdin_payload, timeout=timeout,
+                               step="segments"):
         text_buf += text
         # Flush complete NDJSON lines from the accumulated buffer
         while "\n" in text_buf:
@@ -220,13 +248,19 @@ def stream_text(
     *,
     on_delta: Callable[[str], None],
     timeout: float = _DEFAULT_TIMEOUT,
+    step: str = "ask",
+    resume: str | None = None,
+    on_meta=None,
 ) -> str:
     """Stream a plain-text answer, calling on_delta for each piece as it arrives.
 
+    resume continues a prior session instead of re-sending its context; on_meta
+    receives {session_id, usage} so the caller can resume this one next time.
     Returns the full text. Raises NotImplementedError for custom backends.
     """
     parts: list[str] = []
-    gen = _stream_deltas(prompt, stdin_payload, timeout=timeout)
+    gen = _stream_deltas(prompt, stdin_payload, timeout=timeout, step=step,
+                         resume=resume, on_meta=on_meta)
     try:
         for text in gen:
             parts.append(text)
@@ -237,7 +271,8 @@ def stream_text(
 
 
 def ask_text(
-    prompt: str, stdin_payload: str, *, timeout: float = _DEFAULT_TIMEOUT
+    prompt: str, stdin_payload: str, *, timeout: float = _DEFAULT_TIMEOUT,
+    step: str = "ask",
 ) -> str:
     """Buffered plain-text answer — the fallback when the backend can't stream."""
     argv, extract = _backend()
@@ -247,6 +282,7 @@ def ask_text(
         raise                                    # surfaces as 504
     except TldrError as exc:
         raise ClaudeError(str(exc)) from exc     # non-zero exit etc. -> 502
+    _record_envelope(result.stdout, step)
     return extract(result.stdout)
 
 
@@ -256,6 +292,7 @@ def ask_json(
     *,
     validate: Callable[[dict], object],
     timeout: float = _DEFAULT_TIMEOUT,
+    step: str = "summarize",
 ) -> object:
     """Run claude, parse+validate JSON. One repair retry, then TldrError.
 
@@ -278,6 +315,7 @@ def ask_json(
             raise  # surfaces as 504, not swallowed by the retry
         except TldrError as exc:
             raise ClaudeError(str(exc)) from exc  # non-zero exit etc. -> 502
+        _record_envelope(result.stdout, step if attempt == 0 else f"{step}-retry")
         try:
             data = _parse_inner_json(extract(result.stdout))
             return validate(data)

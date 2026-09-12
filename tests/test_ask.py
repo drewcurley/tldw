@@ -1,6 +1,6 @@
 import pytest
 
-from youtube_tldw import ask
+from youtube_tldw import ClaudeError, ask
 from youtube_tldw.transcript import Cue
 
 
@@ -68,8 +68,12 @@ def test_prompt_states_the_grounding_and_citation_rules():
 def test_stream_answer_streams_deltas(monkeypatch):
     seen = {}
 
-    def fake_stream(prompt, payload, *, on_delta, timeout):
+    def fake_stream(prompt, payload, *, on_delta, timeout, step=None,
+                    resume=None, on_meta=None):
         seen["payload"] = payload
+        seen["resume"] = resume
+        if on_meta:
+            on_meta({"session_id": "sess-1"})
         for piece in ["It ", "covers ", "DNS [12:34]."]:
             on_delta(piece)
         return "It covers DNS [12:34]."
@@ -83,13 +87,62 @@ def test_stream_answer_streams_deltas(monkeypatch):
     assert "what about DNS?" in seen["payload"]
 
 
+def test_stream_answer_reports_the_session_for_reuse(monkeypatch):
+    """The first question's session id is what makes the next one cheap."""
+    def fake_stream(prompt, payload, *, on_delta, timeout, step=None,
+                    resume=None, on_meta=None):
+        on_meta({"session_id": "sess-42"})
+        on_delta("hi")
+        return "hi"
+
+    monkeypatch.setattr(ask, "stream_text", fake_stream)
+    got = []
+    ask.stream_answer(_Meta(), _cues(), [], "q?", on_session=got.append)
+    assert got == ["sess-42"]
+
+
+def test_resumed_question_sends_only_the_question(monkeypatch):
+    """The whole point: a resumed session already holds the transcript."""
+    seen = {}
+
+    def fake_stream(prompt, payload, *, on_delta, timeout, step=None,
+                    resume=None, on_meta=None):
+        seen["payload"], seen["resume"] = payload, resume
+        return "ok"
+
+    monkeypatch.setattr(ask, "stream_text", fake_stream)
+    ask.stream_answer(_Meta(), _cues(), [], "and DNS?", session_id="sess-9")
+    assert seen["resume"] == "sess-9"
+    assert "and DNS?" in seen["payload"]
+    assert "TRANSCRIPT" not in seen["payload"]      # not re-sent
+    assert "[12:34]" not in seen["payload"]
+
+
+def test_stale_session_falls_back_to_a_full_question(monkeypatch):
+    """A pruned session must cost a re-send, not the answer."""
+    calls = []
+
+    def fake_stream(prompt, payload, *, on_delta, timeout, step=None,
+                   resume=None, on_meta=None):
+        calls.append(resume)
+        if resume:
+            raise ClaudeError("No conversation found with session ID")
+        return "recovered"
+
+    monkeypatch.setattr(ask, "stream_text", fake_stream)
+    answer = ask.stream_answer(_Meta(), _cues(), [], "q?", session_id="gone")
+    assert answer == "recovered"
+    assert calls == ["gone", None]                  # retried without the session
+
+
 def test_stream_answer_falls_back_when_the_backend_cannot_stream(monkeypatch):
     """A custom TLDW_LLM_CMD has no streaming mode — answer in one shot."""
     def no_stream(*a, **k):
         raise NotImplementedError
 
     monkeypatch.setattr(ask, "stream_text", no_stream)
-    monkeypatch.setattr(ask, "ask_text", lambda p, payload, timeout=None: "buffered answer")
+    monkeypatch.setattr(ask, "ask_text",
+                        lambda p, payload, timeout=None, step=None: "buffered answer")
     got = []
     answer = ask.stream_answer(_Meta(), _cues(), [], "q?", on_delta=got.append)
     assert answer == "buffered answer"

@@ -230,7 +230,8 @@ def summarize_text(
     partials = []
     map_prompt = _TEXT_PROMPT.format(ratio_clause=_ratio_clause(None))
     for part in chunks:
-        res = ask_json(map_prompt, header + part, validate=_validate_text, timeout=timeout)
+        res = ask_json(map_prompt, header + part, validate=_validate_text,
+                       timeout=timeout, step="summarize-map")
         partials.append("- " + "\n- ".join(res.key_points) + "\n\n" + res.summary)
 
     reduce_prompt = _TEXT_REDUCE_PROMPT.format(ratio_clause=_ratio_clause(ratio))
@@ -296,6 +297,7 @@ def select_video_segments(
         return ask_json(
             prompt, header + listing,
             validate=_make_video_validator(len(cues)), timeout=timeout,
+            step="segments",
         )
 
     # Chunk cues but keep GLOBAL indices so spans stay on one timeline.
@@ -309,7 +311,7 @@ def select_video_segments(
         sel = ask_json(
             prompt, header + sub_listing,
             validate=_make_video_validator(len(cues), lo=group[0], hi=group[-1]),
-            timeout=timeout,
+            timeout=timeout, step="segments-chunk",
         )
         batch_ranges.extend(sel.ranges)
         if sel.chosen_ratio is not None:
