@@ -1,4 +1,5 @@
 import json
+import os
 import socket
 import threading
 import time
@@ -654,7 +655,10 @@ def test_token_persists_across_calls(monkeypatch, tmp_path):
     assert p1 and tf.exists()
     t2, p2 = server.load_or_create_token(None)
     assert t2 == t1 and p2                     # stable across restarts
-    assert oct(tf.stat().st_mode)[-3:] == "600"  # not world-readable
+    if os.name != "nt":
+        # Windows has no POSIX mode bits; the file is protected by the profile
+        # directory's ACLs instead. See config.restrict_to_owner.
+        assert oct(tf.stat().st_mode)[-3:] == "600"  # not world-readable
 
 
 def test_explicit_token_not_persisted(monkeypatch, tmp_path):

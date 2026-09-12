@@ -142,7 +142,7 @@ from . import (
     __version__,
 )
 from . import metadata as md
-from . import ask, audio, core, textmode, usage
+from . import ask, audio, config, core, textmode, usage
 from .summarize import SINGLE_PASS_CHARS
 from .urls import canonical_video_id
 from .timing import format_length, parse_duration
@@ -180,7 +180,7 @@ def load_or_create_token(explicit: str | None) -> tuple[str, bool]:
     token = secrets.token_urlsafe(32)
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     TOKEN_FILE.write_text(token)
-    os.chmod(TOKEN_FILE, 0o600)
+    config.restrict_to_owner(TOKEN_FILE)
     return token, True
 
 # Typed error -> HTTP status.

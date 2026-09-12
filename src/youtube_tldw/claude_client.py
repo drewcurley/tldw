@@ -42,7 +42,8 @@ def _extract_result_text(stdout: str) -> str:
     except json.JSONDecodeError as exc:
         raise ClaudeError("Could not parse Claude's response envelope.") from exc
     if envelope.get("is_error"):
-        raise ClaudeError(f"Claude reported an error: {envelope.get('subtype')}")
+        detail = envelope.get("result") or envelope.get("subtype") or "unknown error"
+        raise ClaudeError(f"Claude reported an error: {detail}")
     result = envelope.get("result")
     if not isinstance(result, str) or not result.strip():
         raise ClaudeError("Claude returned an empty result.")
@@ -68,6 +69,27 @@ def _record_envelope(stdout: str, step: str) -> None:
         return
     if isinstance(envelope, dict) and envelope.get("usage"):
         usage.record(usage.parse_usage(envelope, step))
+
+
+def _explain_failure(name: str, result) -> str:
+    """Turn a failed backend invocation into something a person can act on.
+
+    The claude CLI exits non-zero *and* prints its usual JSON envelope, whose
+    `result` field carries the real message ("Not logged in - Please run /login").
+    Without this the user gets two kilobytes of JSON, which is how a first run ends
+    in a bug report instead of a login.
+    """
+    for blob in (result.stdout, result.stderr):
+        try:
+            envelope = json.loads((blob or "").strip())
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(envelope, dict):
+            msg = envelope.get("result") or envelope.get("error")
+            if isinstance(msg, str) and msg.strip():
+                return f"`{name}` failed: {msg.strip()}"
+    tail = ((result.stderr or result.stdout) or "").strip().splitlines()[-3:]
+    return f"`{name}` failed (exit {result.returncode}): " + " ".join(tail)
 
 
 def _backend() -> tuple[list[str], Callable[[str], str]]:
@@ -295,11 +317,14 @@ def ask_text(
     """Buffered plain-text answer — the fallback when the backend can't stream."""
     argv, extract = _backend()
     try:
-        result = run(argv, stdin=prompt + "\n\n" + stdin_payload, timeout=timeout)
+        result = run(argv, stdin=prompt + "\n\n" + stdin_payload, timeout=timeout,
+                     check=False)
     except TldrTimeoutError:
         raise                                    # surfaces as 504
     except TldrError as exc:
-        raise ClaudeError(str(exc)) from exc     # non-zero exit etc. -> 502
+        raise ClaudeError(str(exc)) from exc     # not installed etc. -> 502
+    if result.returncode != 0:
+        raise ClaudeError(_explain_failure(argv[0], result))
     _record_envelope(result.stdout, step)
     return extract(result.stdout)
 
@@ -328,11 +353,13 @@ def ask_json(
                 "markdown fences."
             )
         try:
-            result = run(argv, stdin=full, timeout=timeout)
+            result = run(argv, stdin=full, timeout=timeout, check=False)
         except TldrTimeoutError:
             raise  # surfaces as 504, not swallowed by the retry
         except TldrError as exc:
-            raise ClaudeError(str(exc)) from exc  # non-zero exit etc. -> 502
+            raise ClaudeError(str(exc)) from exc  # not installed etc. -> 502
+        if result.returncode != 0:
+            raise ClaudeError(_explain_failure(argv[0], result))
         _record_envelope(result.stdout, step if attempt == 0 else f"{step}-retry")
         try:
             data = _parse_inner_json(extract(result.stdout))

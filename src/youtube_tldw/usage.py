@@ -16,11 +16,12 @@ request it was measuring.
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from . import config
 
 USAGE_FILE = Path.home() / ".config" / "youtube-tldw" / "usage.jsonl"
 _lock = threading.Lock()
@@ -156,10 +157,7 @@ def _append(row: dict) -> None:
     with _lock:
         with USAGE_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
-        try:
-            os.chmod(USAGE_FILE, 0o600)
-        except OSError:
-            pass
+        config.restrict_to_owner(USAGE_FILE)
 
 
 def note_video(video_id: str, video_ms: int, summary_words: int, wpm: int = 200) -> None:
