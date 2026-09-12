@@ -23,7 +23,7 @@ from typing import Callable
 
 from . import ClaudeError, TldrError, TldrTimeoutError
 from . import config, usage
-from .proc import run
+from .proc import _resolve, run
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 _DEFAULT_TIMEOUT = 300.0
@@ -137,8 +137,8 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
         argv += ["--resume", str(resume)]
     full = prompt + "\n\n" + stdin_payload
 
-    proc = subprocess.Popen(  # noqa: S603
-        argv,
+    proc = subprocess.Popen(  # noqa: S603 - resolved argv, shell=False
+        _resolve(argv),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -160,6 +160,8 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
 
     deadline = time.monotonic() + timeout
     saw_delta = False
+    killed = False
+    drained = False
     try:
         for raw in proc.stdout:
             if time.monotonic() > deadline:
@@ -192,13 +194,29 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
                     if isinstance(block, dict) and block.get("type") == "text")
                 if whole:
                     yield whole
+        drained = True          # stdout reached EOF: the process is on its way out
     finally:
         proc.stdout.close()
-        if proc.poll() is None:
-            proc.kill()   # consumer abandoned us (client hung up) or we're unwinding
-        ret = proc.wait(timeout=5)
+        if drained:
+            # Let it exit on its own. poll() can still read None while a finished
+            # process is being reaped, and killing it then turned a clean exit into
+            # a reported "failure".
+            try:
+                ret = proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                killed = True
+                ret = proc.wait(timeout=5)
+        else:
+            # Unwinding early — a timeout, or the consumer hung up (Stop). Kill now:
+            # waiting on a process that is still streaming would stall the abort.
+            proc.kill()
+            killed = True
+            ret = proc.wait(timeout=5)
 
-    if ret and ret not in (0, -9):
+    # A process we killed on purpose isn't a failure. Don't test for a specific
+    # code: POSIX reports -9 for SIGKILL, Windows reports 1 from TerminateProcess.
+    if ret and not killed:
         tail = proc.stderr.read().strip().splitlines()[-3:]
         raise ClaudeError(f"`claude` failed (exit {ret}): " + " | ".join(tail))
 
