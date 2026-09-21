@@ -163,7 +163,7 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
   check("progress is remembered so a re-attach can restore it",
     /lastProgress = m;/.test(src), true);
   check("re-attach replays the remembered progress",
-    /backgrounded = false;[\s\S]{0,400}updateProgress\(lastProgress\.message/.test(src), true);
+    /backgrounded = false;[\s\S]{0,400}updateProgress\(lastProgress\.message/.test(stripComments(src)), true);
 }
 
 // --- mp3 download filename ---
@@ -241,6 +241,34 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
   check("no stats means no ask", /!stats \|\|/.test(body), true);
   check("the video count is escaped like any other model-supplied value",
     /esc\(String\(stats\.videos\)\)/.test(body), true);
+}
+
+// --- the summary while it's being written ---
+{
+  eval(grab("  function audioRowHtml(pending)", "\n  // --- The summary as it's written"));
+  const pending = audioRowHtml(true), done = audioRowHtml(false);
+  check("in-progress controls are all disabled",
+    (pending.match(/ disabled /g) || []).length, 4);
+  check("finished controls are not", / disabled /.test(done), false);
+  check("both views share one layout (no jump when the result lands)",
+    pending.replace(/ disabled title="[^"]*"/g, ""), done);
+
+  const body = stripComments(src.slice(src.indexOf("  function showPartial()"),
+                                       src.indexOf("  function showResult(")));
+  check("streamed key points are escaped", /<li>\$\{esc\(text\)\}<\/li>/.test(body), true);
+  check("streamed paragraphs go through the escaping renderer",
+    /renderSummary\(text\)/.test(body), true);
+  check("a closed panel keeps state but draws nothing",
+    /if \(backgrounded\) return;/.test(body), true);
+  check("drawing it keeps the request's keepalive running",
+    /clearTimers\(\)/.test(body), false);
+
+  const port = stripComments(src.slice(src.indexOf("  function startSummarize("),
+                                       src.indexOf("  function endBackground(")));
+  check("meta/partial are routed before the request is marked finished",
+    port.indexOf('m.type === "partial"') < port.indexOf("requestActive = false"), true);
+  check("re-opening mid-run redraws what's been written, not a spinner",
+    /partialState && partialState\.meta\) \{\s*showPartial\(\)/.test(stripComments(src)), true);
 }
 
 if (failures.length) {

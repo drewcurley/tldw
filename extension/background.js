@@ -7,7 +7,10 @@
 // (also promise-based in MV3). Either way, `api` gives us promises.
 const api = globalThis.browser ?? globalThis.chrome;
 
-const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "", voice: "amy" };
+const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "", voice: "amy",
+                   model: "opus" };
+// Keep in step with the server's claude_client.MODELS; it refuses anything else.
+const MODELS = ["opus", "sonnet"];
 const CLIENT_TIMEOUT_MS = 150000;
 const SEG_TIMEOUT_MS = 320000;          // segment selection can take 2-3 min (Claude JSON)
 const ASK_TIMEOUT_MS = 300000;          // one answer over an already-fetched transcript
@@ -33,7 +36,8 @@ function videoIdFromUrl(url) {
 
 async function getSettings() {
   const s = await api.storage.local.get(DEFAULTS);
-  return { serverUrl: s.serverUrl || DEFAULTS.serverUrl, token: s.token || "" };
+  return { serverUrl: s.serverUrl || DEFAULTS.serverUrl, token: s.token || "",
+           model: MODELS.includes(s.model) ? s.model : DEFAULTS.model };
 }
 
 function send(tabId, msg) {
@@ -71,7 +75,7 @@ async function handleSummarize(port, msg) {
     safePost(port, { type: "result", payload: cache.get(videoId), cached: true });
     return;
   }
-  const { serverUrl, token } = await getSettings();
+  const { serverUrl, token, model } = await getSettings();
   if (!token) {
     safePost(port, { type: "error",
       error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
@@ -84,7 +88,7 @@ async function handleSummarize(port, msg) {
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/summarize/stream", {
       method: "POST", signal: ctrl.signal,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, model }),
     });
     if (!resp.ok) {
       let detail = "";
@@ -109,6 +113,13 @@ async function handleSummarize(port, msg) {
         if (ev.type === "progress") {
           safePost(port, { type: "progress", message: ev.message,
             percent: ev.percent, creep: ev.creep });
+        } else if (ev.type === "meta") {
+          // The video's details, before the summary exists: enough to draw it.
+          safePost(port, { type: "meta", meta: {
+            video_id: ev.video_id, title: ev.title, channel: ev.channel,
+            source_url: ev.source_url, original_length: ev.original_length } });
+        } else if (ev.type === "partial") {
+          safePost(port, { type: "partial", kind: ev.kind, text: ev.text });
         } else if (ev.type === "result") {
           gotTerminal = true;
           if (videoId) cache.set(videoId, ev);
@@ -262,7 +273,7 @@ function bytesToBase64(u8) {
 // question and the conversation so far, and streams the answer back in deltas.
 async function handleAsk(port, msg) {
   const { url, question, history } = msg;
-  const { serverUrl, token } = await getSettings();
+  const { serverUrl, token, model } = await getSettings();
   if (!token) {
     safePost(port, { type: "askError",
       error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
@@ -281,7 +292,7 @@ async function handleAsk(port, msg) {
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/ask/stream", {
       method: "POST", signal: ctrl.signal,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-      body: JSON.stringify({ url, question, history }),
+      body: JSON.stringify({ url, question, history, model }),
     });
     if (!resp.ok) {
       let detail = "";
@@ -394,7 +405,7 @@ function speakError(status, detail) {
 
 async function handleSegments(port, msg) {
   const { url } = msg;
-  const { serverUrl, token } = await getSettings();
+  const { serverUrl, token, model } = await getSettings();
   if (!token) {
     safePost(port, { type: "segError",
       error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
@@ -407,7 +418,7 @@ async function handleSegments(port, msg) {
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/segments/stream", {
       method: "POST", signal: ctrl.signal,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, model }),
     });
     if (!resp.ok) {
       let detail = "";

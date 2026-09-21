@@ -159,3 +159,89 @@ def test_summarize_text_map_reduce(monkeypatch):
     r = summarize.summarize_text(_cues(6), "C", "T", 0.2, timeout=1)
     assert r.summary == "s"
     assert calls["n"] >= 2  # at least one map + one reduce
+
+
+# --- streaming summary --------------------------------------------------------------
+
+def _stream_lines(monkeypatch, lines, seen=None):
+    def fake(prompt, payload, *, on_obj, timeout, step=""):
+        if seen is not None:
+            seen["prompt"], seen["step"] = prompt, step
+        for obj in lines:
+            on_obj(obj)
+    monkeypatch.setattr(summarize, "stream_ndjson", fake)
+
+
+def _no_buffered(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("fell back to the buffered call")
+    monkeypatch.setattr(summarize, "ask_json", boom)
+
+
+def test_streaming_summary_reports_pieces_as_they_arrive(monkeypatch):
+    seen = {}
+    _stream_lines(monkeypatch, [
+        {"key_point": "Neurons hold a number"},
+        {"key_point": "Layers pass activations forward"},
+        {"paragraph": "A network is layers of neurons."},
+        {"paragraph": "It learns by adjusting weights."},
+        {"chosen_ratio": 0.2, "rationale": "dense"},
+    ], seen)
+    _no_buffered(monkeypatch)
+    partials = []
+    res = summarize.summarize_text(_cues(5), "C", "T", None, timeout=1,
+                                   on_partial=partials.append)
+    assert [p["kind"] for p in partials] == ["key_point", "key_point",
+                                             "paragraph", "paragraph"]
+    assert res.key_points == ["Neurons hold a number", "Layers pass activations forward"]
+    assert res.summary == "A network is layers of neurons.\n\nIt learns by adjusting weights."
+    assert res.chosen_ratio == 0.2 and res.rationale == "dense"
+    assert "WRITE FOR THE EAR" in seen["prompt"]          # same rules as batch
+    assert '{"key_point"' in seen["prompt"] and seen["step"] == "summarize"
+
+
+def test_streaming_that_never_produces_a_summary_falls_back(monkeypatch):
+    """A model that ignores the line format costs one retry, not a broken result."""
+    _stream_lines(monkeypatch, [{"key_point": "only a point"}])
+    calls = []
+    monkeypatch.setattr(summarize, "ask_json",
+                        lambda *a, **k: calls.append(1) or summarize.TextResult(
+                            ["k"], "buffered body", 0.3, "r"))
+    progress = []
+    res = summarize.summarize_text(_cues(5), "C", "T", None, timeout=1,
+                                   on_partial=lambda _p: None,
+                                   on_progress=lambda m, p=None: progress.append(m))
+    assert calls == [1] and res.summary == "buffered body"
+    assert any("reformatting" in m for m in progress)
+
+
+def test_streaming_does_not_retry_a_real_failure(monkeypatch):
+    """A logged-out CLI or a timeout would fail the retry identically."""
+    def fail(*a, **k):
+        raise summarize.TldrError("claude: Not logged in")
+    monkeypatch.setattr(summarize, "stream_ndjson", fail)
+    _no_buffered(monkeypatch)
+    with pytest.raises(summarize.TldrError, match="Not logged in"):
+        summarize.summarize_text(_cues(5), "C", "T", None, timeout=1,
+                                 on_partial=lambda _p: None)
+
+
+def test_custom_backends_get_the_buffered_summary(monkeypatch):
+    def cannot(*a, **k):
+        raise NotImplementedError
+    monkeypatch.setattr(summarize, "stream_ndjson", cannot)
+    monkeypatch.setattr(summarize, "ask_json",
+                        lambda *a, **k: summarize.TextResult(["k"], "body", None, ""))
+    res = summarize.summarize_text(_cues(5), "C", "T", None, timeout=1,
+                                   on_partial=lambda _p: None)
+    assert res.summary == "body"
+
+
+def test_no_on_partial_means_the_original_buffered_path(monkeypatch):
+    """The CLI and anything else that doesn't ask for streaming is unchanged."""
+    def never(*a, **k):
+        raise AssertionError("streamed without being asked to")
+    monkeypatch.setattr(summarize, "stream_ndjson", never)
+    monkeypatch.setattr(summarize, "ask_json",
+                        lambda p, *a, **k: summarize.TextResult(["k"], "b", None, ""))
+    assert summarize.summarize_text(_cues(5), "C", "T", None, timeout=1).summary == "b"

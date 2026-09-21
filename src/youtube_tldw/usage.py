@@ -78,6 +78,11 @@ def parse_usage(envelope: dict, step: str = "") -> Usage:
     msg = envelope.get("message")
     if isinstance(msg, dict):
         model = msg.get("model") or ""
+    # The CLI's result envelope has no top-level "model"; it reports per-model usage
+    # under modelUsage instead. Without this every row's model was blank.
+    by_model = envelope.get("modelUsage")
+    if not model and isinstance(by_model, dict) and by_model:
+        model = ",".join(sorted(by_model))
     return Usage(
         step=step,
         model=model or envelope.get("model") or "",

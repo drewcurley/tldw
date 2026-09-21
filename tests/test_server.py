@@ -172,7 +172,8 @@ def _read_ndjson(port, body, headers, path="/summarize/stream"):
 def test_summarize_stream_emits_progress_then_result(srv, monkeypatch):
     _, port = srv
 
-    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None):
+    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None,
+             on_partial=None):
         if on_progress:
             on_progress("fetching metadata…")
             on_progress("summarizing with Claude…")
@@ -188,7 +189,8 @@ def test_summarize_stream_emits_progress_then_result(srv, monkeypatch):
 def test_summarize_stream_error_is_in_band(srv, monkeypatch):
     _, port = srv
 
-    def boom(url, ratio, lang, *, timeout, max_chars, on_progress=None):
+    def boom(url, ratio, lang, *, timeout, max_chars, on_progress=None,
+             on_partial=None):
         raise NoTranscriptError("no captions")
 
     monkeypatch.setattr(server.core, "summarize_url", boom)
@@ -646,6 +648,85 @@ def test_cache_get_touch_renews_the_ttl(monkeypatch):
         assert server._transcript_cache["vid"][0] > first
     with server._cache_lock:
         del server._transcript_cache["vid"]
+
+
+def test_summarize_stream_sends_the_summary_as_it_is_written(srv, monkeypatch):
+    """meta first (enough to draw the layout), then each key point and paragraph,
+    then the full result — reading can start long before the model finishes."""
+    _, port = srv
+
+    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None, on_partial=None):
+        summary = _summary()
+        on_partial({"kind": "meta", "meta": summary.meta})
+        on_partial({"kind": "key_point", "text": "point one"})
+        on_partial({"kind": "paragraph", "text": "the body"})
+        return summary
+
+    monkeypatch.setattr(server.core, "summarize_url", fake)
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
+    types = [e["type"] for e in events]
+    assert types == ["meta", "partial", "partial", "result"]
+    meta = events[0]
+    assert meta["title"] == "Cool Title" and meta["channel"] == "Chan"
+    assert meta["original_length"] and meta["video_id"] == "dQw4w9WgXcQ"
+    assert events[1] == {"type": "partial", "kind": "key_point", "text": "point one"}
+    assert events[2] == {"type": "partial", "kind": "paragraph", "text": "the body"}
+
+
+def test_requested_model_is_pinned_for_the_request(srv, monkeypatch):
+    _, port = srv
+    seen = []
+
+    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None, on_partial=None):
+        seen.append(server.claude_client.current_model())
+        return _summary()
+
+    monkeypatch.setattr(server.core, "summarize_url", fake)
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ", "model": "sonnet"}, _auth())
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
+    assert seen == ["sonnet", None]          # no model -> the CLI's default
+
+
+def test_unknown_model_is_refused_not_defaulted(srv):
+    """It ends up in argv — refuse it outright."""
+    _, port = srv
+    for path, body in [("/summarize/stream", {"url": "x", "model": "gpt-4"}),
+                       ("/ask/stream", {"url": "x", "question": "q", "model": "--help"})]:
+        status, payload, _ = _req(port, "POST", path, body, _auth())
+        assert status == 400 and payload["error"] == "unknown model", path
+
+
+def test_segment_prefetch_inherits_the_request_model(monkeypatch):
+    """It runs on its own thread, where the request's model scope doesn't reach."""
+    seen, done = [], threading.Event()
+
+    def fake_select(url, ratio, lang, *, timeout, _prefetched):
+        seen.append(server.claude_client.current_model())
+        done.set()
+        return _prefetched[0], []
+
+    monkeypatch.setattr(server.core, "select_segments", fake_select)
+    meta = VideoMeta("prefetchvid", "T", "C", 1000, {}, {})
+    server._start_seg_prefetch(meta, [], "sonnet")
+    assert done.wait(5)
+    assert seen == ["sonnet"]
+
+
+def test_ask_uses_the_requested_model(srv, monkeypatch):
+    _, port = srv
+    _stub_transcript(monkeypatch)
+    seen = []
+
+    def answer(*a, **k):
+        seen.append(server.claude_client.current_model())
+        k["on_delta"]("ok")
+        return "ok"
+
+    monkeypatch.setattr(server.ask, "stream_answer", answer)
+    _read_ndjson(port, _ask_body(model="sonnet"), _auth(), path="/ask/stream")
+    assert seen == ["sonnet"]
 
 
 def test_token_persists_across_calls(monkeypatch, tmp_path):

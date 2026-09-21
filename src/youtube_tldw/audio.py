@@ -82,7 +82,59 @@ _SPEAK_FIXES = [
 ]
 
 
+_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+         "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+         "sixteen", "seventeen", "eighteen", "nineteen"]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty",
+         "ninety"]
+
+
+def _two_digits(n: int) -> str:
+    if n < 20:
+        return _ONES[n]
+    tens, ones = divmod(n, 10)
+    return _TENS[tens] + (f"-{_ONES[ones]}" if ones else "")
+
+
+def _plural(words: str) -> str:
+    """ninety -> nineties, hundred -> hundreds, eight -> eights."""
+    return words[:-1] + "ies" if words.endswith("y") else words + "s"
+
+
+def year_words(year: int, decade: bool = False) -> str:
+    """How a year is said aloud: 1908 -> "nineteen oh-eight", 1842 -> "eighteen
+    forty-two", 2000 -> "two thousand", 2024 -> "twenty twenty-four". decade=True
+    gives the plural form: 1990 -> "nineteen nineties", 1800 -> "eighteen hundreds".
+    """
+    century, rest = divmod(year, 100)
+    if rest == 0 and century % 10 == 0:              # 1000, 2000
+        spoken = f"{_ONES[century // 10]} thousand"
+    elif rest == 0:                                  # 1900
+        spoken = f"{_two_digits(century)} hundred"
+    elif century % 10 == 0 and rest < 10:            # 2005, 1003
+        spoken = f"{_ONES[century // 10]} thousand {_ONES[rest]}"
+    elif rest < 10:                                  # 1908
+        spoken = f"{_two_digits(century)} oh-{_ONES[rest]}"
+    else:                                            # 1842, 2024
+        spoken = f"{_two_digits(century)} {_two_digits(rest)}"
+    return _plural(spoken) if decade else spoken
+
+
+# Years stay as digits in the text people read (the summary prompt asks for that),
+# and are spoken here. Piper can't be left to it: it reads 1842 as "one thousand
+# eight hundred forty two" and "the 1990s" as "nineteen hundred ninety z". Only
+# 1000-2099, and never inside a larger number, a decimal, a price or a percentage.
+_YEAR = re.compile(r"(?<![\d.,$£€])\b(1\d{3}|20\d{2})(s?)\b(?![.,]?\d|%)")
+
+
+def _speak_years(text: str) -> str:
+    return _YEAR.sub(lambda m: year_words(int(m.group(1)), bool(m.group(2))), text)
+
+
 def _speakify(text: str) -> str:
+    # Years first: the fixes below turn "%" into " percent", and "1908%" must still
+    # read as a quantity, not "nineteen oh-eight percent".
+    text = _speak_years(text)
     for pat, rep in _SPEAK_FIXES:
         text = pat.sub(rep, text)
     return re.sub(r"\s+", " ", text).strip()

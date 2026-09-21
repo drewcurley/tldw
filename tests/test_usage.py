@@ -196,3 +196,24 @@ def test_every_model_call_is_labelled_with_its_step(monkeypatch):
     cues = [Cue(i * 1000, i * 1000 + 900, f"line {i}") for i in range(4)]
     summarize.select_video_segments(cues, "C", "T", None, None, timeout=1)
     assert seen == ["segments"]                   # not "summarize"
+
+
+def test_parse_usage_reads_the_model_from_model_usage():
+    """The CLI's result event has no top-level model — it's under modelUsage."""
+    u = usage.parse_usage({"usage": {"output_tokens": 1},
+                           "modelUsage": {"claude-sonnet-5": {"outputTokens": 1}}})
+    assert u.model == "claude-sonnet-5"
+
+
+def test_usage_report_breaks_cost_down_by_model(tmp_path, capsys):
+    f = tmp_path / "u.jsonl"
+    _write(f, [
+        {"ts": 1e9, "kind": "summarize", "video_id": "v1", "step": "summarize",
+         "model": "claude-opus-5[1m]", "cost_usd": 0.10, "output_tokens": 3000},
+        {"ts": 1e9, "kind": "summarize", "video_id": "v2", "step": "summarize",
+         "model": "claude-sonnet-5", "cost_usd": 0.04, "output_tokens": 1600},
+    ])
+    assert cli.main(["usage", "--file", str(f)]) == 0
+    out = capsys.readouterr().out
+    assert "claude-opus-5 " in out            # the [1m] context suffix is folded
+    assert "claude-sonnet-5" in out

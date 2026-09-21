@@ -101,7 +101,7 @@ def _session_put(video_id: str, session_id: str) -> None:
         _prune(_ask_sessions)
 
 
-def _start_seg_prefetch(meta, cues: list) -> None:
+def _start_seg_prefetch(meta, cues: list, model: str | None = None) -> None:
     """Start background segment selection. No-op if one is already running for this video.
     Stores a threading.Event in _seg_prefetch_events so _run_segments can wait instead
     of spawning a second concurrent Claude call."""
@@ -115,7 +115,8 @@ def _start_seg_prefetch(meta, cues: list) -> None:
     def _run():
         from . import metadata as _md
         try:
-            with usage.interaction("segments", vid):
+            # A new thread: the request's model scope doesn't follow it here.
+            with claude_client.use_model(model), usage.interaction("segments", vid):
                 _meta, segs = core.select_segments(
                     _md.watch_url(vid), None, "en",
                     timeout=SEGMENTS_TIMEOUT,
@@ -142,7 +143,7 @@ from . import (
     __version__,
 )
 from . import metadata as md
-from . import ask, audio, config, core, textmode, usage
+from . import ask, audio, claude_client, config, core, textmode, usage
 from .summarize import SINGLE_PASS_CHARS
 from .urls import canonical_video_id
 from .timing import format_length, parse_duration
@@ -292,22 +293,38 @@ class _Handler(BaseHTTPRequestHandler):
             parsed = self._validate(body)
             if parsed is None:
                 return
+        model = self._model(body)
+        if model is False:
+            return  # 400 already sent
         if not self.server.sem.acquire(blocking=False):
             self._send_json(429, {"error": "busy, try again shortly"})
             return
         try:
-            if path == "/speak":
-                self._run_speak(body, stream=False)
-            elif path == "/speak/stream":
-                self._run_speak(body, stream=True)
-            elif path == "/summarize/stream":
-                self._run_stream(*parsed)
-            elif path == "/segments/stream":
-                self._run_segments(*parsed, body)
-            else:
-                self._run_buffered(*parsed)
+            with claude_client.use_model(model):
+                if path == "/speak":
+                    self._run_speak(body, stream=False)
+                elif path == "/speak/stream":
+                    self._run_speak(body, stream=True)
+                elif path == "/summarize/stream":
+                    self._run_stream(*parsed)
+                elif path == "/segments/stream":
+                    self._run_segments(*parsed, body)
+                else:
+                    self._run_buffered(*parsed)
         finally:
             self.server.sem.release()
+
+    def _model(self, body):
+        """The requested model, None for the CLI default, or False after a 400.
+
+        Validated here rather than at use because it ends up in argv: an unknown
+        name must be refused, not quietly swapped for the default.
+        """
+        model = body.get("model") if isinstance(body, dict) else None
+        if model is None or model in claude_client.MODELS:
+            return model
+        self._send_json(400, {"error": "unknown model"})
+        return False
 
     def _guarded(self, handler, *, max_bytes: int = MAX_BODY_BYTES) -> None:
         """auth -> bounded body -> concurrency slot, then run `handler(body)`."""
@@ -317,11 +334,15 @@ class _Handler(BaseHTTPRequestHandler):
         body = self._read_body(max_bytes)
         if body is None:
             return  # _read_body already responded
+        model = self._model(body)
+        if model is False:
+            return
         if not self.server.sem.acquire(blocking=False):
             self._send_json(429, {"error": "busy, try again shortly"})
             return
         try:
-            handler(body)
+            with claude_client.use_model(model):
+                handler(body)
         finally:
             self.server.sem.release()
 
@@ -404,11 +425,22 @@ class _Handler(BaseHTTPRequestHandler):
             tlog(m)
             emit({"type": "progress", "message": m, "percent": pct, "creep": creep})
 
+        def partial(ev):
+            if ev["kind"] == "meta":
+                m = ev["meta"]
+                # Enough to draw the real layout before the summary exists.
+                emit({"type": "meta", "video_id": m.video_id, "title": m.title,
+                      "channel": m.channel, "source_url": md.watch_url(m.video_id),
+                      "original_length": format_length(m.duration_ms)})
+            else:
+                emit({"type": "partial", "kind": ev["kind"], "text": ev["text"]})
+
         try:
             with usage.interaction("summarize", _vid_of(url)):
                 summary = core.summarize_url(
                     url, ratio, lang, timeout=REQUEST_TIMEOUT,
-                    max_chars=SINGLE_PASS_CHARS, on_progress=progress)
+                    max_chars=SINGLE_PASS_CHARS, on_progress=progress,
+                    on_partial=partial)
                 usage.note_video(summary.meta.video_id, summary.meta.duration_ms,
                                  textmode.summary_word_count(summary.result))
         except TldrError as exc:
@@ -425,7 +457,8 @@ class _Handler(BaseHTTPRequestHandler):
             _cache_put(summary.meta.video_id, summary.meta, summary.cues)
             # Kick off segment selection in the background so "play key moments" is
             # ready by the time the user reads the summary.
-            _start_seg_prefetch(summary.meta, summary.cues)
+            _start_seg_prefetch(summary.meta, summary.cues,
+                                claude_client.current_model())
         emit({"type": "result", **_to_payload(summary), "stats": usage.stats()})
 
     def _validate_speak(self, body: dict):
