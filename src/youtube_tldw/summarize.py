@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import TldrError
-from .claude_client import ask_json, is_claude_cli, stream_ndjson_segments
+from .claude_client import ask_json, is_claude_cli, stream_ndjson, stream_ndjson_segments
 from .timing import format_length, to_ffmpeg_ts
 from .transcript import Cue
 
@@ -16,7 +16,9 @@ from .transcript import Cue
 # generous; beyond it we map-reduce (text) / chunk-select (video).
 SINGLE_PASS_CHARS = 350_000
 
-_TEXT_PROMPT = """You are an expert at distilling video transcripts into a TL;DW \
+# Shared by the batch and streaming forms, so the two can never drift apart on
+# the rules — only the output format differs.
+_TEXT_BODY = """You are an expert at distilling video transcripts into a TL;DW \
 that preserves every key point while cutting all filler.
 
 Input (on stdin): video metadata then the full transcript.
@@ -29,14 +31,32 @@ NOT use abbreviations, acronyms, initialisms, or symbols. For example: "Senator"
 "Sen.", "Lieutenant Governor" not "Lt. Gov.", "World War Two" not "WWII", "United
 States" not "U.S.", "Doctor" not "Dr.", "versus" not "vs.", "percent" not "%", "and"
 not "&", "number" not "No.". Expand units and counts into natural spoken words.
+The one exception is YEARS: write them as numerals — 1908, 1842, 2024, the 1990s —
+never spelled out. They read naturally that way, and the speech step voices them.
 
-Return ONLY a JSON object, no prose, no markdown fences, with this schema:
+"""
+
+_TEXT_PROMPT = _TEXT_BODY + """Return ONLY a JSON object, no prose, no markdown fences, with this schema:
 {{
   "key_points": ["concise bullet", ...],   // the essential takeaways, in order
   "summary": "markdown body that reads naturally and keeps all key points",
   "chosen_ratio": 0.0,                      // fraction of original length you kept
   "rationale": "one sentence on why this length fits the content"
 }}"""
+
+# Streaming form: one JSON object per line, so the extension can show key points
+# while the rest is still being written. Key points first because they're short and
+# the most useful thing to read early; the summary follows a paragraph per line.
+_TEXT_PROMPT_STREAM = _TEXT_BODY + """Output ONLY JSON lines — one JSON object per line, no prose, no markdown fences.
+Emit each line the moment it is ready; do not hold anything back until the end.
+
+1. Each key takeaway, in order, one per line:
+{{"key_point": "concise bullet"}}
+2. Then the summary, one markdown paragraph per line — it must read naturally and
+   keep every key point:
+{{"paragraph": "a paragraph of the summary"}}
+3. Last, exactly one closing line:
+{{"chosen_ratio": 0.0, "rationale": "one sentence on why this length fits the content"}}"""
 
 _TEXT_REDUCE_PROMPT = """You are combining ordered partial summaries of one video \
 into a single TL;DW. Input (on stdin): the partial summaries in order.
@@ -45,7 +65,8 @@ into a single TL;DW. Input (on stdin): the partial summaries in order.
 
 WRITE FOR THE EAR — the result may be read aloud. Spell everything out in full; use
 no abbreviations, acronyms, initialisms, or symbols (e.g. "Senator" not "Sen.",
-"World War Two" not "WWII", "percent" not "%", "and" not "&").
+"World War Two" not "WWII", "percent" not "%", "and" not "&"). Write years as
+numerals (1908, the 1990s), never spelled out.
 
 Return ONLY a JSON object with this schema:
 {{
@@ -207,12 +228,66 @@ def _chunk(seq: list, size: int) -> list[list]:
     return [seq[i : i + size] for i in range(0, len(seq), size)]
 
 
+def _stream_text_summary(prompt: str, payload: str, *, timeout: float,
+                         on_partial) -> TextResult:
+    """Summarize while reporting each key point and paragraph as it's written.
+
+    Raises NotImplementedError for backends that can't stream, and ValueError when
+    what streamed doesn't add up to a summary — the caller falls back to the
+    buffered call in both cases, so a model that ignores the line format costs a
+    retry, never a broken result.
+    """
+    points: list[str] = []
+    paragraphs: list[str] = []
+    closing: dict = {}
+
+    def on_obj(obj: dict) -> None:
+        kp, para = obj.get("key_point"), obj.get("paragraph")
+        if isinstance(kp, str) and kp.strip():
+            points.append(kp.strip())
+            on_partial({"kind": "key_point", "text": kp.strip()})
+        elif isinstance(para, str) and para.strip():
+            paragraphs.append(para.strip())
+            on_partial({"kind": "paragraph", "text": para.strip()})
+        elif "chosen_ratio" in obj or "rationale" in obj:
+            closing.update(obj)
+
+    stream_ndjson(prompt, payload, on_obj=on_obj, timeout=timeout, step="summarize")
+    return _validate_text({
+        "key_points": points,
+        "summary": "\n\n".join(paragraphs),          # empty -> ValueError
+        "chosen_ratio": closing.get("chosen_ratio"),
+        "rationale": closing.get("rationale", ""),
+    })
+
+
 def summarize_text(
-    cues: list[Cue], channel: str, title: str, ratio: float | None, *, timeout: float
+    cues: list[Cue], channel: str, title: str, ratio: float | None, *, timeout: float,
+    on_partial=None, on_progress=None,
 ) -> TextResult:
+    """Summarize a transcript.
+
+    on_partial, when given, receives {"kind": "key_point"|"paragraph", "text": ...}
+    as each piece is written, so a reader can start before the model finishes.
+    """
     header = _metadata_header(channel, title)
     full = " ".join(c.text for c in cues)
     if len(full) <= SINGLE_PASS_CHARS:
+        if on_partial is not None:
+            stream_prompt = _TEXT_PROMPT_STREAM.format(ratio_clause=_ratio_clause(ratio))
+            try:
+                return _stream_text_summary(stream_prompt, header + full,
+                                            timeout=timeout, on_partial=on_partial)
+            except NotImplementedError:
+                pass                     # custom backend: buffered below
+            except ValueError:
+                # It streamed but didn't add up to a summary — the model ignored the
+                # line format. One buffered retry, like ask_json's own repair pass.
+                # Deliberately NOT for TldrError: a timeout, a CLI failure or a
+                # logged-out session would fail the retry identically, at double
+                # the wait.
+                if on_progress:
+                    on_progress("reformatting the summary…", None)
         prompt = _TEXT_PROMPT.format(ratio_clause=_ratio_clause(ratio))
         return ask_json(prompt, header + full, validate=_validate_text, timeout=timeout)
 

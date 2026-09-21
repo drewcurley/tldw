@@ -19,6 +19,7 @@ import shlex
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from typing import Callable
 
 from . import ClaudeError, TldrError, TldrTimeoutError
@@ -92,6 +93,62 @@ def _explain_failure(name: str, result) -> str:
     return f"`{name}` failed (exit {result.returncode}): " + " ".join(tail)
 
 
+# The claude CLI is a coding agent. Invoked plainly, every call carries its agent
+# system prompt, its tool definitions, the MCP servers from every installed plugin,
+# and any CLAUDE.md files above the working directory — none of which has anything
+# to do with summarizing a video, and the last of which means each user's personal
+# instructions were being sent along with every transcript. Measured on an
+# 18-minute video: 57,890 input tokens down to 6,376, about 5x cheaper, and the
+# first token 1-2s sooner. Keep this free of & | < > ^ — on Windows an npm-installed
+# CLI is a .cmd shim run through cmd.exe, and proc._resolve refuses those.
+_SYSTEM_PROMPT = ("You are the text engine for tldw, a YouTube video summarizer. "
+                  "Follow the task instructions in the message exactly.")
+_LEAN = ["--tools", "", "--strict-mcp-config", "--setting-sources", "",
+         "--system-prompt", _SYSTEM_PROMPT]
+
+# Request value -> CLI model alias. An allowlist, because the choice arrives from the
+# extension and ends up in argv.
+MODELS = {"opus": "opus", "sonnet": "sonnet"}
+_local = threading.local()
+
+
+@contextmanager
+def use_model(model: str | None):
+    """Pin the model for claude calls made on this thread.
+
+    Thread-scoped rather than threaded through every signature, the same way usage
+    interactions are: the server handles each request on its own thread. None means
+    the CLI's own default. Unknown names are ignored here — callers validate against
+    MODELS first so a bad value is a 400, not a silent default.
+    """
+    prev = getattr(_local, "model", None)
+    _local.model = model if model in MODELS else None
+    try:
+        yield
+    finally:
+        _local.model = prev
+
+
+def current_model() -> str | None:
+    return getattr(_local, "model", None)
+
+
+def _claude_argv(*mode: str, persist: bool = False) -> list[str]:
+    """The claude invocation every call shares.
+
+    persist=False for one-shot calls: nothing ever resumes a summary or a segment
+    selection, and without it each call leaves a transcript-sized session file in
+    ~/.claude/projects. Q&A persists, because follow-ups resume that session.
+    """
+    argv = ["claude", "-p", *mode, *_LEAN]
+    model = current_model()
+    if model:
+        argv += ["--model", MODELS[model]]
+    if not persist:
+        argv.append("--no-session-persistence")
+    return argv
+
+
 def _backend() -> tuple[list[str], Callable[[str], str]]:
     """(argv, extractor) for the configured backend. argv reads the prompt on stdin.
 
@@ -100,7 +157,7 @@ def _backend() -> tuple[list[str], Callable[[str], str]]:
     cmd = (os.environ.get("TLDW_LLM_CMD") or config.get("llm_cmd") or "").strip()
     if cmd:
         return shlex.split(cmd), _raw_extract
-    return ["claude", "-p", "--output-format", "json"], _extract_result_text
+    return _claude_argv("--output-format", "json"), _extract_result_text
 
 
 def _parse_inner_json(text: str) -> dict:
@@ -136,7 +193,8 @@ def _delta_text(event: dict) -> str:
 
 
 def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
-                   step: str = "", resume: str | None = None, on_meta=None):
+                   step: str = "", resume: str | None = None, on_meta=None,
+                   persist: bool = False):
     """Yield the model's text deltas as the claude CLI produces them.
 
     Shared plumbing for every streaming caller: argv is a constant, the prompt and
@@ -150,8 +208,8 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
     # --verbose is REQUIRED alongside -p --output-format stream-json (the CLI refuses
     # otherwise), and --include-partial-messages is what actually yields token-level
     # deltas; without it the CLI only emits one whole `assistant` message at the end.
-    argv = ["claude", "-p", "--output-format", "stream-json", "--verbose",
-            "--include-partial-messages"]
+    argv = _claude_argv("--output-format", "stream-json", "--verbose",
+                        "--include-partial-messages", persist=persist)
     if resume:
         # Continue an existing conversation: the transcript and the rules are
         # already in that session, so only the new question rides on stdin. The id
@@ -243,6 +301,43 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
         raise ClaudeError(f"`claude` failed (exit {ret}): " + " | ".join(tail))
 
 
+def stream_ndjson(
+    prompt: str,
+    stdin_payload: str,
+    *,
+    on_obj: Callable[[dict], None],
+    timeout: float = _DEFAULT_TIMEOUT,
+    step: str = "",
+) -> None:
+    """Stream a reply the prompt asked for as one JSON object per line, calling
+    on_obj for each object as soon as its line is complete.
+
+    Lines that aren't a JSON object are skipped rather than fatal — the caller
+    decides whether what arrived adds up to a usable answer. Raises
+    NotImplementedError for custom backends, which can't stream.
+    """
+    def emit(line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if isinstance(obj, dict):
+            on_obj(obj)
+
+    buf = ""
+    for text in _stream_deltas(prompt, stdin_payload, timeout=timeout, step=step):
+        buf += text
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            emit(line)
+    # The model doesn't always end with a newline, and the last line is usually
+    # the one carrying the final fields — dropping it lost them silently.
+    emit(buf)
+
+
 def stream_ndjson_segments(
     prompt: str,
     stdin_payload: str,
@@ -250,36 +345,21 @@ def stream_ndjson_segments(
     on_segment: Callable[[dict], None],
     timeout: float = _DEFAULT_TIMEOUT,
 ) -> dict:
-    """Stream segment selection from the claude CLI using --output-format stream-json.
-
-    The prompt must ask Claude to emit one segment JSON per line as it identifies
-    each one, then a final {chosen_ratio, rationale} line.  on_segment is called
-    for every {first_cue, last_cue, reason} line received in real time.
-
-    Returns the final summary dict {chosen_ratio, rationale}.
-    Raises TldrTimeoutError / ClaudeError on failure.
-    Falls back to ask_json (buffered, no streaming) for custom LLM backends.
+    """Stream segment selection: on_segment gets each {first_cue, last_cue, reason}
+    as it's identified; returns the closing {chosen_ratio, rationale}.
+    Raises NotImplementedError for custom backends (callers fall back to ask_json).
     """
-    text_buf = ""
-    done_data: dict = {}
-    for text in _stream_deltas(prompt, stdin_payload, timeout=timeout,
-                               step="segments"):
-        text_buf += text
-        # Flush complete NDJSON lines from the accumulated buffer
-        while "\n" in text_buf:
-            line, text_buf = text_buf.split("\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if "first_cue" in obj:
-                on_segment(obj)
-            elif "chosen_ratio" in obj or "rationale" in obj:
-                done_data = obj
-    return done_data
+    done: dict = {}
+
+    def on_obj(obj: dict) -> None:
+        if "first_cue" in obj:
+            on_segment(obj)
+        elif "chosen_ratio" in obj or "rationale" in obj:
+            done.update(obj)
+
+    stream_ndjson(prompt, stdin_payload, on_obj=on_obj, timeout=timeout,
+                  step="segments")
+    return done
 
 
 def stream_text(
@@ -300,7 +380,7 @@ def stream_text(
     """
     parts: list[str] = []
     gen = _stream_deltas(prompt, stdin_payload, timeout=timeout, step=step,
-                         resume=resume, on_meta=on_meta)
+                         resume=resume, on_meta=on_meta, persist=True)
     try:
         for text in gen:
             parts.append(text)

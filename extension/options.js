@@ -1,7 +1,8 @@
 const api = globalThis.browser ?? globalThis.chrome;  // promises in both Firefox & Chrome
 
 const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "", voice: "amy",
-                   closeAction: "continue" };
+                   closeAction: "continue", model: "opus" };
+const MODELS = ["opus", "sonnet"];     // keep in step with the server's allowlist
 
 // Fallback list if the server isn't reachable (kept in sync with audio.VOICES).
 const VOICE_FALLBACK = [
@@ -32,6 +33,8 @@ async function load() {
   document.getElementById("token").value = s.token || "";
   document.getElementById("closeAction").value =
     s.closeAction === "abort" ? "abort" : DEFAULTS.closeAction;
+  document.getElementById("model").value =
+    MODELS.includes(s.model) ? s.model : DEFAULTS.model;
   fillVoices(VOICE_FALLBACK, s.voice);
   // Prefer the live server list so new voices show up without an extension update.
   try {
@@ -95,7 +98,9 @@ document.getElementById("save").addEventListener("click", async () => {
   const voice = document.getElementById("voice").value || DEFAULTS.voice;
   const closeAction =
     document.getElementById("closeAction").value === "abort" ? "abort" : "continue";
-  await api.storage.local.set({ serverUrl, token, voice, closeAction });
+  const model = MODELS.includes(document.getElementById("model").value)
+    ? document.getElementById("model").value : DEFAULTS.model;
+  await api.storage.local.set({ serverUrl, token, voice, closeAction, model });
   const status = document.getElementById("status");
   status.textContent = "Saved";
   setTimeout(() => (status.textContent = ""), 1500);

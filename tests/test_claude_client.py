@@ -1,8 +1,11 @@
 import json
+import re
+import threading
 
 import pytest
 
 from youtube_tldw import ClaudeError, TldrError, claude_client
+from youtube_tldw import claude_client as cc
 from youtube_tldw.proc import ProcResult
 
 
@@ -154,3 +157,137 @@ def test_is_error_envelope_reports_the_message_not_the_subtype():
                            "result": "Credit balance too low"})
     with pytest.raises(ClaudeError, match="Credit balance too low"):
         claude_client._extract_result_text(envelope)
+
+
+# --- lean invocation -----------------------------------------------------------
+
+def _claude_backend(monkeypatch):
+    monkeypatch.delenv("TLDW_LLM_CMD", raising=False)
+    monkeypatch.setattr(cc.config, "get", lambda *a, **k: None)
+
+
+def test_every_claude_call_strips_the_coding_agent_context(monkeypatch):
+    """No tools, no plugin MCP servers, no settings/CLAUDE.md, our own system
+    prompt — the default context was 89% of every request's input tokens, and it
+    carried the user's personal instructions along with each transcript."""
+    _claude_backend(monkeypatch)
+    argv, _ = cc._backend()
+    assert argv[:2] == ["claude", "-p"]
+    i = argv.index("--tools")
+    assert argv[i + 1] == ""
+    assert "--strict-mcp-config" in argv
+    j = argv.index("--setting-sources")
+    assert argv[j + 1] == ""
+    k = argv.index("--system-prompt")
+    assert argv[k + 1] == cc._SYSTEM_PROMPT
+
+
+def test_one_shot_calls_leave_no_session_file(monkeypatch):
+    _claude_backend(monkeypatch)
+    argv, _ = cc._backend()
+    assert "--no-session-persistence" in argv
+
+
+def test_qa_calls_persist_so_follow_ups_can_resume(monkeypatch):
+    _claude_backend(monkeypatch)
+    assert "--no-session-persistence" not in cc._claude_argv("-x", persist=True)
+
+
+def test_system_prompt_survives_the_windows_cmd_shim_guard():
+    """proc._resolve refuses cmd.exe metacharacters for .cmd shims (npm installs)."""
+    assert not re.search(r"[&|<>^]", cc._SYSTEM_PROMPT)
+
+
+def test_custom_backends_are_left_alone(monkeypatch):
+    """The lean flags are claude-CLI specific; an operator's own command is
+    passed exactly as configured."""
+    monkeypatch.setenv("TLDW_LLM_CMD", "ollama run llama3")
+    argv, _ = cc._backend()
+    assert argv == ["ollama", "run", "llama3"]
+
+
+# --- model choice ----------------------------------------------------------------
+
+def test_no_model_means_the_cli_default(monkeypatch):
+    _claude_backend(monkeypatch)
+    assert "--model" not in cc._backend()[0]
+
+
+def test_use_model_pins_the_model_for_this_thread(monkeypatch):
+    _claude_backend(monkeypatch)
+    with cc.use_model("sonnet"):
+        argv, _ = cc._backend()
+        assert argv[argv.index("--model") + 1] == "sonnet"
+    assert "--model" not in cc._backend()[0]          # restored on exit
+
+
+def test_use_model_ignores_names_outside_the_allowlist(monkeypatch):
+    """Belt and braces: the server validates first, but nothing unlisted reaches
+    argv even if a caller forgets."""
+    _claude_backend(monkeypatch)
+    with cc.use_model("opus; rm -rf /"):
+        assert "--model" not in cc._backend()[0]
+
+
+def test_model_scope_is_per_thread(monkeypatch):
+    _claude_backend(monkeypatch)
+    seen = {}
+
+    def other():
+        seen["argv"] = cc._backend()[0]
+
+    with cc.use_model("sonnet"):
+        t = threading.Thread(target=other)
+        t.start(); t.join()
+    assert "--model" not in seen["argv"]              # another request's thread
+
+
+# --- NDJSON streaming -------------------------------------------------------------
+
+def _fake_deltas(monkeypatch, pieces):
+    monkeypatch.setattr(cc, "_stream_deltas", lambda *a, **k: iter(pieces))
+
+
+def test_stream_ndjson_reassembles_lines_split_across_deltas(monkeypatch):
+    _fake_deltas(monkeypatch, ['{"a"', ': 1}\n{"b": ', '2}\n'])
+    got = []
+    cc.stream_ndjson("p", "x", on_obj=got.append)
+    assert got == [{"a": 1}, {"b": 2}]
+
+
+def test_stream_ndjson_keeps_a_final_line_without_a_newline(monkeypatch):
+    """The closing line usually carries the final fields; it used to be dropped."""
+    _fake_deltas(monkeypatch, ['{"a": 1}\n{"chosen_ratio": 0.3}'])
+    got = []
+    cc.stream_ndjson("p", "x", on_obj=got.append)
+    assert got[-1] == {"chosen_ratio": 0.3}
+
+
+def test_stream_ndjson_skips_junk_lines(monkeypatch):
+    _fake_deltas(monkeypatch, ['Sure! Here you go:\n', '```json\n', '{"a": 1}\n',
+                               '[1, 2]\n', '```'])
+    got = []
+    cc.stream_ndjson("p", "x", on_obj=got.append)
+    assert got == [{"a": 1}]                    # prose, fences, non-objects ignored
+
+
+def test_segments_keep_their_closing_line_without_a_newline(monkeypatch):
+    _fake_deltas(monkeypatch, ['{"first_cue": 0, "last_cue": 2}\n',
+                               '{"chosen_ratio": 0.2, "rationale": "tight"}'])
+    segs = []
+    done = cc.stream_ndjson_segments("p", "x", on_segment=segs.append)
+    assert segs == [{"first_cue": 0, "last_cue": 2}]
+    assert done == {"chosen_ratio": 0.2, "rationale": "tight"}
+
+
+def test_extension_model_lists_match_the_server_allowlist():
+    """Three copies of one list: add a model to one and forget another, and the
+    server refuses every request that uses it."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent / "extension"
+    for name in ("background.js", "options.js"):
+        src = (root / name).read_text()
+        m = re.search(r"const MODELS = \[([^\]]*)\]", src)
+        assert m, f"no MODELS list in {name}"
+        listed = re.findall(r'"([^"]+)"', m.group(1))
+        assert sorted(listed) == sorted(cc.MODELS), name

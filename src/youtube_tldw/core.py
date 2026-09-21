@@ -128,6 +128,7 @@ def summarize_url(
     timeout: float = 300.0,
     max_chars: int | None = None,
     on_progress: Callable[[str], None] | None = None,
+    on_partial: Callable[[dict], None] | None = None,
 ) -> Summary:
     """Fetch a video's transcript and summarize it. Raises the typed TldrError
     subclasses (BadUrl/NoTranscript/TranscriptTooLong/Claude/Timeout).
@@ -135,6 +136,9 @@ def summarize_url(
     max_chars: if set, reject transcripts that would trigger map-reduce (the
     browser flow uses this so a click never blocks for minutes).
     on_progress: optional callback for human-readable step messages.
+    on_partial: optional callback that streams the result as it's produced — first
+    {"kind": "meta", "meta": VideoMeta} once the video is known, then each
+    {"kind": "key_point"|"paragraph", "text": ...} as the model writes it.
     """
     log = on_progress or (lambda _m, _p=None, _c=False: None)
     video_id = canonical_video_id(url)  # BadUrlError
@@ -148,9 +152,12 @@ def summarize_url(
             )
     # The long step owns ~80% of the bar: starts at 15%, and creep=True tells the
     # client to ease forward toward ~96% from here until the result lands.
+    if on_partial is not None:
+        on_partial({"kind": "meta", "meta": meta})
     log("summarizing with Claude (this can take 30-90s for a long video)...", 15, True)
     result = summarize.summarize_text(
-        cues, meta.channel, meta.title, ratio, timeout=timeout
+        cues, meta.channel, meta.title, ratio, timeout=timeout,
+        on_partial=on_partial, on_progress=log,
     )
     return Summary(meta, result, len(cues), cues)
 

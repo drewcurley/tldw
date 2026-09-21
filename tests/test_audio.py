@@ -203,3 +203,50 @@ def test_require_piper_missing(monkeypatch):
     monkeypatch.setattr(audio.importlib.util, "find_spec", lambda name: None)
     with pytest.raises(TldrError):
         audio.require_piper()
+
+
+@pytest.mark.parametrize("year,spoken", [
+    (1908, "nineteen oh-eight"),
+    (1842, "eighteen forty-two"),
+    (1901, "nineteen oh-one"),
+    (1900, "nineteen hundred"),
+    (1100, "eleven hundred"),
+    (1000, "one thousand"),
+    (2000, "two thousand"),
+    (2005, "two thousand five"),
+    (2010, "twenty ten"),
+    (2024, "twenty twenty-four"),
+    (1776, "seventeen seventy-six"),
+])
+def test_year_words(year, spoken):
+    assert audio.year_words(year) == spoken
+
+
+@pytest.mark.parametrize("decade,spoken", [
+    (1990, "nineteen nineties"),
+    (1800, "eighteen hundreds"),
+    (2000, "two thousands"),
+    (1960, "nineteen sixties"),
+])
+def test_decades(decade, spoken):
+    assert audio.year_words(decade, decade=True) == spoken
+
+
+def test_speech_voices_years_that_piper_would_mangle():
+    """Piper reads 1842 as "one thousand eight hundred forty two" and "the 1990s"
+    as "nineteen hundred ninety z" — so years are spoken here, not left to it."""
+    s = audio.build_spoken_script("T", "C", ["Founded 1842"], "Peaked in the 1990s.")
+    assert "eighteen forty-two" in s and "nineteen nineties" in s
+    assert "1842" not in s and "1990" not in s
+
+
+@pytest.mark.parametrize("text", [
+    "Priced at $1908.",     # a price
+    "Pi to 1908.5 places.", # a decimal
+    "Zip code 12345.",      # part of a longer number
+    "Up 1908%.",            # a percentage
+    "Room 999.",            # below the year range
+])
+def test_numbers_that_are_not_years_are_left_alone(text):
+    out = audio._speakify(text)
+    assert "oh-eight" not in out and "nineteen" not in out, out

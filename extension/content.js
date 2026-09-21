@@ -43,6 +43,7 @@
   let backgrounded = false;              // panel closed while a summary was running
   let currentVideoId = null;
   let lastProgress = null;               // last progress event of the running summary
+  let partialState = null;               // {meta, points, paragraphs} while it streams
   api.storage.local.get({ closeAction: "continue" })
     .then((s) => { closeAction = s.closeAction === "abort" ? "abort" : "continue"; })
     .catch(() => {});
@@ -199,6 +200,7 @@
           border: 1px solid rgba(128,128,128,.4); background: transparent;
           color: inherit; }
         .askstatus { font-size: 12px; color: #888; min-height: 14px; margin-top: 6px; }
+        .writing { font-size: 13px; color: #888; margin: 10px 0 4px; }
         .sponsor { margin-top: 18px; padding: 12px 14px; border-radius: 10px;
           background: rgba(128,128,128,.1); font-size: 13px; line-height: 1.5; }
         .sponsor .srow { display: flex; gap: 10px; align-items: center;
@@ -348,6 +350,7 @@
     clearTimers();
     if (port) { try { port.disconnect(); } catch (_) {} port = null; }
     lastProgress = null;
+    partialState = null;
     showLoading();
     requestActive = true;
     currentVideoId = videoId;
@@ -357,10 +360,13 @@
       if (!requestActive) return;
       if (m.type === "progress") {
         lastProgress = m;          // replayed if the panel is re-opened mid-run
-        updateProgress(m.message, m.percent, m.creep);
+        // Once the summary is on screen the loading bar is gone; don't redraw it.
+        if (!partialState) updateProgress(m.message, m.percent, m.creep);
         return;
       }
+      if (m.type === "meta" || m.type === "partial") { onPartial(m); return; }
       requestActive = false;
+      partialState = null;
       if (m.type === "result") {
         if (backgrounded) { lastPayload = m.payload; endBackground("TL;DW summary ready"); }
         else showResult(m.payload, m.cached);
@@ -479,6 +485,83 @@
     c.innerHTML = `<div class="status err">${esc(msg).replace(/`([^`]+)`/g, "<code>$1</code>")}</div>`;
   }
 
+  // The action row, shared by the finished view and the one that fills in while
+  // the summary is still being written. Same markup in both, so nothing below it
+  // shifts when the result lands on top of whatever you're already reading.
+  function audioRowHtml(pending) {
+    const off = pending ? ' disabled title="Available once the summary is finished"' : "";
+    return `
+      <div class="audiorow">
+        <button class="playkey"${off} aria-label="Play just the key moments in the YouTube player">⏭ Play key moments</button>
+        <button class="listen"${off} aria-label="Generate spoken audio of this summary">🔊 Listen to summary</button>
+        <select class="voice"${off} aria-label="Voice"></select>
+        <button class="vpreview"${off} title="Hear a sample of this voice"
+          aria-label="Preview the selected voice">▶ Preview</button>
+      </div>
+      <div class="audioprogress">
+        <svg class="circ" viewBox="0 0 36 36" width="20" height="20" aria-hidden="true">
+          <circle class="circ-bg" cx="18" cy="18" r="15.5"></circle>
+          <circle class="circ-fg" cx="18" cy="18" r="15.5"></circle>
+        </svg>
+        <span class="audiostatus" aria-live="polite"></span>
+      </div>
+      <div class="audioslot"></div>`;
+  }
+
+  // --- The summary as it's written ----------------------------------------------
+  //
+  // The model spends ~35s generating after the first token arrives; the server now
+  // forwards each key point and paragraph as it's finished, so reading can start
+  // within seconds instead of waiting on the whole thing.
+  function showPartial() {
+    const st = partialState;
+    if (!st || !st.meta) return;
+    if (!host) mount();
+    // The loading view's animation timers only; the keepalive ping and the safety
+    // timeout belong to the request, which is still running.
+    if (stageTimer) { clearTimeout(stageTimer); stageTimer = null; }
+    if (creepTimer) { clearInterval(creepTimer); creepTimer = null; }
+    const m = st.meta;
+    root.querySelector(".content").innerHTML = `
+      <div class="meta">${esc(m.channel)} · ${esc(m.original_length)} · writing…</div>
+      <h1 style="margin-bottom:10px">${esc(m.title)}</h1>
+      ${audioRowHtml(true)}
+      <h2>Key points</h2><ul class="points">${st.points.map((k) => `<li>${esc(k)}</li>`).join("")}</ul>
+      <h2>Summary</h2><div class="body">${st.paragraphs.map(renderSummary).join("")}</div>
+      <div class="writing"><span class="spinner"></span>Writing the summary…</div>`;
+  }
+
+  // Append rather than re-render, so the page doesn't flicker or lose a selection
+  // on every new paragraph.
+  function appendPartial(kind, text) {
+    if (kind === "key_point") {
+      const ul = root.querySelector(".points");
+      if (ul) ul.insertAdjacentHTML("beforeend", `<li>${esc(text)}</li>`);
+    } else if (kind === "paragraph") {
+      const body = root.querySelector(".body");
+      if (body) body.insertAdjacentHTML("beforeend", renderSummary(text));
+    }
+  }
+
+  function onPartial(m) {
+    if (m.type === "meta") {
+      partialState = { meta: m.meta, points: [], paragraphs: [] };
+    } else if (partialState) {
+      const list = m.kind === "key_point" ? partialState.points
+        : m.kind === "paragraph" ? partialState.paragraphs : null;
+      if (!list) return;
+      list.push(m.text);
+    } else {
+      return;
+    }
+    if (backgrounded) return;                    // panel closed: keep state, draw later
+    if (m.type === "partial" && root && root.querySelector(".writing")) {
+      appendPartial(m.kind, m.text);
+    } else {
+      showPartial();
+    }
+  }
+
   function showResult(p, cached) {
     if (!host) mount();
     clearTimers();
@@ -490,21 +573,7 @@
       <div class="meta">${esc(p.channel)} · ${esc(p.original_length)} → ~${esc(p.length_label)} read ·
         <a href="${esc(p.source_url)}" target="_blank" rel="noopener noreferrer">original</a></div>
       <h1 style="margin-bottom:10px">${esc(p.title)}</h1>
-      <div class="audiorow">
-        <button class="playkey" aria-label="Play just the key moments in the YouTube player">⏭ Play key moments</button>
-        <button class="listen" aria-label="Generate spoken audio of this summary">🔊 Listen to summary</button>
-        <select class="voice" aria-label="Voice"></select>
-        <button class="vpreview" title="Hear a sample of this voice"
-          aria-label="Preview the selected voice">▶ Preview</button>
-      </div>
-      <div class="audioprogress">
-        <svg class="circ" viewBox="0 0 36 36" width="20" height="20" aria-hidden="true">
-          <circle class="circ-bg" cx="18" cy="18" r="15.5"></circle>
-          <circle class="circ-fg" cx="18" cy="18" r="15.5"></circle>
-        </svg>
-        <span class="audiostatus" aria-live="polite"></span>
-      </div>
-      <div class="audioslot"></div>
+      ${audioRowHtml(false)}
       ${points ? `<h2>Key points</h2><ul class="points">${points}</ul>` : ""}
       <h2>Summary</h2><div class="body">${renderSummary(p.summary_md || "")}</div>
       ${p.rationale ? `<div class="rationale">${esc(p.rationale)}</div>` : ""}
@@ -1410,6 +1479,10 @@
         // the long Claude step sends ONE progress event and then goes quiet for a
         // minute, so without this the bar sits at "Starting… 0%" until the result.
         backgrounded = false;
+        if (partialState && partialState.meta) {
+          showPartial();               // everything written while the panel was shut
+          return;
+        }
         // showLoading() resets progressPct, and replaying lastProgress would only
         // restore the server's last reported figure (15% for the Claude step) —
         // rewinding whatever the creep had reached since. Carry it across.

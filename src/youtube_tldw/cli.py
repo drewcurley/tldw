@@ -412,6 +412,18 @@ def _run_usage(argv: list[str]) -> int:
               f"${sum(float(r.get('cost_usd') or 0) for r in rs)/n:>8.4f} "
               f"${sum(float(r.get('cost_usd') or 0) for r in rs):>8.4f}")
 
+    # Which model did the work — the number that settles Thorough versus Fast.
+    by_model: dict = {}
+    for r in rows:
+        name = (r.get("model") or "").split("[")[0] or "(unrecorded)"
+        e = by_model.setdefault(name, [0, 0.0])
+        e[0] += 1
+        e[1] += float(r.get("cost_usd") or 0)
+    if len(by_model) > 1 or "(unrecorded)" not in by_model:
+        print()
+        for name, (n, cost) in sorted(by_model.items(), key=lambda kv: -kv[1][1]):
+            print(f"{name:<22} {n:>5} call(s)  ${cost / n:.4f} avg  ${cost:.4f} total")
+
     # What a video costs end to end is the question worth answering.
     per_video: dict = {}
     for r in rows:

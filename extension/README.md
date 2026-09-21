@@ -34,7 +34,11 @@ questions about the video.
 ## Use
 
 - Open any YouTube `/watch` page → click the **TL;DW** toolbar button.
-- A modal shows the title, key points, and summary (~20s; transcript fetch + Claude).
+- A modal shows the title, key points, and summary. They stream in as they're
+  written: title in ~4s, first key point in ~8s, the rest filling in behind it.
+- **Options → Model** picks *Thorough (Opus)*, the default, or *Fast (Sonnet)*, which
+  finishes in roughly half the time with shorter summaries. It applies to summaries,
+  key moments and questions.
 - **Copy** grabs the markdown; **Esc** or click-outside closes.
 - **🔊 Listen to summary** synthesizes the summary to speech (local Piper TTS) and
   plays it in the modal. Playback starts on the first second of audio and the rest

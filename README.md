@@ -215,7 +215,15 @@ calls are the summary, segment selection, and questions.
 tldw usage
 ```
 
-`--by-video` breaks it down per video, `--days N` limits the window. Follow-up
+`--by-video` breaks it down per video, `--days N` limits the window, and the report
+splits cost by model.
+
+tldw runs the `claude` CLI stripped of everything a coding agent carries by default
+— no tools, no MCP servers from your plugins, no settings files or `CLAUDE.md`, and
+its own short system prompt. That default context was ~89% of every request's input
+tokens (57,890 → 6,376 on an 18-minute video, about 5× cheaper), and it meant your
+personal Claude Code instructions were sent along with every transcript. One-shot
+calls also leave no session files behind in `~/.claude/projects`. Follow-up
 questions resume the video's existing model session, so only the new question is
 sent rather than the whole transcript again.
 
@@ -277,8 +285,10 @@ use the CLI instead.
 
 ## Browser extension
 
-One toolbar click on a YouTube page summarizes the video in an on-page modal. From
-there you can also:
+One toolbar click on a YouTube page summarizes the video in an on-page modal. The
+summary streams in as it's written — the title appears in about 4 seconds and the
+first key point in about 8, rather than the whole thing arriving at once ~45 seconds
+later. From there you can also:
 
 - **🔊 Listen** — local neural TTS of the summary, which starts playing about a second
   in rather than after the whole clip renders. **▶ Preview** auditions a voice, **⏹ Stop**
