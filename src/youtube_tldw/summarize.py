@@ -52,9 +52,11 @@ Emit each line the moment it is ready; do not hold anything back until the end.
 
 1. Each key takeaway, in order, one per line:
 {{"key_point": "concise bullet"}}
-2. Then the summary, one markdown paragraph per line — it must read naturally and
-   keep every key point:
+2. Then the summary, one line per block. Break it into a few titled sections, the
+   way you would a written article — a heading line, then the paragraphs under it:
+{{"heading": "Short section title"}}
 {{"paragraph": "a paragraph of the summary"}}
+   It must read naturally and keep every key point.
 3. Last, exactly one closing line:
 {{"chosen_ratio": 0.0, "rationale": "one sentence on why this length fits the content"}}"""
 
@@ -242,10 +244,16 @@ def _stream_text_summary(prompt: str, payload: str, *, timeout: float,
     closing: dict = {}
 
     def on_obj(obj: dict) -> None:
-        kp, para = obj.get("key_point"), obj.get("paragraph")
+        kp, para, head = obj.get("key_point"), obj.get("paragraph"), obj.get("heading")
         if isinstance(kp, str) and kp.strip():
             points.append(kp.strip())
             on_partial({"kind": "key_point", "text": kp.strip()})
+        elif isinstance(head, str) and head.strip():
+            # Carried as markdown so the assembled summary, the saved .md and the
+            # spoken script all see one representation.
+            block = "## " + head.strip().lstrip("#").strip()
+            paragraphs.append(block)
+            on_partial({"kind": "paragraph", "text": block})
         elif isinstance(para, str) and para.strip():
             paragraphs.append(para.strip())
             on_partial({"kind": "paragraph", "text": para.strip()})

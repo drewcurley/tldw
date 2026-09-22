@@ -39,6 +39,10 @@ _seg_prefetch_events: dict = {} # video_id -> threading.Event (while prefetch is
 # video_id -> (expires_at, session_id): the model-side conversation for this video.
 # Resuming it means a follow-up question doesn't re-send the transcript.
 _ask_sessions: dict = {}
+# video_id -> {"found": n, "pos_ms": how far into the video the model has read,
+# "duration_ms": total}. Published by a running selection so a waiter can show real
+# progress instead of a clock.
+_seg_progress: dict = {}
 
 
 def _prune(cache: dict) -> None:
@@ -115,12 +119,26 @@ def _start_seg_prefetch(meta, cues: list, model: str | None = None) -> None:
     def _run():
         from . import metadata as _md
         try:
+            def note(seg):
+                # Claude works through the transcript in order, so the end of the
+                # newest clip is how far it has read.
+                with _cache_lock:
+                    p = _seg_progress.setdefault(
+                        vid, {"found": 0, "pos_ms": 0,
+                              "duration_ms": meta.duration_ms})
+                    p["found"] += 1
+                    p["pos_ms"] = max(p["pos_ms"], int(seg.get("end", 0) * 1000))
+
             # A new thread: the request's model scope doesn't follow it here.
             with claude_client.use_model(model), usage.interaction("segments", vid):
                 _meta, segs = core.select_segments(
                     _md.watch_url(vid), None, "en",
                     timeout=SEGMENTS_TIMEOUT,
                     _prefetched=(meta, cues),
+                    # Both are needed to take the streaming path, which is the only
+                    # one that can report progress while it runs.
+                    on_progress=lambda *a, **k: None,
+                    on_segment_ready=note,
                 )
             _seg_cache_put(vid, _meta, segs)
             print(f"  prefetched {len(segs)} segments for {vid}", flush=True)
@@ -129,6 +147,7 @@ def _start_seg_prefetch(meta, cues: list, model: str | None = None) -> None:
         finally:
             with _cache_lock:
                 _seg_prefetch_events.pop(vid, None)
+                _seg_progress.pop(vid, None)
             evt.set()  # wake any waiter (even on failure, so it doesn't block forever)
 
     threading.Thread(target=_run, daemon=True).start()
@@ -197,6 +216,29 @@ _STATUS = {
 class _ClientGone(Exception):
     """Raised out of a streaming callback once the client has hung up, so the work
     behind it unwinds instead of running to completion into a dead socket."""
+
+
+_SEG_CRAWL_CAP = 30       # where the "no clips yet" crawl stops and real progress begins
+
+
+def _seg_progress_line(pos: dict, label: str, elapsed: float):
+    """(message, percent) for a selection in flight.
+
+    Before the first clip there is nothing to measure, so it falls back to a slow
+    crawl — but capped well below the real range, so arriving progress moves the bar
+    forwards rather than backwards.
+    """
+    duration = pos.get("duration_ms") or 0
+    if duration and pos.get("pos_ms"):
+        read = min(1.0, pos["pos_ms"] / duration)
+        # Starts exactly where the pre-clip crawl tops out, so the bar never
+        # jumps backwards when real progress takes over.
+        pct = round(min(_SEG_CRAWL_CAP + (95 - _SEG_CRAWL_CAP) * read, 95), 1)
+        found = pos.get("found", 0)
+        return (f"Analyzing {label}… {int(pct)}% ({found} clip"
+                f"{'' if found == 1 else 's'} so far)", pct)
+    return (f"Reading the transcript… ({int(elapsed)}s)",
+            round(min(20 + elapsed * 0.15, _SEG_CRAWL_CAP), 1))
 
 
 def _vid_of(url: str) -> str:
@@ -516,16 +558,24 @@ class _Handler(BaseHTTPRequestHandler):
             vid = None
 
         def _wait_with_heartbeat(wait_evt, cue_label):
-            """Block on wait_evt in 5s chunks, emitting progress each tick.
-            Returns True if the event fired, False if SEGMENTS_TIMEOUT exceeded."""
-            progress(f"Analyzing {cue_label}…", 22)
+            """Wait for a running selection, reporting how far through the video it
+            has read rather than how long we've been waiting.
+
+            Returns True if the event fired, False if SEGMENTS_TIMEOUT exceeded.
+            """
+            progress(f"Analyzing {cue_label}…", 20)
             t0 = time.monotonic()
-            while not wait_evt.wait(timeout=5.0):
+            last_msg = None
+            while not wait_evt.wait(timeout=2.0):
                 elapsed = time.monotonic() - t0
                 if elapsed >= SEGMENTS_TIMEOUT:
                     return False
-                pct = round(min(25 + elapsed * 0.85, 92), 1)
-                progress(f"Analyzing {cue_label}… ({int(elapsed)}s)", pct)
+                with _cache_lock:
+                    pos = dict(_seg_progress.get(vid) or {})
+                msg, pct = _seg_progress_line(pos, cue_label, elapsed)
+                if msg != last_msg:        # only when something actually changed
+                    progress(msg, pct)
+                    last_msg = msg
             return True
 
         def _emit_segments(meta, segments):
@@ -574,9 +624,15 @@ class _Handler(BaseHTTPRequestHandler):
         prefetched = tx_hit
         streamed_segs: list = []
 
+        direct_ms = tx_hit[0].duration_ms if tx_hit else 0
+
         def _on_segment_ready(seg: dict) -> None:
             streamed_segs.append(seg)
             emit({"type": "segment_added", "segment": seg})
+            msg, pct = _seg_progress_line(
+                {"found": len(streamed_segs), "pos_ms": int(seg.get("end", 0) * 1000),
+                 "duration_ms": direct_ms}, cue_label, 0)
+            progress(msg, pct)
 
         try:
             with usage.interaction("segments", vid or ""):
