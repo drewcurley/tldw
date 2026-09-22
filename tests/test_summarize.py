@@ -245,3 +245,29 @@ def test_no_on_partial_means_the_original_buffered_path(monkeypatch):
     monkeypatch.setattr(summarize, "ask_json",
                         lambda p, *a, **k: summarize.TextResult(["k"], "b", None, ""))
     assert summarize.summarize_text(_cues(5), "C", "T", None, timeout=1).summary == "b"
+
+
+def test_streamed_headings_become_markdown_sections(monkeypatch):
+    """The summary is written in titled sections. The streaming format asked for
+    "one paragraph per line", so the model stopped emitting them entirely."""
+    _stream_lines(monkeypatch, [
+        {"key_point": "a point"},
+        {"heading": "The problem"},
+        {"paragraph": "Recognizing digits is hard."},
+        {"heading": "## Neurons"},          # already hashed: not double-hashed
+        {"paragraph": "A neuron holds a number."},
+        {"chosen_ratio": 0.2, "rationale": "dense"},
+    ])
+    _no_buffered(monkeypatch)
+    partials = []
+    res = summarize.summarize_text(_cues(5), "C", "T", None, timeout=1,
+                                   on_partial=partials.append)
+    assert res.summary == ("## The problem\n\nRecognizing digits is hard.\n\n"
+                           "## Neurons\n\nA neuron holds a number.")
+    # The client renders headings from the same markdown, so they stream as blocks.
+    assert [p["text"] for p in partials if p["kind"] == "paragraph"][0] == "## The problem"
+
+
+def test_stream_prompt_asks_for_sections():
+    p = summarize._TEXT_PROMPT_STREAM.format(ratio_clause="")
+    assert '"heading"' in p and "sections" in p

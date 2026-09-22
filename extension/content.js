@@ -101,6 +101,13 @@
       .filter((b) => b.trim())
       .map((block) => {
         const lines = block.split("\n").filter((l) => l.trim());
+        // Section headings: the summary has always been written with them, and they
+        // rendered as a literal "## Title" because nothing handled them here.
+        const h = /^(#{1,4})\s+(.+)$/.exec(block.trim());
+        if (h && lines.length === 1) {
+          const level = Math.min(h[1].length + 2, 6);     // # -> h3, ## -> h4
+          return `<h${level} class="shead">${inlineMd(h[2])}</h${level}>`;
+        }
         if (lines.length && lines.every((l) => /^\s*[-*]\s+/.test(l))) {
           return "<ul>" + lines
             .map((l) => "<li>" + inlineMd(l.replace(/^\s*[-*]\s+/, "")) + "</li>")
@@ -200,6 +207,8 @@
           border: 1px solid rgba(128,128,128,.4); background: transparent;
           color: inherit; }
         .askstatus { font-size: 12px; color: #888; min-height: 14px; margin-top: 6px; }
+        .shead { font-size: 14px; font-weight: 600; margin: 16px 0 6px;
+          text-transform: none; letter-spacing: 0; opacity: 1; }
         .writing { font-size: 13px; color: #888; margin: 10px 0 4px; }
         .sponsor { margin-top: 18px; padding: 12px 14px; border-radius: 10px;
           background: rgba(128,128,128,.1); font-size: 13px; line-height: 1.5; }

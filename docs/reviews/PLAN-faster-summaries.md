@@ -110,6 +110,31 @@ Purchasing: per-summary cost fell ~5× from the lean flags alone, which is the u
 economics question from the pricing discussion. CEO/Marketing: "you're reading in
 eight seconds" demos well; no new risk.
 
+## Round 2 — two things the first round got wrong
+
+**Section headings vanished from summaries.** Reported after using it. The streaming
+format asked for "one markdown paragraph per line", and a heading isn't a paragraph,
+so the model stopped writing them. Attributed by experiment rather than guessed:
+Opus produces `## The problem` with the batch prompt under *both* the lean and the
+old non-lean invocation (7 and 6 headings), so the lean flags were innocent. The
+stream format now has a `{"heading": ...}` line, carried as markdown so the
+assembled summary, the saved `.md` and the spoken script all see one representation.
+Verified against the real model: 6 headings back.
+
+That also exposed an older bug: `renderSummary` had no heading case, so every
+`## Title` the summary has ever contained displayed as a literal `## Title` in the
+panel. Now rendered, escaped like everything else, with a test that a hash
+mid-sentence or without a space is still prose.
+
+**Segment progress was a clock, not progress.** "Analyzing 1570 cues… (5s) … (10s)"
+counted the wait; it said nothing about how far along the selection was. Claude works
+through the transcript in order, so the end of the newest clip is how far it has
+read. The prefetch now takes the streaming path and publishes `{found, pos_ms,
+duration_ms}`; the waiter reports position. A test caught a flaw in the first cut —
+the pre-clip crawl topped out at 30% while real progress started at 20%, so the bar
+would have jumped *backwards* the moment a clip arrived. The two ranges now meet at
+one constant.
+
 ## Items (non-blocking)
 
 - **Summary cache is keyed by video, not model**: switching to Sonnet shows a video's
@@ -122,4 +147,8 @@ eight seconds" demos well; no new risk.
 - **Years heuristic**: a 1000–2099 count written as digits is voiced as a year
   ("fifteen hundred people"). The prompt asks for counts in words, and the reading
   is still natural.
+- **Segment selection is now the most expensive call** — a 1570-cue video cost
+  $0.94 (20,027 output tokens) against $0.17 for its summary. Most of that is
+  adaptive thinking on a mechanical index-picking task; `--effort low` for this one
+  step looks like the obvious lever, unmeasured so far.
 - The CLI (`tldw URL`) doesn't stream; it gets the lean flags and prints at the end.

@@ -34,6 +34,23 @@ check("bullets", renderSummary("- one\n- two"), "<ul><li>one</li><li>two</li></u
 check("bold in bullets", renderSummary("- **a** b"), "<ul><li><strong>a</strong> b</li></ul>");
 check("paragraphs", renderSummary("one\n\ntwo"), "<p>one</p><p>two</p>");
 
+// Summaries have always been written with section headings; nothing rendered them,
+// so they showed up as a literal "## The problem".
+check("h2 heading", renderSummary("## The problem"),
+  '<h4 class="shead">The problem</h4>');
+check("h1 heading", renderSummary("# Top"), '<h3 class="shead">Top</h3>');
+check("heading with bold inside", renderSummary("## a **b**"),
+  '<h4 class="shead">a <strong>b</strong></h4>');
+check("heading is escaped like everything else",
+  renderSummary("## <script>alert(1)</script>").includes("<script>"), false);
+check("a hash mid-sentence is not a heading",
+  renderSummary("issue #5 matters"), "<p>issue #5 matters</p>");
+check("a hash without a space is not a heading",
+  renderSummary("#hashtag"), "<p>#hashtag</p>");
+check("headings and prose together",
+  renderSummary("## One\n\nbody\n\n## Two"),
+  '<h4 class="shead">One</h4><p>body</p><h4 class="shead">Two</h4>');
+
 // --- citations become seek links, with the right offsets ---
 check("mm:ss", renderAnswer("phone book [12:34]."),
   (h) => h.includes('data-t="754"') && h.includes(">12:34</a>"));

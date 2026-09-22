@@ -702,7 +702,8 @@ def test_segment_prefetch_inherits_the_request_model(monkeypatch):
     """It runs on its own thread, where the request's model scope doesn't reach."""
     seen, done = [], threading.Event()
 
-    def fake_select(url, ratio, lang, *, timeout, _prefetched):
+    def fake_select(url, ratio, lang, *, timeout, _prefetched, on_progress=None,
+                    on_segment_ready=None):
         seen.append(server.claude_client.current_model())
         done.set()
         return _prefetched[0], []
@@ -756,3 +757,52 @@ def test_preflight_rejects_web_origin(srv):
                            headers={"Origin": "https://evil.com"})
     assert status == 204
     assert "Access-Control-Allow-Origin" not in hdrs  # fail closed
+
+
+# --- segment progress ---------------------------------------------------------
+
+def test_progress_reports_position_in_the_video_not_elapsed_time():
+    """It used to tick "(5s)… (10s)…" off a clock, which said nothing about how far
+    along the selection actually was."""
+    half = {"found": 3, "pos_ms": 300_000, "duration_ms": 600_000}
+    msg, pct = server._seg_progress_line(half, "1570 cues", elapsed=5)
+    assert pct == 62.5                       # 30 + 65 * 0.5
+    assert "62%" in msg and "3 clips so far" in msg
+    assert "5s" not in msg
+
+
+def test_progress_before_the_first_clip_stays_below_the_real_range():
+    """Nothing to measure yet — the crawl must not overshoot where real progress
+    starts, or the bar would jump backwards once a clip arrives."""
+    msg, pct = server._seg_progress_line({}, "cues", elapsed=120)
+    assert pct <= 30 and "Reading the transcript" in msg
+    _, real = server._seg_progress_line(
+        {"found": 1, "pos_ms": 1, "duration_ms": 600_000}, "cues", elapsed=120)
+    assert real >= pct
+
+
+def test_progress_is_capped_and_singular_for_one_clip():
+    msg, pct = server._seg_progress_line(
+        {"found": 1, "pos_ms": 999_999, "duration_ms": 600_000}, "cues", 1)
+    assert pct == 95 and "1 clip so far" in msg      # not "1 clips"
+
+
+def test_prefetch_publishes_progress_as_it_finds_clips(monkeypatch):
+    seen, done = [], threading.Event()
+
+    def fake_select(url, ratio, lang, *, timeout, _prefetched, on_progress=None,
+                    on_segment_ready=None):
+        assert on_segment_ready is not None       # must take the streaming path
+        on_segment_ready({"start": 10.0, "end": 60.0, "label": "0:10"})
+        seen.append(dict(server._seg_progress.get("progvid") or {}))
+        done.set()
+        return _prefetched[0], []
+
+    monkeypatch.setattr(server.core, "select_segments", fake_select)
+    meta = VideoMeta("progvid", "T", "C", 600_000, {}, {})
+    server._start_seg_prefetch(meta, [])
+    assert done.wait(5)
+    assert seen[0]["found"] == 1 and seen[0]["pos_ms"] == 60_000
+    assert seen[0]["duration_ms"] == 600_000
+    time.sleep(0.2)
+    assert "progvid" not in server._seg_progress      # cleaned up when it finishes
