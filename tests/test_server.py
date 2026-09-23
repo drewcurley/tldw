@@ -26,7 +26,11 @@ EXT_ORIGIN = "chrome-extension://abcdefghijklmnop"
 
 
 @pytest.fixture(autouse=True)
-def _clear_caches():
+def _clear_caches(tmp_path, monkeypatch):
+    # The disk cache too: without this the tests write transcripts into the real
+    # ~/.cache and leak state into each other.
+    from youtube_tldw import txcache
+    monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path / "txcache")
     caches = (server._transcript_cache, server._seg_cache, server._ask_sessions)
     for cache in caches:
         cache.clear()
@@ -855,3 +859,55 @@ def test_prefetch_uses_the_pages_trim_strength(srv, monkeypatch):
     assert seen["ratio"] == 0.25
     _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
     assert seen["ratio"] is None
+
+
+# --- transcripts on disk ------------------------------------------------------
+
+def test_transcript_survives_a_restart(monkeypatch, tmp_path):
+    """The cache was memory-only, so every `tldw serve` restart re-fetched every
+    video — and YouTube answers bursts with 429."""
+    from youtube_tldw import txcache
+    monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path)
+    from youtube_tldw.transcript import Cue
+    meta = VideoMeta("diskvid", "T", "C", 1000, {"en": []}, {})
+    cues = [Cue(0, 900, "hello"), Cue(900, 1800, "there")]
+
+    server._cache_put("diskvid", meta, cues)
+    with server._cache_lock:                      # simulate a restart
+        server._transcript_cache.clear()
+
+    hit = server._cache_get("diskvid")
+    assert hit is not None, "re-fetched instead of reading the cache"
+    got_meta, got_cues = hit
+    assert got_meta.video_id == "diskvid" and got_meta.duration_ms == 1000
+    assert got_meta.subtitles == {"en": []}
+    assert [(c.start_ms, c.end_ms, c.text) for c in got_cues] == \
+        [(0, 900, "hello"), (900, 1800, "there")]
+    with server._cache_lock:                      # and it's back in memory
+        assert "diskvid" in server._transcript_cache
+
+
+def test_expired_disk_entries_are_ignored(monkeypatch, tmp_path):
+    from youtube_tldw import txcache
+    monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(txcache, "TTL_SECONDS", -1)
+    from youtube_tldw.transcript import Cue
+    txcache.put("oldvid", VideoMeta("oldvid", "T", "C", 1, {}, {}), [Cue(0, 1, "x")])
+    assert txcache.get("oldvid") is None
+
+
+def test_a_corrupt_cache_file_is_a_miss_not_an_error(monkeypatch, tmp_path):
+    from youtube_tldw import txcache
+    monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path)
+    (tmp_path / "badvid.json").write_text("{ this is not json")
+    assert txcache.get("badvid") is None
+    (tmp_path / "shortvid.json").write_text('{"saved_at": 0}')
+    assert txcache.get("shortvid") is None
+
+
+def test_caching_never_breaks_the_request_it_speeds_up(monkeypatch, tmp_path):
+    from youtube_tldw import txcache
+    monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path / "nope")
+    monkeypatch.setattr(txcache, "_prune", lambda: 1 / 0)      # anything at all
+    txcache.put("v", VideoMeta("v", "T", "C", 1, {}, {}), ["not even a cue"])
+    assert txcache.get("v") is None

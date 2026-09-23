@@ -204,6 +204,17 @@ costs nothing to run and nothing to give away. If it saves you time,
 [sponsoring it](https://github.com/sponsors/drewcurley) is welcome and never
 required. `tldw usage` will tell you how many hours it has saved you.
 
+## YouTube rate limiting
+
+YouTube answers bursts of requests from one address with **HTTP 429**. tldw makes
+exactly two yt-dlp calls per video (metadata, then the subtitle track) and both now
+retry with exponential backoff, so a single 429 recovers instead of failing.
+
+Transcripts are cached to `~/.cache/youtube-tldw/transcripts/` for a fortnight, so
+restarting `tldw serve` no longer re-fetches videos you've already summarized — the
+cache used to live only in memory, which made restarts the main source of repeat
+requests. If you do get rate-limited, it clears on its own in a few minutes.
+
 ## Token usage and cost
 
 Every model call is recorded to `~/.config/youtube-tldw/usage.jsonl` — step, token

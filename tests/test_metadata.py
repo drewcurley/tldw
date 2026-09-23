@@ -84,3 +84,41 @@ def test_download_video_missing_raises(monkeypatch, tmp_path):
     monkeypatch.setattr(metadata, "run", lambda *a, **k: None)
     with pytest.raises(TldrError):
         metadata.download_video(VID, tmp_path)
+
+
+# --- rate limiting ------------------------------------------------------------
+
+def test_rate_limited_detects_youtube_throttling():
+    assert metadata.rate_limited("ERROR: Unable to download: HTTP Error 429: Too Many Requests")
+    assert metadata.rate_limited("too many requests")
+    assert not metadata.rate_limited("ERROR: Video unavailable")
+    assert not metadata.rate_limited("")
+    assert not metadata.rate_limited(None)
+
+
+def test_a_429_is_explained_rather_than_dumped(monkeypatch):
+    """The raw yt-dlp text reads like a bug in tldw. It isn't, and it passes."""
+    def boom(argv, **kw):
+        raise TldrError("`yt-dlp` failed (exit 1): ERROR: HTTP Error 429: Too Many Requests")
+
+    monkeypatch.setattr(metadata, "run", boom)
+    with pytest.raises(TldrError) as exc:
+        metadata.fetch_metadata("dQw4w9WgXcQ")
+    assert "rate-limiting" in str(exc.value) and "wait a few minutes" in str(exc.value).lower()
+    assert "yt-dlp" not in str(exc.value)
+
+
+def test_other_failures_are_left_alone(monkeypatch):
+    def boom(argv, **kw):
+        raise TldrError("`yt-dlp` failed (exit 1): ERROR: Video unavailable")
+
+    monkeypatch.setattr(metadata, "run", boom)
+    with pytest.raises(TldrError, match="Video unavailable"):
+        metadata.fetch_metadata("dQw4w9WgXcQ")
+
+
+def test_both_yt_dlp_calls_retry_with_backoff():
+    """A single 429 used to be an immediate hard failure."""
+    for flag in ("--retries", "--extractor-retries", "--retry-sleep"):
+        assert flag in metadata._RETRY
+    assert any("exp=" in a for a in metadata._RETRY)
