@@ -210,8 +210,9 @@ YouTube answers bursts of requests from one address with **HTTP 429**. tldw make
 exactly two yt-dlp calls per video (metadata, then the subtitle track) and both now
 retry with exponential backoff, so a single 429 recovers instead of failing.
 
-Transcripts are cached to `~/.cache/youtube-tldw/transcripts/` for a fortnight, so
-restarting `tldw serve` no longer re-fetches videos you've already summarized — the
+Transcripts are cached to `~/.cache/youtube-tldw/transcripts/` for a fortnight and
+every path reads them — summarizing included — so restarting `tldw serve` no longer
+re-fetches videos you've already summarized — the
 cache used to live only in memory, which made restarts the main source of repeat
 requests. If you do get rate-limited, it clears on its own in a few minutes.
 

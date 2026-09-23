@@ -273,6 +273,17 @@ def _seg_progress_line(pos: dict, label: str, elapsed: float):
             round(min(20 + elapsed * 0.15, _SEG_CRAWL_CAP), 1))
 
 
+def _cached_transcript(url: str):
+    """(meta, cues) for this video if we already have them, else None.
+
+    Summarizing was the one path that never looked: it wrote to the cache when it
+    finished and read from it never, so every restart re-fetched from YouTube — the
+    thing most likely to get the machine rate-limited.
+    """
+    vid = _vid_of(url)
+    return _cache_get(vid, touch=True) if vid else None
+
+
 def _vid_of(url: str) -> str:
     """Best-effort video id for usage attribution; never raises."""
     try:
@@ -469,7 +480,8 @@ class _Handler(BaseHTTPRequestHandler):
             with usage.interaction("summarize", _vid_of(url)):
                 summary = core.summarize_url(
                     url, ratio, lang, timeout=REQUEST_TIMEOUT,
-                    max_chars=SINGLE_PASS_CHARS, on_progress=self._logger(start))
+                    max_chars=SINGLE_PASS_CHARS, on_progress=self._logger(start),
+                    _prefetched=_cached_transcript(url))
                 usage.note_video(summary.meta.video_id, summary.meta.duration_ms,
                                  textmode.summary_word_count(summary.result))
         except TldrError as exc:
@@ -514,7 +526,7 @@ class _Handler(BaseHTTPRequestHandler):
                 summary = core.summarize_url(
                     url, ratio, lang, timeout=REQUEST_TIMEOUT,
                     max_chars=SINGLE_PASS_CHARS, on_progress=progress,
-                    on_partial=partial)
+                    on_partial=partial, _prefetched=_cached_transcript(url))
                 usage.note_video(summary.meta.video_id, summary.meta.duration_ms,
                                  textmode.summary_word_count(summary.result))
         except TldrError as exc:

@@ -177,7 +177,7 @@ def test_summarize_stream_emits_progress_then_result(srv, monkeypatch):
     _, port = srv
 
     def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None,
-             on_partial=None):
+             on_partial=None, _prefetched=None):
         if on_progress:
             on_progress("fetching metadata…")
             on_progress("summarizing with Claude…")
@@ -194,7 +194,7 @@ def test_summarize_stream_error_is_in_band(srv, monkeypatch):
     _, port = srv
 
     def boom(url, ratio, lang, *, timeout, max_chars, on_progress=None,
-             on_partial=None):
+             on_partial=None, _prefetched=None):
         raise NoTranscriptError("no captions")
 
     monkeypatch.setattr(server.core, "summarize_url", boom)
@@ -659,7 +659,8 @@ def test_summarize_stream_sends_the_summary_as_it_is_written(srv, monkeypatch):
     then the full result — reading can start long before the model finishes."""
     _, port = srv
 
-    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None, on_partial=None):
+    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None,
+             on_partial=None, _prefetched=None):
         summary = _summary()
         on_partial({"kind": "meta", "meta": summary.meta})
         on_partial({"kind": "key_point", "text": "point one"})
@@ -682,7 +683,8 @@ def test_requested_model_is_pinned_for_the_request(srv, monkeypatch):
     _, port = srv
     seen = []
 
-    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None, on_partial=None):
+    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None,
+             on_partial=None, _prefetched=None):
         seen.append(server.claude_client.current_model())
         return _summary()
 
@@ -844,7 +846,8 @@ def test_prefetch_uses_the_pages_trim_strength(srv, monkeypatch):
     _, port = srv
     seen = {}
 
-    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None, on_partial=None):
+    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None,
+             on_partial=None, _prefetched=None):
         base = _summary()
         # The prefetch only starts when there's a transcript to select from.
         return core.Summary(base.meta, base.result, base.cue_count, ["a cue"])
@@ -911,3 +914,40 @@ def test_caching_never_breaks_the_request_it_speeds_up(monkeypatch, tmp_path):
     monkeypatch.setattr(txcache, "_prune", lambda: 1 / 0)      # anything at all
     txcache.put("v", VideoMeta("v", "T", "C", 1, {}, {}), ["not even a cue"])
     assert txcache.get("v") is None
+
+
+def test_summarizing_again_does_not_refetch_the_video(srv, monkeypatch, tmp_path):
+    """Summarizing wrote to the transcript cache and read from it never, so every
+    server restart re-fetched from YouTube — the surest way to get 429'd."""
+    _, port = srv
+    from youtube_tldw.transcript import Cue
+    meta = VideoMeta("dQw4w9WgXcQ", "Cool Title", "Chan", 600_000, {}, {})
+    cues = [Cue(0, 900, "hello")]
+    fetches, prefetched = [], []
+
+    def fake_fetch(vid, lang="en", *, on_progress=None, pcts=(3, 7, 13)):
+        fetches.append(vid)
+        return meta, cues
+
+    def fake_summarize(cues_, channel, title, ratio, *, timeout, on_partial=None,
+                       on_progress=None):
+        return TextResult(["k"], "body", 0.2, "why")
+
+    monkeypatch.setattr(server.core, "fetch_transcript", fake_fetch)
+    monkeypatch.setattr(server.core.summarize, "summarize_text", fake_summarize)
+    monkeypatch.setattr(server, "_start_seg_prefetch",
+                        lambda *a, **k: prefetched.append(1))
+
+    body = {"url": "https://youtu.be/dQw4w9WgXcQ"}
+    assert _read_ndjson(port, body, _auth())[-1]["type"] == "result"
+    assert fetches == ["dQw4w9WgXcQ"]           # first time: fetched
+
+    with server._cache_lock:                    # simulate a server restart
+        server._transcript_cache.clear()
+    assert _read_ndjson(port, body, _auth())[-1]["type"] == "result"
+    assert fetches == ["dQw4w9WgXcQ"], "re-fetched a transcript we already had"
+
+
+def test_cached_transcript_lookup_survives_a_bad_url():
+    assert server._cached_transcript("https://example.com/not-a-video") is None
+    assert server._cached_transcript("https://youtu.be/dQw4w9WgXcQ") is None
