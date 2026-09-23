@@ -78,16 +78,40 @@ def _cache_get(video_id: str, *, touch: bool = False):
         return None
 
 
-def _seg_cache_put(video_id: str, meta, segments: list) -> None:
+def _segment_ratio(body):
+    """How aggressively the page wants key moments trimmed, if it said.
+
+    Separate from `ratio`, which shapes the written summary — the two are different
+    questions and the page sets them independently.
+    """
+    if not isinstance(body, dict):
+        return None
+    value = body.get("segment_ratio")
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if 0 < value <= 1 else None
+
+
+def _seg_key(video_id: str, ratio):
+    """Selections differ by how aggressively they trim, so the trim strength is part
+    of the cache identity — otherwise asking for a tighter cut returns the looser
+    selection that was prefetched earlier."""
+    return (video_id, round(ratio, 3) if isinstance(ratio, (int, float)) else None)
+
+
+def _seg_cache_put(video_id: str, meta, segments: list, ratio=None) -> None:
     with _cache_lock:
-        _seg_cache[video_id] = (time.monotonic() + _CACHE_TTL, meta, segments)
+        _seg_cache[_seg_key(video_id, ratio)] = (
+            time.monotonic() + _CACHE_TTL, meta, segments)
         _prune(_seg_cache)
 
 
-def _seg_cache_get(video_id: str):
+def _seg_cache_get(video_id: str, ratio=None):
     """Return (meta, segments) if a fresh entry exists, else None."""
     with _cache_lock:
-        entry = _seg_cache.get(video_id)
+        entry = _seg_cache.get(_seg_key(video_id, ratio))
         if entry and entry[0] > time.monotonic():
             return entry[1], entry[2]
         return None
@@ -105,16 +129,17 @@ def _session_put(video_id: str, session_id: str) -> None:
         _prune(_ask_sessions)
 
 
-def _start_seg_prefetch(meta, cues: list, model: str | None = None) -> None:
+def _start_seg_prefetch(meta, cues: list, model: str | None = None, ratio=None) -> None:
     """Start background segment selection. No-op if one is already running for this video.
     Stores a threading.Event in _seg_prefetch_events so _run_segments can wait instead
     of spawning a second concurrent Claude call."""
     vid = meta.video_id
+    key = _seg_key(vid, ratio)
     with _cache_lock:
-        if vid in _seg_prefetch_events:
+        if key in _seg_prefetch_events:
             return  # already running — don't spawn a second one
         evt = threading.Event()
-        _seg_prefetch_events[vid] = evt
+        _seg_prefetch_events[key] = evt
 
     def _run():
         from . import metadata as _md
@@ -124,7 +149,7 @@ def _start_seg_prefetch(meta, cues: list, model: str | None = None) -> None:
                 # newest clip is how far it has read.
                 with _cache_lock:
                     p = _seg_progress.setdefault(
-                        vid, {"found": 0, "pos_ms": 0,
+                        key, {"found": 0, "pos_ms": 0,
                               "duration_ms": meta.duration_ms})
                     p["found"] += 1
                     p["pos_ms"] = max(p["pos_ms"], int(seg.get("end", 0) * 1000))
@@ -132,7 +157,7 @@ def _start_seg_prefetch(meta, cues: list, model: str | None = None) -> None:
             # A new thread: the request's model scope doesn't follow it here.
             with claude_client.use_model(model), usage.interaction("segments", vid):
                 _meta, segs = core.select_segments(
-                    _md.watch_url(vid), None, "en",
+                    _md.watch_url(vid), ratio, "en",
                     timeout=SEGMENTS_TIMEOUT,
                     _prefetched=(meta, cues),
                     # Both are needed to take the streaming path, which is the only
@@ -140,14 +165,14 @@ def _start_seg_prefetch(meta, cues: list, model: str | None = None) -> None:
                     on_progress=lambda *a, **k: None,
                     on_segment_ready=note,
                 )
-            _seg_cache_put(vid, _meta, segs)
+            _seg_cache_put(vid, _meta, segs, ratio)
             print(f"  prefetched {len(segs)} segments for {vid}", flush=True)
         except Exception as exc:
             print(f"  segment prefetch failed for {vid}: {exc}", flush=True)
         finally:
             with _cache_lock:
-                _seg_prefetch_events.pop(vid, None)
-                _seg_progress.pop(vid, None)
+                _seg_prefetch_events.pop(key, None)
+                _seg_progress.pop(key, None)
             evt.set()  # wake any waiter (even on failure, so it doesn't block forever)
 
     threading.Thread(target=_run, daemon=True).start()
@@ -348,7 +373,7 @@ class _Handler(BaseHTTPRequestHandler):
                 elif path == "/speak/stream":
                     self._run_speak(body, stream=True)
                 elif path == "/summarize/stream":
-                    self._run_stream(*parsed)
+                    self._run_stream(*parsed, body)
                 elif path == "/segments/stream":
                     self._run_segments(*parsed, body)
                 else:
@@ -448,7 +473,7 @@ class _Handler(BaseHTTPRequestHandler):
         print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s", flush=True)
         self._send_json(200, _to_payload(summary))
 
-    def _run_stream(self, url, ratio, lang) -> None:
+    def _run_stream(self, url, ratio, lang, body=None) -> None:
         """NDJSON stream: one {type:progress|result|error} JSON object per line."""
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
@@ -499,8 +524,11 @@ class _Handler(BaseHTTPRequestHandler):
             _cache_put(summary.meta.video_id, summary.meta, summary.cues)
             # Kick off segment selection in the background so "play key moments" is
             # ready by the time the user reads the summary.
+            # The prefetch has to produce the selection the page will ask for: a
+            # looser one cached under a different key would never be used.
             _start_seg_prefetch(summary.meta, summary.cues,
-                                claude_client.current_model())
+                                claude_client.current_model(),
+                                _segment_ratio(body))
         emit({"type": "result", **_to_payload(summary), "stats": usage.stats()})
 
     def _validate_speak(self, body: dict):
@@ -571,7 +599,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if elapsed >= SEGMENTS_TIMEOUT:
                     return False
                 with _cache_lock:
-                    pos = dict(_seg_progress.get(vid) or {})
+                    pos = dict(_seg_progress.get(_seg_key(vid, ratio)) or {})
                 msg, pct = _seg_progress_line(pos, cue_label, elapsed)
                 if msg != last_msg:        # only when something actually changed
                     progress(msg, pct)
@@ -593,8 +621,8 @@ class _Handler(BaseHTTPRequestHandler):
                   "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
 
         # 1. Instant cache hit
-        if vid and max_ms is None and ratio is None:
-            seg_hit = _seg_cache_get(vid)
+        if vid and max_ms is None:
+            seg_hit = _seg_cache_get(vid, ratio)
             if seg_hit:
                 meta, segments = seg_hit
                 print(f"  cached segments for {vid} ({len(segments)} moments, "
@@ -607,13 +635,13 @@ class _Handler(BaseHTTPRequestHandler):
         cue_label = f"{len(tx_hit[1])} cues" if tx_hit else "transcript"
 
         # 2. Wait for in-progress prefetch (heartbeat while blocked)
-        if vid and max_ms is None and ratio is None:
+        if vid and max_ms is None:
             with _cache_lock:
-                prefetch_evt = _seg_prefetch_events.get(vid)
+                prefetch_evt = _seg_prefetch_events.get(_seg_key(vid, ratio))
             if prefetch_evt:
                 print(f"  waiting for prefetch for {vid}", flush=True)
                 _wait_with_heartbeat(prefetch_evt, cue_label)
-                seg_hit = _seg_cache_get(vid)
+                seg_hit = _seg_cache_get(vid, ratio)
                 if seg_hit:
                     _emit_segments(*seg_hit)
                     return
@@ -652,7 +680,7 @@ class _Handler(BaseHTTPRequestHandler):
             emit({"type": "error", "status": 500, "error": "internal error"})
             return
         if vid:
-            _seg_cache_put(vid, meta, segments)
+            _seg_cache_put(vid, meta, segments, ratio)
         if streamed_segs:
             _emit_segments_done(meta, segments)
         else:

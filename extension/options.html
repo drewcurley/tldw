@@ -16,7 +16,7 @@
     .voicerow { display: flex; gap: 8px; align-items: stretch; }
     .voicerow select { flex: 1; min-width: 0; padding: 8px 10px; font: inherit;
       border: 1px solid #bbb; border-radius: 8px; background: #fff; }
-    #closeAction, #model { width: 100%; padding: 8px 10px; font: inherit;
+    #closeAction, #model, #segmentRatio { width: 100%; padding: 8px 10px; font: inherit;
       background: #fff; border: 1px solid #bbb; border-radius: 8px; }
     #preview { margin-top: 0; flex: 0 0 auto; background: #444; }
     #preview[disabled] { opacity: .6; cursor: default; }
@@ -43,6 +43,16 @@
   </select>
   <p class="hint">Used for summaries, key moments and questions. Sonnet finishes in
     roughly half the time and writes shorter summaries; Opus is more thorough.</p>
+  <label for="segmentRatio">Key moments length</label>
+  <select id="segmentRatio">
+    <option value="auto">Auto — let the AI judge each video (default)</option>
+    <option value="0.25">Tight — about a quarter of the original</option>
+    <option value="0.4">Balanced — about 40%</option>
+    <option value="0.6">Generous — about 60%</option>
+  </select>
+  <p class="hint">Applies to <strong>Play key moments</strong>, not the written
+    summary. Auto lets a dense video stay long and a padded one get cut hard;
+    anything else is both a target and a hard cap on the total clip time.</p>
   <label for="closeAction">If you close the panel while it's still working</label>
   <select id="closeAction">
     <option value="continue">Keep working in the background</option>

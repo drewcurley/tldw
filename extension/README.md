@@ -36,6 +36,11 @@ questions about the video.
 - Open any YouTube `/watch` page → click the **TL;DW** toolbar button.
 - A modal shows the title, key points, and summary. They stream in as they're
   written: title in ~4s, first key point in ~8s, the rest filling in behind it.
+- **Options → Key moments length** sets how hard **Play key moments** trims: *Auto*
+  (default) lets the model judge each video — a dense talk stays long, a padded one
+  gets cut hard — while *Tight* (~25%), *Balanced* (~40%) and *Generous* (~60%) are
+  both a target and a hard cap on total clip time. It doesn't affect the written
+  summary.
 - **Options → Model** picks *Thorough (Opus)*, the default, or *Fast (Sonnet)*, which
   finishes in roughly half the time with shorter summaries. It applies to summaries,
   key moments and questions.
