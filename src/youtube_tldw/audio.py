@@ -131,10 +131,43 @@ def _speak_years(text: str) -> str:
     return _YEAR.sub(lambda m: year_words(int(m.group(1)), bool(m.group(2))), text)
 
 
+# Amounts stay as digits in the text people read, and are reordered here. espeak
+# reads the symbol in written order — "$58" comes out "dollar fifty eight" — so the
+# currency word has to move after the number before it reaches Piper. A scale word
+# ("2.5 million") has to stay between the two.
+_MONEY = re.compile(
+    r"\$\s?(\d[\d,]*)(?:\.(\d{1,2}))?(\s+(?:hundred|thousand|million|billion|trillion))?",
+    re.I)
+
+
+def _money_words(match: "re.Match") -> str:
+    whole, cents, scale = match.group(1), match.group(2), match.group(3)
+    if scale:                                  # "$2.5 million" -> "2.5 million dollars"
+        frac = f".{cents}" if cents else ""
+        return f"{whole}{frac}{scale} dollars"
+    unit = "dollar" if whole in ("1",) else "dollars"
+    if cents is None:
+        return f"{whole} {unit}"
+    pennies = int(cents.ljust(2, "0"))         # "$1.5" is a dollar fifty, not five
+    if pennies == 0:
+        return f"{whole} {unit}"
+    cent_unit = "cent" if pennies == 1 else "cents"
+    if whole == "0":                           # "$0.99" -> "99 cents"
+        return f"{pennies} {cent_unit}"
+    return f"{whole} {unit} and {pennies} {cent_unit}"
+
+
+def _speak_money(text: str) -> str:
+    return _MONEY.sub(_money_words, text)
+
+
 def _speakify(text: str) -> str:
     # Years first: the fixes below turn "%" into " percent", and "1908%" must still
-    # read as a quantity, not "nineteen oh-eight percent".
+    # read as a quantity, not "nineteen oh-eight percent". Money comes after years,
+    # which skip anything prefixed by a currency symbol — so "$1908" is an amount
+    # here, not a year.
     text = _speak_years(text)
+    text = _speak_money(text)
     for pat, rep in _SPEAK_FIXES:
         text = pat.sub(rep, text)
     return re.sub(r"\s+", " ", text).strip()
@@ -290,7 +323,15 @@ def synthesize_speech(
         raise TldrError("Failed to produce speech audio.")
 
 
+_HEADING_LINE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]*(.+?)[ \t]*$", re.M)
+
+
 def _strip_markdown(text: str) -> str:
+    # A section heading becomes its own sentence. Stripping the hashes and
+    # collapsing whitespace otherwise runs it straight into the paragraph beneath
+    # — "Cost Results Opus cost 58 dollars" as one breathless line.
+    text = _HEADING_LINE.sub(
+        lambda m: m.group(1) + ("" if m.group(1)[-1:] in ".!?:" else "."), text)
     text = _MD_LINK.sub(r"\1", text)
     text = _MD.sub("", text)
     return re.sub(r"\s+", " ", text).strip()

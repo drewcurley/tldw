@@ -31,8 +31,12 @@ NOT use abbreviations, acronyms, initialisms, or symbols. For example: "Senator"
 "Sen.", "Lieutenant Governor" not "Lt. Gov.", "World War Two" not "WWII", "United
 States" not "U.S.", "Doctor" not "Dr.", "versus" not "vs.", "percent" not "%", "and"
 not "&", "number" not "No.". Expand units and counts into natural spoken words.
-The one exception is YEARS: write them as numerals — 1908, 1842, 2024, the 1990s —
-never spelled out. They read naturally that way, and the speech step voices them.
+The exceptions, which stay as numerals because spelling them out reads badly and
+the speech step voices them correctly anyway:
+- YEARS: 1908, 1842, 2024, the 1990s — never "nineteen oh-eight".
+- VERSION AND MODEL NUMBERS: Opus 5.5, Fable 5.1, Python 3.12, GPT-4 — never
+  "five point five".
+- MONEY: $58, $107, $2.5 million — never "fifty-eight dollars".
 
 """
 
@@ -67,8 +71,9 @@ into a single TL;DW. Input (on stdin): the partial summaries in order.
 
 WRITE FOR THE EAR — the result may be read aloud. Spell everything out in full; use
 no abbreviations, acronyms, initialisms, or symbols (e.g. "Senator" not "Sen.",
-"World War Two" not "WWII", "percent" not "%", "and" not "&"). Write years as
-numerals (1908, the 1990s), never spelled out.
+"World War Two" not "WWII", "percent" not "%", "and" not "&"). Keep years (1908,
+the 1990s), version numbers (Opus 5.5, Python 3.12) and money ($58, $2.5 million)
+as numerals, never spelled out.
 
 Return ONLY a JSON object with this schema:
 {{

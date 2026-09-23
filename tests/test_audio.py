@@ -250,3 +250,50 @@ def test_speech_voices_years_that_piper_would_mangle():
 def test_numbers_that_are_not_years_are_left_alone(text):
     out = audio._speakify(text)
     assert "oh-eight" not in out and "nineteen" not in out, out
+
+
+# --- money and version numbers ------------------------------------------------
+
+@pytest.mark.parametrize("text,spoken", [
+    ("It cost $58.", "It cost 58 dollars."),
+    ("About $107 today.", "About 107 dollars today."),
+    ("Just $1.", "Just 1 dollar."),                      # not "1 dollars"
+    ("$1,200 total.", "1,200 dollars total."),           # separator kept
+    ("Roughly $2.5 million.", "Roughly 2.5 million dollars."),
+    ("$3 billion raised.", "3 billion dollars raised."),
+    ("$1.50 each.", "1 dollar and 50 cents each."),
+    ("$0.99 a month.", "99 cents a month."),
+    ("$2.00 flat.", "2 dollars flat."),                  # .00 isn't "and 0 cents"
+    ("$0.01 fee.", "1 cent fee."),                       # singular
+])
+def test_money_is_reordered_for_speech(text, spoken):
+    """espeak reads the symbol in written order: "$58" comes out "dollar fifty
+    eight", so the currency word has to move after the number."""
+    assert audio._speakify(text) == spoken
+
+
+@pytest.mark.parametrize("text", [
+    "Opus 5.5 beat Fable 5.1.",
+    "Python 3.12 shipped.",
+    "Version 2.0 is out.",
+    "A 1.5x speedup.",
+])
+def test_version_numbers_are_left_as_digits(text):
+    """Piper already reads "5.5" as "five point five" — the fix belongs in the
+    prompt, not here."""
+    assert audio._speakify(text) == text
+
+
+def test_an_amount_and_a_year_can_share_the_same_digits():
+    assert audio._speakify("$1908 in 1908.") == "1908 dollars in nineteen oh-eight."
+
+
+def test_headings_get_a_sentence_break_when_spoken():
+    """Stripping the hashes ran a heading into the paragraph under it."""
+    s = audio.build_spoken_script("T", "C", [], "## Cost Results\n\nOpus cost $58.")
+    assert "Cost Results. Opus cost 58 dollars." in s
+
+
+def test_a_heading_already_ending_in_punctuation_gains_nothing():
+    s = audio.build_spoken_script("T", "C", [], "## Why?\n\nBecause.")
+    assert "Why? Because." in s and "Why?." not in s
