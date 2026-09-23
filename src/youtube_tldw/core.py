@@ -129,6 +129,7 @@ def summarize_url(
     max_chars: int | None = None,
     on_progress: Callable[[str], None] | None = None,
     on_partial: Callable[[dict], None] | None = None,
+    _prefetched=None,
 ) -> Summary:
     """Fetch a video's transcript and summarize it. Raises the typed TldrError
     subclasses (BadUrl/NoTranscript/TranscriptTooLong/Claude/Timeout).
@@ -139,10 +140,18 @@ def summarize_url(
     on_partial: optional callback that streams the result as it's produced — first
     {"kind": "meta", "meta": VideoMeta} once the video is known, then each
     {"kind": "key_point"|"paragraph", "text": ...} as the model writes it.
+
+    _prefetched: (meta, cues) already in hand, which skips the yt-dlp fetch
+    entirely — the same escape hatch select_segments has. YouTube rate-limits
+    repeat requests, so a transcript we already have must never be fetched twice.
     """
     log = on_progress or (lambda _m, _p=None, _c=False: None)
     video_id = canonical_video_id(url)  # BadUrlError
-    meta, cues = fetch_transcript(video_id, lang, on_progress=log)
+    if _prefetched is not None:
+        meta, cues = _prefetched
+        log(f"using the cached transcript ({len(cues)} cues, no re-fetch)", 13)
+    else:
+        meta, cues = fetch_transcript(video_id, lang, on_progress=log)
     if max_chars is not None:
         chars = sum(len(c.text) + 1 for c in cues)
         if chars > max_chars:
