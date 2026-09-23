@@ -60,6 +60,7 @@ def _cache_put(video_id: str, meta, cues: list) -> None:
     with _cache_lock:
         _transcript_cache[video_id] = (time.monotonic() + _CACHE_TTL, meta, cues)
         _prune(_transcript_cache)
+    txcache.put(video_id, meta, cues)     # survives a restart; yt-dlp is rate-limited
 
 
 def _cache_get(video_id: str, *, touch: bool = False):
@@ -75,7 +76,13 @@ def _cache_get(video_id: str, *, touch: bool = False):
                 _transcript_cache[video_id] = (time.monotonic() + _CACHE_TTL,
                                                entry[1], entry[2])
             return entry[1], entry[2]
-        return None
+    # Not in memory: a previous run may still have it, which saves two yt-dlp calls.
+    on_disk = txcache.get(video_id)
+    if on_disk:
+        with _cache_lock:
+            _transcript_cache[video_id] = (time.monotonic() + _CACHE_TTL, *on_disk)
+        return on_disk
+    return None
 
 
 def _segment_ratio(body):
@@ -187,7 +194,7 @@ from . import (
     __version__,
 )
 from . import metadata as md
-from . import ask, audio, claude_client, config, core, textmode, usage
+from . import ask, audio, claude_client, config, core, textmode, txcache, usage
 from .summarize import SINGLE_PASS_CHARS
 from .urls import canonical_video_id
 from .timing import format_length, parse_duration

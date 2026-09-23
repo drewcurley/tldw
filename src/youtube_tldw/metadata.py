@@ -30,11 +30,41 @@ class VideoMeta:
     auto_captions: dict      # auto:   lang -> list[...]
 
 
+# YouTube rate-limits bursts from one address with HTTP 429, and without these a
+# single 429 is an immediate hard failure. Back off and retry rather than making the
+# user try again by hand — exponential from 2s, capped at 30s.
+_RETRY = ["--retries", "3", "--extractor-retries", "3",
+          "--retry-sleep", "extractor:exp=2:30", "--retry-sleep", "http:exp=2:30"]
+
+
+def rate_limited(message: str) -> bool:
+    """Is this yt-dlp failure YouTube throttling us, rather than a bad video?"""
+    text = (message or "").lower()
+    return "429" in text or "too many requests" in text
+
+
+def _translate(exc: TldrError) -> TldrError:
+    """Say what a 429 actually means. The raw yt-dlp text reads like a bug in tldw;
+    it's YouTube throttling this machine, it passes, and it needs no action but
+    waiting."""
+    if rate_limited(str(exc)):
+        return TldrError(
+            "YouTube is rate-limiting this machine (HTTP 429) after too many "
+            "requests in a short time. It clears on its own — wait a few minutes "
+            "and try again. Videos summarized recently are cached and unaffected."
+        )
+    return exc
+
+
 def fetch_metadata(video_id: str, *, timeout: float = 120) -> VideoMeta:
-    res = run(
-        ["yt-dlp", "-J", "--no-playlist", "--skip-download", watch_url(video_id)],
-        timeout=timeout,
-    )
+    try:
+        res = run(
+            ["yt-dlp", "-J", "--no-playlist", "--skip-download", *_RETRY,
+             watch_url(video_id)],
+            timeout=timeout,
+        )
+    except TldrError as exc:
+        raise _translate(exc) from exc
     try:
         info = json.loads(res.stdout)
     except json.JSONDecodeError as exc:
@@ -79,15 +109,18 @@ def download_subtitle(
 ) -> str:
     """Write the chosen subtitle track to workdir and return its text content."""
     flag = "--write-auto-subs" if is_auto else "--write-subs"
-    run(
-        [
-            "yt-dlp", "--skip-download", flag,
-            "--sub-langs", lang_key, "--sub-format", "vtt/srt/best",
-            "--no-playlist", "-o", _OUTPUT_TMPL, watch_url(video_id),
-        ],
-        timeout=timeout,
-        cwd=str(workdir),
-    )
+    try:
+        run(
+            [
+                "yt-dlp", "--skip-download", flag,
+                "--sub-langs", lang_key, "--sub-format", "vtt/srt/best",
+                "--no-playlist", *_RETRY, "-o", _OUTPUT_TMPL, watch_url(video_id),
+            ],
+            timeout=timeout,
+            cwd=str(workdir),
+        )
+    except TldrError as exc:
+        raise _translate(exc) from exc
     # video_id is [A-Za-z0-9_-]{11}: no glob metacharacters. Prefer the exact
     # requested track + format, else fall back to any produced sub file.
     preferred = [
