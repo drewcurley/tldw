@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 import threading
 
 import pytest
@@ -291,3 +292,39 @@ def test_extension_model_lists_match_the_server_allowlist():
         assert m, f"no MODELS list in {name}"
         listed = re.findall(r'"([^"]+)"', m.group(1))
         assert sorted(listed) == sorted(cc.MODELS), name
+
+
+# --- other backends -------------------------------------------------------------
+
+def test_backend_info_describes_the_claude_cli(monkeypatch):
+    _claude_backend(monkeypatch)
+    info = cc.backend_info()
+    assert info["kind"] == "claude" and info["models"] == sorted(cc.MODELS)
+    assert info["streaming"] is True
+
+
+def test_backend_info_never_leaks_the_configured_command(monkeypatch):
+    """/health is unauthenticated; the command is operator config."""
+    monkeypatch.setenv("TLDW_LLM_CMD", "llm -m gpt-4o --key sk-secret")
+    info = cc.backend_info()
+    assert info["kind"] == "custom" and info["models"] == []
+    assert "sk-secret" not in json.dumps(info) and "llm" not in json.dumps(info)
+
+
+def test_a_custom_backend_streams_its_stdout(monkeypatch):
+    """Everything built on streaming works for any model, not only Claude's CLI."""
+    monkeypatch.setenv("TLDW_LLM_CMD",
+                       f'{sys.executable} -c "import sys;sys.stdout.write(sys.stdin.read())"')
+    out = list(cc._stream_deltas("PROMPT", "PAYLOAD", timeout=30))
+    assert "PAYLOAD" in "".join(out)
+
+
+def test_a_multibyte_character_split_across_chunks_survives(monkeypatch):
+    """A chunk boundary can land mid-character; decoding each chunk alone would
+    corrupt the text."""
+    script = ("import sys,time\n"
+              "b='caf\\u00e9 \\u2014 r\\u00e9sum\\u00e9'.encode()\n"
+              "for i in range(0,len(b),3):\n"
+              "    sys.stdout.buffer.write(b[i:i+3]); sys.stdout.buffer.flush()\n")
+    monkeypatch.setenv("TLDW_LLM_CMD", f'{sys.executable} -c "{script}"')
+    assert "".join(cc._stream_deltas("p", "x", timeout=30)) == "café — résumé"

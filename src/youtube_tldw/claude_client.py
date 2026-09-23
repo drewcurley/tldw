@@ -12,6 +12,8 @@ The backend command itself is OPERATOR config (env/flag), never request-controll
 
 from __future__ import annotations
 
+import codecs
+import hashlib
 import json
 import os
 import re
@@ -24,7 +26,7 @@ from typing import Callable
 
 from . import ClaudeError, TldrError, TldrTimeoutError
 from . import config, usage
-from .proc import _resolve, run
+from .proc import _resolve, run, stream_filter
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 _DEFAULT_TIMEOUT = 300.0
@@ -171,6 +173,30 @@ def _parse_inner_json(text: str) -> dict:
     return json.loads(cleaned)
 
 
+def backend_fingerprint() -> str:
+    """Identity of whatever will answer: the resolved command and its flags.
+
+    Hashed, so it can key a cache without exposing operator config. Covers the
+    model too, since that rides in the same argv — a summary written by Sonnet, by
+    Opus, or by somebody's local llama must never be served for the others.
+    """
+    argv, _ = _backend()
+    return hashlib.sha256("|".join(argv).encode("utf-8")).hexdigest()[:12]
+
+
+def backend_info() -> dict:
+    """What the server is actually talking to, for the UI to adapt to.
+
+    Deliberately does NOT expose the configured command: it's operator config, and
+    /health is unauthenticated. Only the shape of what's available.
+    """
+    if is_claude_cli():
+        return {"kind": "claude", "label": "Claude",
+                "models": sorted(MODELS), "streaming": True}
+    return {"kind": "custom", "label": "your model",
+            "models": [], "streaming": True}
+
+
 def is_claude_cli() -> bool:
     """True when the default claude CLI backend is active (not a custom llm_cmd)."""
     argv, _ = _backend()
@@ -192,6 +218,28 @@ def _delta_text(event: dict) -> str:
     return ""
 
 
+def _stream_custom(prompt: str, stdin_payload: str, *, timeout: float):
+    """Yield a custom backend's stdout as it is produced.
+
+    Decoded incrementally: a chunk boundary can land mid-character, and splitting a
+    multi-byte character would corrupt the text.
+    """
+    argv, _ = _backend()
+    payload = (prompt + "\n\n" + stdin_payload).encode("utf-8")
+
+    def feed(write) -> None:
+        write(payload)
+
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    for chunk in stream_filter(argv, feed, timeout=timeout):
+        text = decoder.decode(chunk)
+        if text:
+            yield text
+    tail = decoder.decode(b"", True)
+    if tail:
+        yield tail
+
+
 def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
                    step: str = "", resume: str | None = None, on_meta=None,
                    persist: bool = False):
@@ -203,7 +251,11 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
     Raises NotImplementedError for custom backends, which can't stream.
     """
     if not is_claude_cli():
-        raise NotImplementedError  # caller must fall back to a buffered call
+        # A custom backend just prints text. Stream its stdout as it appears, so
+        # everything built on streaming — the summary filling in, segments arriving
+        # one by one — works for any model, not only Claude's CLI.
+        yield from _stream_custom(prompt, stdin_payload, timeout=timeout)
+        return
 
     # --verbose is REQUIRED alongside -p --output-format stream-json (the CLI refuses
     # otherwise), and --include-partial-messages is what actually yields token-level

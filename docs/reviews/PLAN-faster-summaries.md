@@ -135,6 +135,38 @@ the pre-clip crawl topped out at 30% while real progress started at 20%, so the 
 would have jumped *backwards* the moment a clip arrived. The two ranges now meet at
 one constant.
 
+## Round 3 — forced refresh, and backends other than Claude
+
+**Forced refresh.** `refresh: true` on the summarize request skips the summary
+cache; the panel exposes it as a ↻ next to Copy. It deliberately keeps the cached
+*transcript* — the point is comparing two summaries of the same video after a
+tweak, and re-fetching would only risk a rate limit.
+
+**Bring your own model, properly.** The `llm_cmd` escape hatch existed, but
+everything built recently assumed the claude CLI. Now:
+
+- `_stream_deltas` streams a custom backend's stdout, decoded incrementally so a
+  chunk boundary landing mid-character can't corrupt the text. Summaries and
+  segments stream for any backend that writes as it goes, instead of falling back
+  to a single buffered call.
+- Segment selection no longer requires the claude CLI, and a model that ignores the
+  line format falls through to the batch call instead of raising.
+- `/health` reports `{kind, label, models, streaming}` — deliberately not the
+  configured command, since /health is unauthenticated and the command is operator
+  config. The options page disables the Opus/Sonnet picker when the backend isn't
+  Claude and says why.
+- Progress text says "your model" rather than "Claude" when that's the truth.
+
+**A bug this exposed:** the summary cache keyed on the *model name* rather than the
+backend, so pointing the server at a different command served summaries the
+previous one had written — caught end to end, where a stub backend was handed
+Claude's cached answer. The key is now a hash of the resolved argv, which covers
+the command, its flags and the model together.
+
+Verified end to end against a stub backend: a well-behaved one streams
+meta → partials → result with headings intact and segments prefetched; one that
+ignores the format falls back and still produces a usable summary.
+
 ## Items (non-blocking)
 
 - **Summary cache is keyed by video, not model**: switching to Sonnet shows a video's

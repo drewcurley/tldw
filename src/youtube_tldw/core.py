@@ -163,7 +163,8 @@ def summarize_url(
     # client to ease forward toward ~96% from here until the result lands.
     if on_partial is not None:
         on_partial({"kind": "meta", "meta": meta})
-    log("summarizing with Claude (this can take 30-90s for a long video)...", 15, True)
+    log(f"summarizing with {summarize.backend_label()} "
+        "(this can take 30-90s for a long video)...", 15, True)
     result = summarize.summarize_text(
         cues, meta.channel, meta.title, ratio, timeout=timeout,
         on_partial=on_partial, on_progress=log,

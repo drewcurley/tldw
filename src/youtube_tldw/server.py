@@ -284,7 +284,8 @@ def _summary_key(video_id: str, ratio) -> str:
     """
     shape = "|".join((
         video_id,
-        claude_client.current_model() or "default",
+        # The backend's own identity: which command, which flags, which model.
+        claude_client.backend_fingerprint(),
         str(round(ratio, 3)) if isinstance(ratio, (int, float)) else "auto",
         summarize.PROMPT_FINGERPRINT,
     ))
@@ -368,7 +369,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = self.path.split("?")[0]
         if path == "/health":
-            self._send_json(200, {"ok": True, "name": "tldw", "version": __version__})
+            self._send_json(200, {"ok": True, "name": "tldw", "version": __version__,
+                                  "backend": claude_client.backend_info()})
         elif path == "/voices":
             self._send_json(200, {"voices": audio.voice_list()})
         else:
@@ -534,7 +536,11 @@ class _Handler(BaseHTTPRequestHandler):
         # own cache dies with the service worker or an extension reload, which is
         # exactly when this matters.
         vid = _vid_of(url)
-        if vid:
+        # A forced refresh re-runs the model but deliberately keeps the cached
+        # transcript: the point is to compare summaries, and re-fetching the video
+        # would risk a rate limit for nothing.
+        refresh = isinstance(body, dict) and body.get("refresh") is True
+        if vid and not refresh:
             hit = txcache.get_summary(_summary_key(vid, ratio))
             if hit:
                 tlog(f"cached summary for {vid} (no model call)")

@@ -73,6 +73,18 @@ small notice you can click to read it, and re-opening mid-run re-attaches to the
 already in flight rather than starting it over. Options has an **"If you close the
 panel while it's still working"** setting if you'd rather it stopped and discarded.
 
+## Any model, not just Claude
+
+The server shells out to whatever model command it's configured with, so the
+extension works the same against a Claude subscription, an Anthropic API key,
+OpenAI or Gemini via the `llm` CLI, or a local model through ollama. The summary
+still streams in as it's written wherever the backend streams its output.
+
+Two things are Claude-CLI specific and the options page adapts automatically:
+the **Model** picker (Opus/Sonnet), which it disables for other backends, and
+`tldw usage`, which needs the token and cost figures only that CLI reports. See
+[Choose your model](../README.md#choose-your-model) for configuration.
+
 ## How it stays local & safe
 
 - The extension only talks to `127.0.0.1:8765`; the server uses your local `claude`
