@@ -3,6 +3,7 @@
 // or regex slip is an injection bug in the page. Driven by tests/test_extension_render.py.
 const fs = require("fs");
 const src = fs.readFileSync(process.argv[2], "utf8");
+const worker = process.argv[3] ? fs.readFileSync(process.argv[3], "utf8") : "";
 const grab = (start, end) => {
   const i = src.indexOf(start);
   if (i < 0) throw new Error("start marker not found in content.js: " + start);
@@ -324,6 +325,24 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
   check("the summary header carries the trimmed length",
     /trimmedNote\(\)/.test(res), true);
   check("it is escaped with everything else", /esc\(trimmedNote\(\)\)/.test(res), true);
+}
+
+// --- forced refresh has to survive the whole chain ---
+// Panel -> worker -> server. A break anywhere looks exactly like "the cache served
+// it", which is indistinguishable from correct behaviour without a test.
+{
+  const panel = stripComments(src);
+  check("the regen button asks for a refresh",
+    /startSummarize\(lastPayload\.source_url, lastPayload\.video_id, true\)/.test(panel),
+    true);
+  check("the request carries the flag",
+    /type: "summarize", url, videoId, refresh: !!refresh/.test(panel), true);
+  if (worker) {
+    const bg = stripComments(worker);
+    check("the worker skips its own cache on a refresh",
+      /cache\.has\(videoId\) && !refresh/.test(bg), true);
+    check("the worker forwards it to the server", /refresh: !!refresh/.test(bg), true);
+  }
 }
 
 if (failures.length) {

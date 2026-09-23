@@ -5,6 +5,11 @@ watching by calling your **local `tldw` server** — summary in an on-page modal
 Listen (streaming TTS, with an mp3 download), Play-key-moments, and follow-up
 questions about the video.
 
+> **After pulling changes, reload the extension** (`chrome://extensions` → reload)
+> *and* the YouTube tab. Chrome keeps the old content script otherwise, so you'll be
+> clicking a stale build against a new server — which looks like a bug in whatever
+> you just changed.
+
 ## Setup
 
 1. **Start the server** (in a terminal):
