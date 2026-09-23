@@ -579,7 +579,7 @@
     const c = root.querySelector(".content");
     const points = (p.key_points || []).map((k) => `<li>${esc(k)}</li>`).join("");
     c.innerHTML = `
-      <div class="meta">${esc(p.channel)} · ${esc(p.original_length)} → ~${esc(p.length_label)} read ·
+      <div class="meta">${esc(p.channel)} · ${esc(p.original_length)} → ~${esc(p.length_label)} read${esc(trimmedNote())} ·
         <a href="${esc(p.source_url)}" target="_blank" rel="noopener noreferrer">original</a></div>
       <h1 style="margin-bottom:10px">${esc(p.title)}</h1>
       ${audioRowHtml(false)}
@@ -1140,6 +1140,7 @@
       }
       if (m.type === "segmentsDone") {
         segsComplete = true;
+        refreshTrimmedNote();
         teardownSeg(); finishAudioUI();
         const allSegs = skipSegs ? skipSegs.slice() : [];
         if (!skipSegs) {
@@ -1291,6 +1292,48 @@
     }
   }
 
+  // " · 8m30s trimmed video (35%)" for the summary header, once the key moments for
+  // this video are known. Empty until then — they're picked in the background.
+  // The header is already on screen when the clips finish arriving; patch the one
+  // line rather than re-rendering the summary under the reader.
+  function refreshTrimmedNote() {
+    const el = root && root.querySelector(".meta");
+    if (!el || !lastPayload) return;
+    const note = trimmedNote();
+    if (note && !el.textContent.includes("trimmed video")) {
+      const link = el.querySelector("a");
+      el.insertBefore(document.createTextNode(note + " "), link ? link.previousSibling : null);
+    }
+  }
+
+  function trimmedNote() {
+    const vid = lastPayload && lastPayload.video_id;
+    if (!lastSegments || lastSegments.videoId !== vid ||
+        !(lastSegments.segments || []).length) return "";
+    const v = document.querySelector("video.html5-main-video")
+      || document.querySelector("video");
+    const src = v && isFinite(v.duration) ? v.duration : 0;
+    const { kept, pct } = clipTotals(lastSegments.segments, src);
+    return ` · ${fmtDur(kept)} trimmed video` + (pct === null ? "" : ` (${pct}%)`);
+  }
+
+  // Total playtime of a set of clips, and how that compares to the whole video.
+  function clipTotals(segments, sourceSeconds) {
+    const kept = (segments || []).reduce(
+      (t, sg) => t + Math.max(0, (sg.end || 0) - (sg.start || 0)), 0);
+    const pct = sourceSeconds > 0 ? Math.round((kept / sourceSeconds) * 100) : null;
+    return { kept, pct };
+  }
+
+  // "8m30s" — compact, for sitting inline next to other text.
+  function fmtDur(s) {
+    const t = Math.max(0, Math.round(s));
+    const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = t % 60;
+    if (h > 0) return `${h}h${String(m).padStart(2, "0")}m`;
+    if (m > 0) return sec ? `${m}m${String(sec).padStart(2, "0")}s` : `${m}m`;
+    return `${sec}s`;
+  }
+
   function fmtTime(s) {
     const t = Math.floor(s);
     const h = Math.floor(t / 3600);
@@ -1361,7 +1404,16 @@
       } else {
         const seg = skipSegs[skipIdx];
         const total = `${skipSegs.length}${segsComplete ? "" : "+"}`;
-        label.textContent = `⏭ Clip ${skipIdx + 1}/${total} · ${fmtTime(seg.start)}–${fmtTime(seg.end)}`;
+        const src = skipVideo && isFinite(skipVideo.duration) ? skipVideo.duration : 0;
+        const { kept, pct } = clipTotals(skipSegs, src);
+        // While clips are still arriving the totals are a running tally, not the
+        // final answer — say so rather than showing a figure that keeps changing.
+        const tally = src
+          ? ` · ${segsComplete ? "" : "so far "}${fmtDur(kept)} of ${fmtDur(src)}` +
+            (pct === null ? "" : ` (${pct}%)`)
+          : "";
+        label.textContent =
+          `⏭ Clip ${skipIdx + 1}/${total} · ${fmtTime(seg.start)}–${fmtTime(seg.end)}${tally}`;
       }
     }
     const prev = document.getElementById("tldw-pill-prev");

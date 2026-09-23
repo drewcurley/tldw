@@ -288,6 +288,44 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
     /partialState && partialState\.meta\) \{\s*showPartial\(\)/.test(stripComments(src)), true);
 }
 
+// --- how much of the video the clips actually are ---
+{
+  eval(grab("  function clipTotals(", "\n  function fmtDur(s)"));
+  eval(grab("  function fmtDur(s)", "\n  function fmtTime(s)"));
+  const segs = [{ start: 10, end: 70 }, { start: 100, end: 160 }];
+  check("total playtime of the clips", clipTotals(segs, 600).kept, 120);
+  check("share of the original", clipTotals(segs, 600).pct, 20);
+  check("no source duration -> no percentage", clipTotals(segs, 0).pct, null);
+  check("no clips is zero, not NaN", clipTotals([], 600).kept, 0);
+  check("undefined clips are survivable", clipTotals(undefined, 600).kept, 0);
+  check("a reversed clip can't subtract time",
+    clipTotals([{ start: 90, end: 30 }], 600).kept, 0);
+
+  check("compact seconds", fmtDur(45), "45s");
+  check("compact minutes", fmtDur(8 * 60 + 30), "8m30s");
+  check("whole minutes drop the seconds", fmtDur(12 * 60), "12m");
+  check("hours", fmtDur(3600 + 5 * 60), "1h05m");
+  check("zero", fmtDur(0), "0s");
+}
+
+// --- where the totals are shown ---
+{
+  const pill = stripComments(src.slice(src.indexOf("  function updatePill()"),
+                                       src.indexOf("  function removePill()")));
+  check("the pill shows clip playtime against the original",
+    /clipTotals\(skipSegs, src\)/.test(pill) && /fmtDur\(kept\)/.test(pill), true);
+  check("a running tally is labelled as one while clips still arrive",
+    /segsComplete \? "" : "so far "/.test(pill), true);
+  check("no source duration means no misleading tally",
+    /src\s*\?/.test(pill), true);
+
+  const res = stripComments(src.slice(src.indexOf("  function showResult("),
+                                      src.indexOf("  function setupVoiceSelect")));
+  check("the summary header carries the trimmed length",
+    /trimmedNote\(\)/.test(res), true);
+  check("it is escaped with everything else", /esc\(trimmedNote\(\)\)/.test(res), true);
+}
+
 if (failures.length) {
   console.log("FAILURES:\n" + failures.join("\n"));
   process.exit(1);

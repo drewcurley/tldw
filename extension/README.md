@@ -49,8 +49,10 @@ questions about the video.
   First use of a voice downloads its model (~once).
 - **⏭ Play key moments** finds the key segments (transcript + Claude — no download,
   no recut) and **auto-skips the YouTube player through just those moments**, in full
-  quality in your own player. A floating pill shows progress (e.g. "Key moment 2/5")
-  with a ✕ to stop.
+  quality in your own player. A floating pill shows progress, including the total
+  playtime of the clips against the original (e.g. "Clip 2/5 · 0:30–0:34 · 12m of
+  49m (25%)"), with a ✕ to stop. Once the clips are known, the summary header shows
+  the trimmed length too.
 - **💬 Ask about this video** opens a chat under the summary. Questions are answered
   from the transcript the server already has cached, so the first answer starts in a
   few seconds. Answers cite moments as `[12:34]` — click one to jump the player
