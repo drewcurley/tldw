@@ -13,13 +13,14 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTENT_JS = ROOT / "extension" / "content.js"
+BACKGROUND_JS = ROOT / "extension" / "background.js"
 CHECKS_JS = Path(__file__).parent / "js" / "render_checks.js"
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 def test_answer_rendering_escaping_and_citations():
     proc = subprocess.run(
-        ["node", str(CHECKS_JS), str(CONTENT_JS)],
+        ["node", str(CHECKS_JS), str(CONTENT_JS), str(BACKGROUND_JS)],
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
