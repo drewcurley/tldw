@@ -126,7 +126,7 @@ tldw "https://youtu.be/VIDEO_ID" --mode video --ratio 0.2 --keep-source
 | `--mode {text,video}` | Defaults to `video`. |
 | `--render-audio` | Also save an mp3: video → the recut audio; text → spoken summary (TTS). |
 | `--voice VOICE` | Text-mode TTS voice: `female`/`male` or a named US/UK voice (`amy`, `ryan`, `cori`, `alan`, …). |
-| `--ratio FLOAT` | Target fraction of original length (`0 < r <= 1`). Omit to let the AI choose. |
+| `--ratio FLOAT` | Target fraction of original length (`0 < r <= 1`), and a hard cap. Omit to let the AI choose. The extension exposes the same dial as **Options → Key moments length**. |
 | `--max-length DUR` | Hard cap (`5m`, `90s`, `1m30s`). **Wins over `--ratio`.** |
 | `--lang CODE` | Preferred subtitle language (default `en`). |
 | `--burn-captions` | (video) burn recut-aligned captions into the output. |

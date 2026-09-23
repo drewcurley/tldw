@@ -8,7 +8,7 @@
 const api = globalThis.browser ?? globalThis.chrome;
 
 const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "", voice: "amy",
-                   model: "opus" };
+                   model: "opus", segmentRatio: "auto" };
 // Keep in step with the server's claude_client.MODELS; it refuses anything else.
 const MODELS = ["opus", "sonnet"];
 const CLIENT_TIMEOUT_MS = 150000;
@@ -36,8 +36,11 @@ function videoIdFromUrl(url) {
 
 async function getSettings() {
   const s = await api.storage.local.get(DEFAULTS);
+  // "auto" means no ratio at all — the model judges each video.
+  const ratio = parseFloat(s.segmentRatio);
   return { serverUrl: s.serverUrl || DEFAULTS.serverUrl, token: s.token || "",
-           model: MODELS.includes(s.model) ? s.model : DEFAULTS.model };
+           model: MODELS.includes(s.model) ? s.model : DEFAULTS.model,
+           segmentRatio: ratio > 0 && ratio <= 1 ? ratio : null };
 }
 
 function send(tabId, msg) {
@@ -75,7 +78,7 @@ async function handleSummarize(port, msg) {
     safePost(port, { type: "result", payload: cache.get(videoId), cached: true });
     return;
   }
-  const { serverUrl, token, model } = await getSettings();
+  const { serverUrl, token, model, segmentRatio } = await getSettings();
   if (!token) {
     safePost(port, { type: "error",
       error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
@@ -88,7 +91,7 @@ async function handleSummarize(port, msg) {
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/summarize/stream", {
       method: "POST", signal: ctrl.signal,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-      body: JSON.stringify({ url, model }),
+      body: JSON.stringify({ url, model, segment_ratio: segmentRatio }),
     });
     if (!resp.ok) {
       let detail = "";
@@ -273,7 +276,7 @@ function bytesToBase64(u8) {
 // question and the conversation so far, and streams the answer back in deltas.
 async function handleAsk(port, msg) {
   const { url, question, history } = msg;
-  const { serverUrl, token, model } = await getSettings();
+  const { serverUrl, token, model, segmentRatio } = await getSettings();
   if (!token) {
     safePost(port, { type: "askError",
       error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
@@ -405,7 +408,7 @@ function speakError(status, detail) {
 
 async function handleSegments(port, msg) {
   const { url } = msg;
-  const { serverUrl, token, model } = await getSettings();
+  const { serverUrl, token, model, segmentRatio } = await getSettings();
   if (!token) {
     safePost(port, { type: "segError",
       error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
@@ -418,7 +421,7 @@ async function handleSegments(port, msg) {
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/segments/stream", {
       method: "POST", signal: ctrl.signal,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-      body: JSON.stringify({ url, model }),
+      body: JSON.stringify({ url, model, ratio: segmentRatio }),
     });
     if (!resp.ok) {
       let detail = "";

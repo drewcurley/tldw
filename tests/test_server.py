@@ -794,7 +794,7 @@ def test_prefetch_publishes_progress_as_it_finds_clips(monkeypatch):
                     on_segment_ready=None):
         assert on_segment_ready is not None       # must take the streaming path
         on_segment_ready({"start": 10.0, "end": 60.0, "label": "0:10"})
-        seen.append(dict(server._seg_progress.get("progvid") or {}))
+        seen.append(dict(server._seg_progress.get(("progvid", None)) or {}))
         done.set()
         return _prefetched[0], []
 
@@ -805,4 +805,53 @@ def test_prefetch_publishes_progress_as_it_finds_clips(monkeypatch):
     assert seen[0]["found"] == 1 and seen[0]["pos_ms"] == 60_000
     assert seen[0]["duration_ms"] == 600_000
     time.sleep(0.2)
-    assert "progvid" not in server._seg_progress      # cleaned up when it finishes
+    assert ("progvid", None) not in server._seg_progress   # cleaned up when done
+
+
+# --- trim strength ------------------------------------------------------------
+
+def test_selections_are_cached_per_trim_strength(monkeypatch):
+    """A tighter cut must not be served the looser selection prefetched earlier."""
+    meta = VideoMeta("ratiovid", "T", "C", 600_000, {}, {})
+    server._seg_cache_put("ratiovid", meta, [{"start": 0, "end": 300}], None)
+    server._seg_cache_put("ratiovid", meta, [{"start": 0, "end": 100}], 0.25)
+    assert server._seg_cache_get("ratiovid", None)[1][0]["end"] == 300
+    assert server._seg_cache_get("ratiovid", 0.25)[1][0]["end"] == 100
+    assert server._seg_cache_get("ratiovid", 0.4) is None      # not yet selected
+
+
+def test_auto_and_an_explicit_ratio_are_different_keys():
+    assert server._seg_key("v", None) != server._seg_key("v", 0.25)
+    assert server._seg_key("v", 0.25) == server._seg_key("v", 0.25000001)  # rounded
+
+
+def test_segment_ratio_from_the_summarize_body():
+    """Separate from `ratio`, which shapes the written summary."""
+    assert server._segment_ratio({"segment_ratio": 0.4}) == 0.4
+    assert server._segment_ratio({"segment_ratio": "0.4"}) == 0.4
+    assert server._segment_ratio({}) is None
+    for bad in ["auto", None, 0, -1, 1.5, [], {"a": 1}]:
+        assert server._segment_ratio({"segment_ratio": bad}) is None, bad
+    assert server._segment_ratio("not a dict") is None
+
+
+def test_prefetch_uses_the_pages_trim_strength(srv, monkeypatch):
+    """Otherwise it caches a selection under a key nothing will ask for."""
+    _, port = srv
+    seen = {}
+
+    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None, on_partial=None):
+        base = _summary()
+        # The prefetch only starts when there's a transcript to select from.
+        return core.Summary(base.meta, base.result, base.cue_count, ["a cue"])
+
+    def fake_prefetch(meta, cues, model=None, ratio=None):
+        seen["ratio"] = ratio
+
+    monkeypatch.setattr(server.core, "summarize_url", fake)
+    monkeypatch.setattr(server, "_start_seg_prefetch", fake_prefetch)
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ", "segment_ratio": 0.25},
+                 _auth())
+    assert seen["ratio"] == 0.25
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
+    assert seen["ratio"] is None

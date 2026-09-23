@@ -1,7 +1,9 @@
 const api = globalThis.browser ?? globalThis.chrome;  // promises in both Firefox & Chrome
 
 const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "", voice: "amy",
-                   closeAction: "continue", model: "opus" };
+                   closeAction: "continue", model: "opus",
+                   segmentRatio: "auto" };
+const RATIOS = ["auto", "0.25", "0.4", "0.6"];
 const MODELS = ["opus", "sonnet"];     // keep in step with the server's allowlist
 
 // Fallback list if the server isn't reachable (kept in sync with audio.VOICES).
@@ -33,6 +35,9 @@ async function load() {
   document.getElementById("token").value = s.token || "";
   document.getElementById("closeAction").value =
     s.closeAction === "abort" ? "abort" : DEFAULTS.closeAction;
+  document.getElementById("segmentRatio").value =
+    RATIOS.includes(String(s.segmentRatio)) ? String(s.segmentRatio)
+      : DEFAULTS.segmentRatio;
   document.getElementById("model").value =
     MODELS.includes(s.model) ? s.model : DEFAULTS.model;
   fillVoices(VOICE_FALLBACK, s.voice);
@@ -100,7 +105,10 @@ document.getElementById("save").addEventListener("click", async () => {
     document.getElementById("closeAction").value === "abort" ? "abort" : "continue";
   const model = MODELS.includes(document.getElementById("model").value)
     ? document.getElementById("model").value : DEFAULTS.model;
-  await api.storage.local.set({ serverUrl, token, voice, closeAction, model });
+  const picked = document.getElementById("segmentRatio").value;
+  const segmentRatio = RATIOS.includes(picked) ? picked : DEFAULTS.segmentRatio;
+  await api.storage.local.set({ serverUrl, token, voice, closeAction, model,
+                                segmentRatio });
   const status = document.getElementById("status");
   status.textContent = "Saved";
   setTimeout(() => (status.textContent = ""), 1500);
