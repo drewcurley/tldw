@@ -11,6 +11,7 @@ Stdlib only. Security posture (see docs/reviews/PLAN-extension.md):
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import json
 import os
@@ -195,6 +196,7 @@ from . import (
 )
 from . import metadata as md
 from . import ask, audio, claude_client, config, core, textmode, txcache, usage
+from . import summarize
 from .summarize import SINGLE_PASS_CHARS
 from .urls import canonical_video_id
 from .timing import format_length, parse_duration
@@ -271,6 +273,22 @@ def _seg_progress_line(pos: dict, label: str, elapsed: float):
                 f"{'' if found == 1 else 's'} so far)", pct)
     return (f"Reading the transcript… ({int(elapsed)}s)",
             round(min(20 + elapsed * 0.15, _SEG_CRAWL_CAP), 1))
+
+
+def _summary_key(video_id: str, ratio) -> str:
+    """Identity of a summary: the video, and everything that shapes the answer.
+
+    The prompt fingerprint matters most — editing a prompt used to be invisible to a
+    cache, so it would keep serving text the current code would never produce. The
+    model comes from the request's own scope.
+    """
+    shape = "|".join((
+        video_id,
+        claude_client.current_model() or "default",
+        str(round(ratio, 3)) if isinstance(ratio, (int, float)) else "auto",
+        summarize.PROMPT_FINGERPRINT,
+    ))
+    return f"{video_id}-{hashlib.sha256(shape.encode()).hexdigest()[:16]}"
 
 
 def _cached_transcript(url: str):
@@ -511,6 +529,28 @@ class _Handler(BaseHTTPRequestHandler):
             tlog(m)
             emit({"type": "progress", "message": m, "percent": pct, "creep": creep})
 
+        # A summary we've already produced for this video, model, trim ratio and
+        # prompt: serve it instead of paying for the model call again. The page's
+        # own cache dies with the service worker or an extension reload, which is
+        # exactly when this matters.
+        vid = _vid_of(url)
+        if vid:
+            hit = txcache.get_summary(_summary_key(vid, ratio))
+            if hit:
+                tlog(f"cached summary for {vid} (no model call)")
+                emit({"type": "meta", "video_id": hit.get("video_id", vid),
+                      "title": hit.get("title", ""), "channel": hit.get("channel", ""),
+                      "source_url": hit.get("source_url", md.watch_url(vid)),
+                      "original_length": hit.get("original_length", "")})
+                emit({"type": "result", **hit, "cached": True,
+                      "stats": usage.stats()})
+                tx = _cache_get(vid, touch=True)
+                if tx and not _seg_cache_get(vid, ratio):
+                    # Still worth having key moments ready by the time they look.
+                    _start_seg_prefetch(tx[0], tx[1], claude_client.current_model(),
+                                        _segment_ratio(body))
+                return
+
         def partial(ev):
             if ev["kind"] == "meta":
                 m = ev["meta"]
@@ -548,7 +588,10 @@ class _Handler(BaseHTTPRequestHandler):
             _start_seg_prefetch(summary.meta, summary.cues,
                                 claude_client.current_model(),
                                 _segment_ratio(body))
-        emit({"type": "result", **_to_payload(summary), "stats": usage.stats()})
+        payload = _to_payload(summary)
+        if vid:
+            txcache.put_summary(_summary_key(vid, ratio), payload)
+        emit({"type": "result", **payload, "stats": usage.stats()})
 
     def _validate_speak(self, body: dict):
         """Return (script, voice) or None (after sending the proper error status)."""

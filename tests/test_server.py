@@ -31,6 +31,7 @@ def _clear_caches(tmp_path, monkeypatch):
     # ~/.cache and leak state into each other.
     from youtube_tldw import txcache
     monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path / "txcache")
+    monkeypatch.setattr(txcache, "SUMMARY_DIR", tmp_path / "summaries")
     caches = (server._transcript_cache, server._seg_cache, server._ask_sessions)
     for cache in caches:
         cache.clear()
@@ -951,3 +952,81 @@ def test_summarizing_again_does_not_refetch_the_video(srv, monkeypatch, tmp_path
 def test_cached_transcript_lookup_survives_a_bad_url():
     assert server._cached_transcript("https://example.com/not-a-video") is None
     assert server._cached_transcript("https://youtu.be/dQw4w9WgXcQ") is None
+
+
+# --- summary cache ------------------------------------------------------------
+
+def _count_summaries(monkeypatch, port):
+    """Summarize twice, returning how many times the model was actually called."""
+    from youtube_tldw.transcript import Cue
+    meta = VideoMeta("dQw4w9WgXcQ", "Cool Title", "Chan", 600_000, {}, {})
+    calls = []
+
+    monkeypatch.setattr(server.core, "fetch_transcript",
+                        lambda vid, lang="en", **k: (meta, [Cue(0, 900, "hi")]))
+    monkeypatch.setattr(server.core.summarize, "summarize_text",
+                        lambda *a, **k: calls.append(1) or TextResult(
+                            ["k"], "body", 0.2, "why"))
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    return calls
+
+
+def test_a_second_summary_costs_no_model_call(srv, monkeypatch):
+    """The page's own cache dies with the service worker or an extension reload —
+    exactly when paying for the summary again hurts most."""
+    _, port = srv
+    calls = _count_summaries(monkeypatch, port)
+    body = {"url": "https://youtu.be/dQw4w9WgXcQ"}
+
+    first = _read_ndjson(port, body, _auth())[-1]
+    assert first["type"] == "result" and not first.get("cached")
+    assert calls == [1]
+
+    second = _read_ndjson(port, body, _auth())[-1]
+    assert second["type"] == "result" and second["cached"] is True
+    assert calls == [1], "summarized again instead of using the cache"
+    assert second["summary_md"] == first["summary_md"]
+    assert second["title"] == first["title"]
+
+
+def test_a_cached_summary_still_sends_meta_first(srv, monkeypatch):
+    """The page draws its layout from meta; a cache hit must not skip it."""
+    _, port = srv
+    _count_summaries(monkeypatch, port)
+    body = {"url": "https://youtu.be/dQw4w9WgXcQ"}
+    _read_ndjson(port, body, _auth())
+    events = _read_ndjson(port, body, _auth())
+    assert [e["type"] for e in events] == ["meta", "result"]
+    assert events[0]["title"] == "Cool Title" and events[0]["original_length"]
+
+
+def test_the_key_separates_model_ratio_and_prompt(monkeypatch):
+    base = server._summary_key("vid", None)
+    with server.claude_client.use_model("sonnet"):
+        assert server._summary_key("vid", None) != base      # model
+    assert server._summary_key("vid", 0.25) != base          # trim ratio
+    assert server._summary_key("other", None) != base        # video
+    monkeypatch.setattr(server.summarize, "PROMPT_FINGERPRINT", "changed")
+    assert server._summary_key("vid", None) != base          # reworded prompt
+
+
+def test_a_reworded_prompt_invalidates_cached_summaries(srv, monkeypatch):
+    """Editing a prompt used to be invisible to a cache, which would then serve
+    text the current code would never produce."""
+    _, port = srv
+    calls = _count_summaries(monkeypatch, port)
+    body = {"url": "https://youtu.be/dQw4w9WgXcQ"}
+    _read_ndjson(port, body, _auth())
+    monkeypatch.setattr(server.summarize, "PROMPT_FINGERPRINT", "after-an-edit")
+    _read_ndjson(port, body, _auth())
+    assert calls == [1, 1], "served a summary written by the old prompt"
+
+
+def test_a_corrupt_summary_file_is_a_miss(monkeypatch, tmp_path):
+    from youtube_tldw import txcache
+    monkeypatch.setattr(txcache, "SUMMARY_DIR", tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "k.json").write_text("{not json")
+    assert txcache.get_summary("k") is None
+    txcache.put_summary("k2", {"summary_md": "x"})
+    assert txcache.get_summary("k2") == {"summary_md": "x"}

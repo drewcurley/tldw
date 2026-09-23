@@ -126,7 +126,8 @@ async function handleSummarize(port, msg) {
         } else if (ev.type === "result") {
           gotTerminal = true;
           if (videoId) cache.set(videoId, ev);
-          safePost(port, { type: "result", payload: ev });
+          // ev.cached marks a summary the server had already produced.
+          safePost(port, { type: "result", payload: ev, cached: !!ev.cached });
         } else if (ev.type === "error") {
           gotTerminal = true;
           safePost(port, { type: "error", error: httpError(ev.status, ev.error) });
