@@ -73,8 +73,8 @@ api.runtime.onConnect.addListener((port) => {
 });
 
 async function handleSummarize(port, msg) {
-  const { url, videoId } = msg;
-  if (videoId && cache.has(videoId)) {
+  const { url, videoId, refresh } = msg;
+  if (videoId && cache.has(videoId) && !refresh) {
     safePost(port, { type: "result", payload: cache.get(videoId), cached: true });
     return;
   }
@@ -91,7 +91,8 @@ async function handleSummarize(port, msg) {
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/summarize/stream", {
       method: "POST", signal: ctrl.signal,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-      body: JSON.stringify({ url, model, segment_ratio: segmentRatio }),
+      body: JSON.stringify({ url, model, segment_ratio: segmentRatio,
+                             refresh: !!refresh }),
     });
     if (!resp.ok) {
       let detail = "";
@@ -484,7 +485,7 @@ function httpError(status, detail) {
   if (status === 413) return detail || "This transcript is too long for the browser; use the tldw CLI.";
   if (status === 422) return detail || "This video has no captions/transcript to summarize.";
   if (status === 429) return "Server is busy with another summary. Try again in a moment.";
-  if (status === 502) return "Claude summarization failed. Make sure `claude` is logged in, then retry.";
+  if (status === 502) return "The model call failed. If you're on the Claude CLI, make sure `claude` is logged in; otherwise check your configured model command.";
   if (status === 504) return "Summarizing timed out on the server. Try again, or use the CLI for long videos.";
   return detail || ("Server error (" + status + ").");
 }

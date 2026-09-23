@@ -64,38 +64,40 @@ pip install -e ".[tts]"
 
 ## Choose your model
 
-The summarizer just shells out to a command that **reads the prompt on stdin and prints
-the model's text on stdout** — so you can point it at anything. Set it once with
-`tldw config set llm-cmd "<command>"` (persists), or per run with `--llm-cmd`, or via the
-`TLDW_LLM_CMD` env var.
+tldw shells out to one command that reads a prompt on stdin and writes the answer to
+stdout. Anything that fits that shape works, so you bring your own model and your own
+billing — nothing is hard-wired to one provider.
 
-**Local — fully offline, no keys, no cost** ([Ollama](https://ollama.com)):
-```bash
-ollama pull llama3.1
-tldw config set llm-cmd "ollama run llama3.1"
-```
-
-**OpenAI / Gemini / Mistral / Anthropic / 100+ others** via the
-[`llm`](https://llm.datasette.io) CLI:
-```bash
-pipx install llm
-llm keys set openai                       # paste your key (or: llm install llm-gemini && llm keys set gemini)
-tldw config set llm-cmd "llm -m gpt-4o"   # or "llm -m gemini-1.5-pro", "llm -m mistral-large", …
-```
-
-**Claude (default)** — if the [`claude` CLI](https://www.claude.com/product/claude-code)
-is installed and logged in (any Claude plan, or `ANTHROPIC_API_KEY`), it's used
-automatically with no config. `npm i -g @anthropic-ai/claude-code` then run `claude` once
-to log in.
+| You have | Configure |
+|---|---|
+| A Claude subscription (Pro/Max/Team) | Nothing — install the `claude` CLI and log in once. This is the default. |
+| An Anthropic API key | Same CLI, with `ANTHROPIC_API_KEY` set in the environment `tldw serve` runs in. |
+| Claude via Bedrock / Vertex / Foundry | Same CLI — those platforms use their own credentials; see Claude Code's own docs for the environment it expects. |
+| OpenAI, Gemini, Mistral, … | The [`llm`](https://llm.datasette.io) CLI: `tldw config llm_cmd "llm -m gpt-4o"` |
+| A local model, fully offline | `tldw config llm_cmd "ollama run llama3"` |
+| Anything else | Any command that takes the prompt on stdin and prints text. |
 
 ```bash
-tldw config get        # shows the effective model
+tldw config llm_cmd "llm -m gpt-4o"    # persist it
+TLDW_LLM_CMD="ollama run llama3" tldw serve   # or set it per run
+tldw config unset llm_cmd              # back to the claude CLI
 ```
 
-Resolution order: `--llm-cmd` > `TLDW_LLM_CMD` > `tldw config` > the `claude` CLI. Text
-summaries work well on most models; the **video** cue-selection needs reliable structured
-JSON, where larger models (Claude, GPT-4o, etc.) are more consistent than small local ones.
-The backend is **operator config only** — never set by the browser extension / an HTTP request.
+The command is **operator config** — it comes from your config file, your
+environment or `--llm-cmd`, and never from a request. The browser extension can't
+change it, by design.
+
+### What differs by backend
+
+- **Streaming works for any backend** that writes its answer as it goes, so the
+  summary fills in while it's written. A backend that buffers its output still
+  works; it just arrives at the end. A model that ignores the line format falls
+  back to a single buffered call rather than failing.
+- **The Options → Model picker (Opus/Sonnet) applies to the Claude CLI only.** With
+  a custom command the extension detects that and disables it — pick your model in
+  the command itself.
+- **`tldw usage` only has numbers for the Claude CLI**, which reports tokens and
+  cost per call. Other commands report nothing to account for.
 
 ## Usage
 

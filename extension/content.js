@@ -236,6 +236,7 @@
           <div class="row">
             <h1 id="tldw-h">TL;DW</h1>
             <div class="btns">
+              <button class="regen" hidden title="Summarize again, ignoring the cached summary (keeps the transcript)">↻</button>
               <button class="copy" hidden>Copy</button>
               <button class="close" aria-label="Close">✕</button>
             </div>
@@ -353,7 +354,7 @@
     if (lastFocused && lastFocused.focus) { try { lastFocused.focus(); } catch (_) {} }
   }
 
-  function startSummarize(url, videoId) {
+  function startSummarize(url, videoId, refresh) {
     // A new run abandons whatever the last one left connected (mount() no longer
     // does this, and it must not — see the comment there).
     clearTimers();
@@ -391,7 +392,7 @@
       if (backgrounded) endBackground(msg, true);
       else showError(msg);
     });
-    port.postMessage({ type: "summarize", url, videoId });
+    port.postMessage({ type: "summarize", url, videoId, refresh: !!refresh });
     // Heartbeat: the page never suspends, so pinging every 20s keeps the MV3 service
     // worker alive through a long (60s+) summarize that would otherwise be killed.
     pingTimer = setInterval(() => {
@@ -599,6 +600,16 @@
           <div class="askstatus" aria-live="polite"></div>
         </div>
       </div>`;
+    const again = root.querySelector(".regen");
+    if (again) {
+      again.hidden = false;
+      again.onclick = () => {
+        if (busy || requestActive || !lastPayload) return;
+        // Deliberately keeps the cached transcript: this re-runs the model, it
+        // doesn't re-download the video.
+        startSummarize(lastPayload.source_url, lastPayload.video_id, true);
+      };
+    }
     const copy = root.querySelector(".copy");
     copy.hidden = false;
     copy.onclick = () => {

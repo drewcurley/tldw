@@ -1030,3 +1030,42 @@ def test_a_corrupt_summary_file_is_a_miss(monkeypatch, tmp_path):
     assert txcache.get_summary("k") is None
     txcache.put_summary("k2", {"summary_md": "x"})
     assert txcache.get_summary("k2") == {"summary_md": "x"}
+
+
+def test_refresh_reruns_the_model_but_keeps_the_transcript(srv, monkeypatch):
+    """For comparing two versions of the same video after a tweak. Re-fetching the
+    video would only risk a rate limit."""
+    _, port = srv
+    from youtube_tldw.transcript import Cue
+    meta = VideoMeta("dQw4w9WgXcQ", "Cool Title", "Chan", 600_000, {}, {})
+    fetches, calls = [], []
+    monkeypatch.setattr(server.core, "fetch_transcript",
+                        lambda vid, lang="en", **k: fetches.append(vid) or
+                        (meta, [Cue(0, 900, "hi")]))
+    monkeypatch.setattr(server.core.summarize, "summarize_text",
+                        lambda *a, **k: calls.append(1) or TextResult(
+                            ["k"], "body", 0.2, "why"))
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    body = {"url": "https://youtu.be/dQw4w9WgXcQ"}
+
+    _read_ndjson(port, body, _auth())
+    _read_ndjson(port, body, _auth())
+    assert calls == [1] and fetches == ["dQw4w9WgXcQ"]      # second was cached
+
+    forced = _read_ndjson(port, {**body, "refresh": True}, _auth())[-1]
+    assert calls == [1, 1], "refresh did not re-run the model"
+    assert fetches == ["dQw4w9WgXcQ"], "refresh re-fetched the video"
+    assert not forced.get("cached")
+
+    _read_ndjson(port, body, _auth())                        # and it re-cached
+    assert calls == [1, 1]
+
+
+def test_the_key_separates_backends(monkeypatch):
+    """A summary written by somebody's local model must never be served as if the
+    configured backend had produced it."""
+    base = server._summary_key("vid", None)
+    monkeypatch.setenv("TLDW_LLM_CMD", "ollama run llama3")
+    assert server._summary_key("vid", None) != base
+    monkeypatch.setenv("TLDW_LLM_CMD", "llm -m gpt-4o")
+    assert server._summary_key("vid", None) != base

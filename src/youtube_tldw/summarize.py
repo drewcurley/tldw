@@ -131,6 +131,12 @@ _VIDEO_PROMPT_STREAM = _VIDEO_PROMPT_BODY + (
 )
 
 
+def backend_label() -> str:
+    """What to call the model in user-facing progress text."""
+    from .claude_client import backend_info
+    return backend_info()["label"]
+
+
 def _prompt_fingerprint() -> str:
     """Changes whenever the wording that shapes a summary changes, so a cached
     summary from an older prompt is a miss rather than a stale answer."""
@@ -356,7 +362,11 @@ def select_video_segments(
     listing = format_cues_for_selection(cues)
 
     # --- Streaming path: one Claude call, segments arrive in real time ---
-    if on_progress is not None and is_claude_cli() and len(listing) <= SINGLE_PASS_CHARS:
+    # Any backend that streams its output can take this path — not just the claude
+    # CLI. A model that ignores the line format falls through to the batch call
+    # below rather than failing, so an unfamiliar backend degrades instead of
+    # breaking.
+    if on_progress is not None and len(listing) <= SINGLE_PASS_CHARS:
         prompt = _VIDEO_PROMPT_STREAM.format(
             ratio_clause=_ratio_clause(ratio), maxlen_clause=_maxlen_clause(max_length_ms)
         )
@@ -380,13 +390,15 @@ def select_video_segments(
         done = stream_ndjson_segments(
             prompt, header + listing, on_segment=on_seg, timeout=timeout
         )
-        if not all_ranges:
-            raise TldrError("Claude selected no segments.")
-        return VideoSelection(
-            ranges=all_ranges,
-            chosen_ratio=done.get("chosen_ratio"),
-            rationale=done.get("rationale", ""),
-        )
+        if all_ranges:
+            return VideoSelection(
+                ranges=all_ranges,
+                chosen_ratio=done.get("chosen_ratio"),
+                rationale=done.get("rationale", ""),
+            )
+        # Nothing parsed: the model ignored the line format. Nothing was emitted to
+        # the caller either, so the batch call below can start cleanly.
+        log("reformatting the selection...", None)
 
     # --- Batch path: single-pass or chunked for oversized transcripts ---
     prompt = _VIDEO_PROMPT.format(

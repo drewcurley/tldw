@@ -41,6 +41,26 @@ async function load() {
   document.getElementById("model").value =
     MODELS.includes(s.model) ? s.model : DEFAULTS.model;
   fillVoices(VOICE_FALLBACK, s.voice);
+  // The model picker is Claude-CLI specific. Ask the server what it's actually
+  // talking to rather than assuming, so a bring-your-own-model setup doesn't show
+  // a control that does nothing.
+  try {
+    const base = (s.serverUrl || DEFAULTS.serverUrl).replace(/\/+$/, "");
+    const health = await (await fetch(base + "/health")).json();
+    const backend = health.backend || {};
+    const sel = document.getElementById("model");
+    const note = document.getElementById("modelNote");
+    if (backend.kind && backend.kind !== "claude") {
+      sel.disabled = true;
+      if (note) {
+        note.textContent =
+          " Your server is configured to use a custom model command, so this "
+          + "setting doesn't apply. Change the model where that command is "
+          + "configured (tldw config llm_cmd ... or TLDW_LLM_CMD).";
+      }
+    }
+  } catch (_) {}
+
   // Prefer the live server list so new voices show up without an extension update.
   try {
     const resp = await fetch((s.serverUrl || DEFAULTS.serverUrl).replace(/\/+$/, "") + "/voices");
