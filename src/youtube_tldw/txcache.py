@@ -1,4 +1,4 @@
-"""Transcripts on disk, so a restart doesn't mean re-fetching from YouTube.
+"""Transcripts and summaries on disk, so a restart doesn't throw away work.
 
 The server has always cached transcripts in memory, which meant every `tldw serve`
 restart re-fetched every video — and YouTube answers bursts from one address with
@@ -19,6 +19,7 @@ from .metadata import VideoMeta
 from .transcript import Cue
 
 CACHE_DIR = Path.home() / ".cache" / "youtube-tldw" / "transcripts"
+SUMMARY_DIR = Path.home() / ".cache" / "youtube-tldw" / "summaries"
 TTL_SECONDS = 14 * 24 * 3600      # transcripts rarely change; a fortnight is ample
 MAX_ENTRIES = 500
 
@@ -66,7 +67,39 @@ def put(video_id: str, meta, cues: list) -> None:
         pass
 
 
-def _prune() -> None:
-    files = sorted(CACHE_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime)
+def _prune(directory: Path | None = None) -> None:
+    target = directory or CACHE_DIR
+    files = sorted(target.glob("*.json"), key=lambda f: f.stat().st_mtime)
     for stale in files[:max(0, len(files) - MAX_ENTRIES)]:
         stale.unlink(missing_ok=True)
+
+
+# --- summaries ----------------------------------------------------------------
+#
+# Keyed by video *and* by everything that shapes the answer — the model, the trim
+# ratio, and a fingerprint of the prompts themselves — so changing any of them
+# produces a miss rather than serving something the current code wouldn't produce.
+
+def get_summary(key: str):
+    """The stored payload for this key, or None."""
+    try:
+        raw = json.loads((SUMMARY_DIR / f"{key}.json").read_text(encoding="utf-8"))
+        if time.time() - float(raw["saved_at"]) > TTL_SECONDS:
+            return None
+        payload = raw["payload"]
+        return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def put_summary(key: str, payload: dict) -> None:
+    """Best effort, like the transcript side: never fail a finished request."""
+    try:
+        SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SUMMARY_DIR / f"{key}.tmp"
+        tmp.write_text(json.dumps({"saved_at": time.time(), "payload": payload}),
+                       encoding="utf-8")
+        tmp.replace(SUMMARY_DIR / f"{key}.json")
+        _prune(SUMMARY_DIR)
+    except Exception:
+        pass

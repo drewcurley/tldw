@@ -131,6 +131,17 @@ _VIDEO_PROMPT_STREAM = _VIDEO_PROMPT_BODY + (
 )
 
 
+def _prompt_fingerprint() -> str:
+    """Changes whenever the wording that shapes a summary changes, so a cached
+    summary from an older prompt is a miss rather than a stale answer."""
+    import hashlib
+    blob = "".join((_TEXT_BODY, _TEXT_PROMPT, _TEXT_PROMPT_STREAM, _TEXT_REDUCE_PROMPT))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
+PROMPT_FINGERPRINT = _prompt_fingerprint()
+
+
 def _ratio_clause(ratio: float | None) -> str:
     if ratio is None:
         return (

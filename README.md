@@ -212,7 +212,10 @@ retry with exponential backoff, so a single 429 recovers instead of failing.
 
 Transcripts are cached to `~/.cache/youtube-tldw/transcripts/` for a fortnight and
 every path reads them — summarizing included — so restarting `tldw serve` no longer
-re-fetches videos you've already summarized — the
+re-fetches videos you've already summarized. Finished summaries are cached the same
+way in `summaries/`, keyed by video, model, trim strength **and** a fingerprint of
+the prompts, so re-opening a video is instant and free while a reworded prompt
+produces a miss rather than a stale answer — the
 cache used to live only in memory, which made restarts the main source of repeat
 requests. If you do get rate-limited, it clears on its own in a few minutes.
 
