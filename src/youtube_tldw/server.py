@@ -332,8 +332,9 @@ def _page_transcript(body, url: str):
         vid = canonical_video_id(url)
     except TldrError:
         return None
+    fmt = page.get("captions_format")
     try:
-        cues = transcript.parse_subtitles(vtt)
+        cues = transcript.parse_captions(vtt, fmt if isinstance(fmt, str) else None)
     except TldrError:
         return None                      # unparseable: fall back to fetching it
     if not cues:

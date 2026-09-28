@@ -410,11 +410,32 @@
       };
       const track = pickCaptionTrack(player);
       if (!track || !track.baseUrl) return { ...out, status: "no-captions" };
-      const capRes = await fetch(track.baseUrl + "&fmt=vtt", { credentials: "include" });
-      if (!capRes.ok) return { ...out, status: "captions-" + capRes.status };
-      const captions = await capRes.text();
-      if (!captions.trim()) return { ...out, status: "captions-empty" };
-      return { ...out, captions, status: "ok" };
+      // YouTube answers 200-with-an-empty-body for a format it doesn't want to
+      // serve, so try more than one and report which worked. json3 first: it's what
+      // the player itself asks for. Setting fmt rather than appending matters —
+      // baseUrl often carries one already, and two of them yield nothing.
+      const tried = [];
+      for (const fmt of ["json3", "vtt", null]) {
+        let url;
+        try {
+          url = new URL(track.baseUrl, location.origin);
+          if (fmt) url.searchParams.set("fmt", fmt);
+          else url.searchParams.delete("fmt");
+        } catch (_) { continue; }
+        const label = fmt || "raw";
+        let res;
+        try {
+          res = await fetch(url.toString(), { credentials: "include" });
+        } catch (_) { tried.push(label + "-threw"); continue; }
+        if (!res.ok) { tried.push(label + "-" + res.status); continue; }
+        const body = await res.text();
+        if (body.trim()) {
+          return { ...out, captions: body, captions_format: label,
+                   status: "ok-" + label };
+        }
+        tried.push(label + "-empty");
+      }
+      return { ...out, status: "captions-empty (" + tried.join(",") + ")" };
     } catch (e) {
       return { status: "error-" + (e && e.name ? e.name : "unknown") };
     }
