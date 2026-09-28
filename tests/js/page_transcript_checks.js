@@ -50,9 +50,13 @@ check("no captions section", pickCaptionTrack({}), null);
 check("no player at all", pickCaptionTrack(null), null);
 
 // --- the whole collection, and what it reports when it can't ---
-function collector(html, capResponse) {
+// capResponses: one response per caption attempt, in order (json3, vtt, raw).
+function collector(html, capResponses) {
   const fetches = [];
-  global.location = { href: "https://www.youtube.com/watch?v=abc" };
+  const queue = Array.isArray(capResponses) ? capResponses.slice() : [capResponses];
+  global.URL = URL;
+  global.location = { href: "https://www.youtube.com/watch?v=abc",
+                      origin: "https://www.youtube.com" };
   global.fetch = (url) => {
     fetches.push(url);
     if (fetches.length === 1) {
@@ -60,7 +64,8 @@ function collector(html, capResponse) {
         ? Promise.reject(new TypeError("Failed to fetch"))
         : Promise.resolve({ ok: true, text: () => Promise.resolve(html) });
     }
-    return Promise.resolve(capResponse);
+    const next = queue.length > 1 ? queue.shift() : queue[0];
+    return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
   };
   const m = {};
   eval(COLLECT + "\nm.fn = collectPageTranscript;");
@@ -75,13 +80,32 @@ const OK_CAPS = { ok: true, text: () => Promise.resolve("WEBVTT\n\nhi\n") };
 (async () => {
   let c = collector(PLAYER([{ baseUrl: "https://x/en", languageCode: "en" }]), OK_CAPS);
   let r = await c.run();
-  check("status ok", r.status, "ok");
+  check("status names the format that worked", r.status, "ok-json3");
+  check("and the format travels with the text", r.captions_format, "json3");
   check("title", r.title, "T");
   check("channel", r.channel, "C");
   check("duration in ms", r.duration_ms, 600000);
   check("captions", r.captions, "WEBVTT\n\nhi\n");
-  check("asks for vtt, which the server already parses",
-    c.fetches[1], "https://x/en&fmt=vtt");
+  check("asks the player's own format first",
+    c.fetches[1], (u) => u.includes("fmt=json3"));
+
+  // YouTube answers 200-with-nothing for a format it won't serve, so falling back
+  // to another one is the difference between working and not.
+  const EMPTY = { ok: true, text: () => Promise.resolve("") };
+  c = collector(PLAYER([{ baseUrl: "https://x/en" }]), [EMPTY, OK_CAPS]);
+  r = await c.run();
+  check("empty json3 falls through to vtt", r.status, "ok-vtt");
+  check("...and asked for vtt second", c.fetches[2], (u) => u.includes("fmt=vtt"));
+
+  c = collector(PLAYER([{ baseUrl: "https://x/en" }]), [EMPTY, EMPTY, OK_CAPS]);
+  r = await c.run();
+  check("then the url as the page gave it", r.status, "ok-raw");
+  check("...with no fmt of ours attached", c.fetches[3], (u) => !u.includes("fmt="));
+
+  c = collector(PLAYER([{ baseUrl: "https://x/en?fmt=srv3" }]), OK_CAPS);
+  await c.run();
+  check("an fmt already on the url is replaced, not duplicated",
+    (c.fetches[1].match(/fmt=/g) || []).length, 1);
 
   r = await collector("no player blob here", OK_CAPS).run();
   check("page without player data says so", r.status, "no-player-data");
@@ -95,11 +119,13 @@ const OK_CAPS = { ok: true, text: () => Promise.resolve("WEBVTT\n\nhi\n") };
 
   r = await collector(PLAYER([{ baseUrl: "https://x/en" }]),
     { ok: false, status: 429 }).run();
-  check("captions refused reports the code", r.status, "captions-429");
+  check("every attempt refused reports each code",
+    r.status, "captions-empty (json3-429,vtt-429,raw-429)");
 
   r = await collector(PLAYER([{ baseUrl: "https://x/en" }]),
     { ok: true, text: () => Promise.resolve("   ") }).run();
-  check("empty captions say so", r.status, "captions-empty");
+  check("every attempt empty says so",
+    r.status, "captions-empty (json3-empty,vtt-empty,raw-empty)");
 
   r = await collector(null, OK_CAPS).run();
   check("network failure is named, not swallowed", r.status, "error-TypeError");
