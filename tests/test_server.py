@@ -1157,3 +1157,62 @@ def test_page_metadata_is_bounded_and_has_fallbacks():
     assert meta.channel == "(unknown)"
     assert meta.duration_ms == cues[-1].end_ms      # implausible value ignored
     assert meta.video_id == "dQw4w9WgXcQ"
+
+
+# --- the transcript as the page's own panel rendered it -------------------------
+#
+# This is the path that keeps the server from talking to YouTube at all. The older
+# `captions` shape is still accepted so an un-updated extension keeps working.
+
+PANEL_CUES = [{"start_ms": 0, "text": "first line"},
+              {"start_ms": 5000, "text": "second line"}]
+
+
+def test_panel_cues_are_used_without_contacting_youtube(srv, monkeypatch):
+    _, port = srv
+    monkeypatch.setattr(server.core, "fetch_transcript",
+                        lambda *a, **k: pytest.fail("contacted YouTube"))
+    monkeypatch.setattr(server.core.summarize, "summarize_text",
+                        lambda *a, **k: TextResult(["k"], "b", 0.2, ""))
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                        "page": {"cues": PANEL_CUES, "title": "T", "channel": "C"}},
+                 _auth())
+    assert server._cache_get("dQw4w9WgXcQ") is not None
+
+
+def test_panel_cues_carry_the_pages_metadata():
+    body = {"page": {"cues": PANEL_CUES, "title": "A Title", "channel": "A Channel",
+                     "duration_ms": 600_000}}
+    meta, cues = server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
+    assert (meta.title, meta.channel) == ("A Title", "A Channel")
+    assert meta.duration_ms == 600_000
+    assert [c.text for c in cues] == ["first line", "second line"]
+    assert cues[-1].end_ms == 600_000       # the last line runs to the end
+
+
+def test_panel_cues_without_a_duration_fall_back_to_the_last_cue():
+    body = {"page": {"cues": PANEL_CUES}}
+    meta, cues = server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
+    assert meta.duration_ms == cues[-1].end_ms
+
+
+@pytest.mark.parametrize("cues", [
+    [], "not a list", [{}], [{"start_ms": "x", "text": "y"}], [None],
+])
+def test_unusable_panel_cues_fall_back_to_fetching(cues):
+    """Same rule as every other page input: unusable means fetch it properly."""
+    body = {"page": {"cues": cues, "title": "T"}}
+    assert server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ") is None
+
+
+def test_cues_win_over_a_caption_track_when_both_arrive():
+    body = {"page": {"cues": PANEL_CUES, "captions": VTT}}
+    _, cues = server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
+    assert [c.text for c in cues] == ["first line", "second line"]
+
+
+def test_an_older_extension_still_gets_its_caption_track_parsed():
+    body = {"page": {"captions": VTT}}
+    result = server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
+    assert result is not None and result[1]

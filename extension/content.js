@@ -356,89 +356,183 @@
 
   // --- What the server would otherwise ask YouTube for ---------------------------
   //
-  // It's all on this page already. Doing it here rather than from the worker keeps
-  // it inside the page's own origin and session: no host permission, no MAIN-world
-  // injection (the first attempt at this, which the activeTab grant doesn't cover),
-  // and YouTube sees an ordinary request from the tab you're looking at.
+  // YouTube no longer serves captions to anything that isn't the player. The
+  // timedtext endpoint answers 429 to yt-dlp and to curl, and 200-with-an-empty-body
+  // to a fetch made from this page -- it wants a proof-of-origin token we can't mint.
+  // Measured, for all of json3/vtt/raw, which is why the previous version of this
+  // function could only ever report "captions-empty".
+  //
+  // The one copy of the captions still within reach is the transcript *panel*: the
+  // page loads that for itself, through its own session. So we open the panel, read
+  // what it rendered, and put it back the way we found it.
+  //
+  // Doing this in the content script rather than the worker keeps it inside the
+  // page's own origin and session -- no host permission and no MAIN-world injection
+  // (the first attempt at this, which the activeTab grant doesn't cover).
 
-  // Pulls one balanced JSON object out of the page source. Regex can't do this —
-  // the blob contains braces in strings, and it's a megabyte long.
-  function extractJson(html, marker) {
-    const at = html.indexOf(marker);
-    if (at < 0) return null;
-    const start = html.indexOf("{", at);
-    if (start < 0) return null;
-    let depth = 0, inString = false, escaped = false;
-    for (let i = start; i < html.length; i++) {
-      const c = html[i];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (c === "\\") escaped = true;
-        else if (c === '"') inString = false;
-      } else if (c === '"') inString = true;
-      else if (c === "{") depth++;
-      else if (c === "}" && --depth === 0) return html.slice(start, i + 1);
+  const CLOCK = /^\d{1,2}(?::\d{2}){1,2}$/;
+  const SEGMENT_ROWS = "transcript-segment-view-model, ytd-transcript-segment-renderer";
+  const PANEL = "ytd-engagement-panel-section-list-renderer";
+  const TRANSCRIPT_BUTTON = "ytd-video-description-transcript-section-renderer button";
+  // A panel that is going to fill starts doing so in well under a second (measured
+  // at ~300ms against a real page). This ceiling is therefore not about patience but
+  // about giving up: every second spent here on a video whose panel will never fill
+  // is a second added to the summary, because the server's fallback can't start
+  // until we've answered.
+  const PANEL_WAIT_MS = 8000;      // for the panel's first row to appear
+  const PANEL_SETTLE_MS = 5000;    // ...and for the last one, once they're arriving
+  const PANEL_POLL_MS = 200;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function clockToMs(text) {
+    const parts = String(text).trim().split(":");
+    if (parts.length < 2 || parts.length > 3) return null;
+    let secs = 0;
+    for (const part of parts) {
+      if (!/^\d+$/.test(part)) return null;
+      secs = secs * 60 + Number(part);
+    }
+    return secs * 1000;
+  }
+
+  function isoDurationMs(iso) {
+    const m = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(String(iso || "").trim());
+    if (!m) return null;
+    const ms = ((+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0)) * 1000;
+    return ms > 0 ? ms : null;
+  }
+
+  // A panel row is read structurally, not by class name: YouTube's generated class
+  // names churn, but "the timestamp is the child that reads like a clock, the words
+  // are what's left" has held across both the old renderer and the current one. The
+  // row also carries a screen-reader twin of the timestamp ("5 seconds") which is
+  // English-only, so it's dropped by class rather than by matching its text.
+  function rowStartMs(row) {
+    const stamp = row.querySelector(".segment-timestamp");
+    if (stamp) return clockToMs(stamp.textContent || "");
+    for (const el of row.querySelectorAll("*")) {
+      if (el.children.length) continue;
+      const text = (el.textContent || "").trim();
+      if (CLOCK.test(text)) return clockToMs(text);
     }
     return null;
   }
 
-  function pickCaptionTrack(player) {
-    const tracks = (player && player.captions
-      && player.captions.playerCaptionsTracklistRenderer
-      && player.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
-    // A real transcript beats auto-captions; English beats whatever came first.
-    const score = (t) => (t.kind === "asr" ? 0 : 2)
-      + (String(t.languageCode || "").startsWith("en") ? 1 : 0);
-    return tracks.slice().sort((a, b) => score(b) - score(a))[0] || null;
+  function rowText(row) {
+    const direct = row.querySelector(".segment-text");
+    if (direct) return (direct.textContent || "").trim();
+    const parts = [];
+    for (const el of row.children) {
+      const text = (el.textContent || "").trim();
+      if (!text || CLOCK.test(text)) continue;
+      if (/a11y/i.test(String(el.className || ""))) continue;
+      parts.push(text);
+    }
+    return parts.join(" ").trim();
+  }
+
+  function readTranscriptRows(doc) {
+    const cues = [];
+    for (const row of (doc || document).querySelectorAll(SEGMENT_ROWS)) {
+      const start = rowStartMs(row);
+      const text = rowText(row);
+      if (start !== null && text) cues.push({ start_ms: start, text });
+    }
+    return cues;
+  }
+
+  // The panel that holds the transcript. Finding it by its rows alone would miss
+  // the case this whole thing has to handle -- a panel that opened and never
+  // filled -- and we would leave it open on a page we were only supposed to read.
+  function transcriptPanel(doc) {
+    const panels = Array.prototype.slice.call(
+      (doc || document).querySelectorAll(PANEL));
+    const named = (p) => /transcript/i.test(p.getAttribute("target-id") || "");
+    const open = (p) => (p.getAttribute("visibility") || "").includes("EXPANDED");
+    return panels.find((p) => p.querySelector(SEGMENT_ROWS))
+      || panels.find((p) => named(p) && open(p))
+      || panels.find(named)
+      || null;
+  }
+
+  // Title, channel and duration are all in the page's own metadata tags, so none of
+  // this costs a request. Duration matters: the last cue's timestamp is where the
+  // final sentence *starts*, not where the video ends.
+  function pageMeta(doc) {
+    const d = doc || document;
+    const attr = (sel, name) => {
+      const el = d.querySelector(sel);
+      return el ? (el.getAttribute(name) || "").trim() : "";
+    };
+    const text = (sel) => {
+      const el = d.querySelector(sel);
+      return el ? (el.textContent || "").trim() : "";
+    };
+    const out = {
+      title: attr('meta[name="title"]', "content")
+        || text("#above-the-fold h1, ytd-watch-metadata h1"),
+      channel: attr('span[itemprop="author"] link[itemprop="name"]', "content")
+        || text("#owner #channel-name a, ytd-channel-name a"),
+    };
+    const ms = isoDurationMs(attr('meta[itemprop="duration"]', "content"));
+    if (ms) out.duration_ms = ms;
+    return out;
+  }
+
+  // Wait for the row count to stop growing: the panel streams its segments in, so
+  // the first row appearing does not mean the last one has.
+  async function settledRows(deadlineMs) {
+    let previous = -1;
+    let count = readTranscriptRows().length;
+    const until = Date.now() + deadlineMs;
+    while (count !== previous && Date.now() < until) {
+      previous = count;
+      await sleep(PANEL_POLL_MS);
+      count = readTranscriptRows().length;
+    }
+    return count;
   }
 
   // Always resolves. A failure here just means the server fetches instead, and the
-  // status says which failure it was — silence made the first version undiagnosable.
+  // status says which failure it was -- silence made the first version undiagnosable.
   async function collectPageTranscript() {
     try {
-      const res = await fetch(location.href, { credentials: "include" });
-      if (!res.ok) return { status: "page-fetch-" + res.status };
-      const raw = extractJson(await res.text(), "ytInitialPlayerResponse");
-      if (!raw) return { status: "no-player-data" };
-      let player;
-      try { player = JSON.parse(raw); } catch (_) { return { status: "unparsable" }; }
-      const details = player.videoDetails || {};
-      const out = {
-        title: details.title,
-        channel: details.author,
-        duration_ms: Number(details.lengthSeconds) * 1000 || undefined,
-      };
-      const track = pickCaptionTrack(player);
-      if (!track || !track.baseUrl) return { ...out, status: "no-captions" };
-      // YouTube answers 200-with-an-empty-body for a format it doesn't want to
-      // serve, so try more than one and report which worked. json3 first: it's what
-      // the player itself asks for. Setting fmt rather than appending matters —
-      // baseUrl often carries one already, and two of them yield nothing.
-      const tried = [];
-      for (const fmt of ["json3", "vtt", null]) {
-        let url;
-        try {
-          url = new URL(track.baseUrl, location.origin);
-          if (fmt) url.searchParams.set("fmt", fmt);
-          else url.searchParams.delete("fmt");
-        } catch (_) { continue; }
-        const label = fmt || "raw";
-        let res;
-        try {
-          res = await fetch(url.toString(), { credentials: "include" });
-        } catch (_) { tried.push(label + "-threw"); continue; }
-        if (!res.ok) { tried.push(label + "-" + res.status); continue; }
-        const body = await res.text();
-        if (body.trim()) {
-          return { ...out, captions: body, captions_format: label,
-                   status: "ok-" + label };
+      const meta = pageMeta();
+      const already = readTranscriptRows().length > 0;
+      if (!already) {
+        const button = document.querySelector(TRANSCRIPT_BUTTON);
+        if (!button) return { ...meta, status: "no-transcript-button" };
+        // The button lives in the collapsed description; it doesn't need to be
+        // on screen to be clicked, but the panel it opens takes a moment to fill.
+        button.click();
+        const until = Date.now() + PANEL_WAIT_MS;
+        while (Date.now() < until && !readTranscriptRows().length) {
+          await sleep(PANEL_POLL_MS);
         }
-        tried.push(label + "-empty");
       }
-      return { ...out, status: "captions-empty (" + tried.join(",") + ")" };
+      const count = await settledRows(PANEL_SETTLE_MS);
+      const cues = readTranscriptRows();
+      if (!already) restoreTranscriptPanel();
+      if (!count || !cues.length) {
+        // The panel opened but never filled: YouTube refused its own get_transcript
+        // call. Seen on videos whose captions aren't auto-generated.
+        return { ...meta, status: "panel-empty" };
+      }
+      return { ...meta, cues, status: "ok-panel (" + cues.length + " cues)" };
     } catch (e) {
-      return { status: "error-" + (e && e.name ? e.name : "unknown") };
+      return { status: "error-" + ((e && e.name) || "unknown") };
     }
+  }
+
+  // Put the panel back. We opened it to read it; leaving it open would rearrange the
+  // page around someone who only asked for a summary.
+  function restoreTranscriptPanel() {
+    try {
+      const panel = transcriptPanel();
+      const close = panel && panel.querySelector("#visibility-button button");
+      if (close) close.click();
+    } catch (_) {}
   }
 
   function startSummarize(url, videoId, refresh) {
