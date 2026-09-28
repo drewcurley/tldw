@@ -325,16 +325,27 @@ def _page_transcript(body, url: str):
     page = body.get("page") if isinstance(body, dict) else None
     if not isinstance(page, dict):
         return None
-    vtt = page.get("captions")
-    if not isinstance(vtt, str) or not vtt.strip():
-        return None
     try:
         vid = canonical_video_id(url)
     except TldrError:
         return None
-    fmt = page.get("captions_format")
+    raw_duration = page.get("duration_ms")
+    duration_ms = int(raw_duration) if isinstance(raw_duration, (int, float)) \
+        and not isinstance(raw_duration, bool) \
+        and 0 < raw_duration < 24 * 3600 * 1000 else None
+    rows = page.get("cues")
     try:
-        cues = transcript.parse_captions(vtt, fmt if isinstance(fmt, str) else None)
+        if isinstance(rows, list):
+            # What the page's own transcript panel rendered -- the only copy of the
+            # captions YouTube still hands out (see the extension for why).
+            cues = transcript.parse_panel_rows(rows, duration_ms)
+        else:
+            # An extension older than the panel change still sends a caption track.
+            vtt = page.get("captions")
+            if not isinstance(vtt, str) or not vtt.strip():
+                return None
+            fmt = page.get("captions_format")
+            cues = transcript.parse_captions(vtt, fmt if isinstance(fmt, str) else None)
     except TldrError:
         return None                      # unparseable: fall back to fetching it
     if not cues:
@@ -343,9 +354,7 @@ def _page_transcript(body, url: str):
     def text(value, limit):
         return value.strip()[:limit] if isinstance(value, str) and value.strip() else ""
 
-    duration = page.get("duration_ms")
-    duration = int(duration) if isinstance(duration, (int, float)) and \
-        0 < duration < 24 * 3600 * 1000 else cues[-1].end_ms
+    duration = duration_ms or cues[-1].end_ms
     meta = md.VideoMeta(vid, text(page.get("title"), 300) or "(untitled)",
                         text(page.get("channel"), 200) or "(unknown)",
                         duration, {}, {})
@@ -619,7 +628,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         page = body.get("page") if isinstance(body, dict) else None
         if isinstance(page, dict) and page.get("status"):
-            tlog(f"page transcript: {str(page['status'])[:40]}")
+            tlog(f"page transcript: {str(page['status'])[:200]}")
         elif page is None:
             tlog("page transcript: not offered (old extension, or non-page request)")
 

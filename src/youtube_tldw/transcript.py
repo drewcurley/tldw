@@ -96,6 +96,50 @@ def parse_json3(content: str) -> list[Cue]:
     return _normalize(deduped)
 
 
+MAX_PANEL_ROWS = 20_000        # a 10-hour video is ~5,000 panel rows
+MAX_CUE_CHARS = 1_000
+_TAIL_MS = 5_000               # how long the closing line runs when nothing says
+
+
+def parse_panel_rows(rows, duration_ms: int | None = None) -> list[Cue]:
+    """Cues from YouTube's own transcript panel, as the extension read it.
+
+    The panel gives each line a start and the words, but no end -- on screen, a line
+    simply runs until the next one starts, so that is what we reconstruct. The last
+    line runs to the end of the video when we know how long it is, since its start is
+    where the closing sentence begins, not where it stops.
+
+    Every value here came in over HTTP from the page, so nothing is trusted: rows
+    that aren't a start plus some text are dropped rather than repaired.
+    """
+    clean: list[tuple[int, str]] = []
+    for row in list(rows)[:MAX_PANEL_ROWS]:
+        if not isinstance(row, dict):
+            continue
+        start, text = row.get("start_ms"), row.get("text")
+        if isinstance(start, bool) or not isinstance(start, (int, float)):
+            continue
+        if start < 0 or start > 24 * 3600 * 1000:
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        clean.append((int(start), _WS.sub(" ", text).strip()[:MAX_CUE_CHARS]))
+    if not clean:
+        return []
+    clean.sort(key=lambda row: row[0])
+    end_of_video = duration_ms if isinstance(duration_ms, int) else None
+    cues = []
+    for i, (start, text) in enumerate(clean):
+        if i + 1 < len(clean):
+            end = clean[i + 1][0]
+        elif end_of_video and end_of_video > start:
+            end = end_of_video
+        else:
+            end = start + _TAIL_MS
+        cues.append(Cue(start, max(end, start + 1), text))
+    return _normalize(cues)
+
+
 def parse_captions(content: str, fmt: str | None = None) -> list[Cue]:
     """Parse a caption track in whichever format the page managed to fetch."""
     if fmt == "json3" or content.lstrip().startswith("{"):
