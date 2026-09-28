@@ -616,6 +616,12 @@ class _Handler(BaseHTTPRequestHandler):
                                         _segment_ratio(body))
                 return
 
+        page = body.get("page") if isinstance(body, dict) else None
+        if isinstance(page, dict) and page.get("status"):
+            tlog(f"page transcript: {str(page['status'])[:40]}")
+        elif page is None:
+            tlog("page transcript: not offered (old extension, or non-page request)")
+
         def partial(ev):
             if ev["kind"] == "meta":
                 m = ev["meta"]

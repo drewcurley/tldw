@@ -354,6 +354,72 @@
     if (lastFocused && lastFocused.focus) { try { lastFocused.focus(); } catch (_) {} }
   }
 
+  // --- What the server would otherwise ask YouTube for ---------------------------
+  //
+  // It's all on this page already. Doing it here rather than from the worker keeps
+  // it inside the page's own origin and session: no host permission, no MAIN-world
+  // injection (the first attempt at this, which the activeTab grant doesn't cover),
+  // and YouTube sees an ordinary request from the tab you're looking at.
+
+  // Pulls one balanced JSON object out of the page source. Regex can't do this —
+  // the blob contains braces in strings, and it's a megabyte long.
+  function extractJson(html, marker) {
+    const at = html.indexOf(marker);
+    if (at < 0) return null;
+    const start = html.indexOf("{", at);
+    if (start < 0) return null;
+    let depth = 0, inString = false, escaped = false;
+    for (let i = start; i < html.length; i++) {
+      const c = html[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (c === "\\") escaped = true;
+        else if (c === '"') inString = false;
+      } else if (c === '"') inString = true;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) return html.slice(start, i + 1);
+    }
+    return null;
+  }
+
+  function pickCaptionTrack(player) {
+    const tracks = (player && player.captions
+      && player.captions.playerCaptionsTracklistRenderer
+      && player.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
+    // A real transcript beats auto-captions; English beats whatever came first.
+    const score = (t) => (t.kind === "asr" ? 0 : 2)
+      + (String(t.languageCode || "").startsWith("en") ? 1 : 0);
+    return tracks.slice().sort((a, b) => score(b) - score(a))[0] || null;
+  }
+
+  // Always resolves. A failure here just means the server fetches instead, and the
+  // status says which failure it was — silence made the first version undiagnosable.
+  async function collectPageTranscript() {
+    try {
+      const res = await fetch(location.href, { credentials: "include" });
+      if (!res.ok) return { status: "page-fetch-" + res.status };
+      const raw = extractJson(await res.text(), "ytInitialPlayerResponse");
+      if (!raw) return { status: "no-player-data" };
+      let player;
+      try { player = JSON.parse(raw); } catch (_) { return { status: "unparsable" }; }
+      const details = player.videoDetails || {};
+      const out = {
+        title: details.title,
+        channel: details.author,
+        duration_ms: Number(details.lengthSeconds) * 1000 || undefined,
+      };
+      const track = pickCaptionTrack(player);
+      if (!track || !track.baseUrl) return { ...out, status: "no-captions" };
+      const capRes = await fetch(track.baseUrl + "&fmt=vtt", { credentials: "include" });
+      if (!capRes.ok) return { ...out, status: "captions-" + capRes.status };
+      const captions = await capRes.text();
+      if (!captions.trim()) return { ...out, status: "captions-empty" };
+      return { ...out, captions, status: "ok" };
+    } catch (e) {
+      return { status: "error-" + (e && e.name ? e.name : "unknown") };
+    }
+  }
+
   function startSummarize(url, videoId, refresh) {
     // A new run abandons whatever the last one left connected (mount() no longer
     // does this, and it must not — see the comment there).
@@ -392,7 +458,12 @@
       if (backgrounded) endBackground(msg, true);
       else showError(msg);
     });
-    port.postMessage({ type: "summarize", url, videoId, refresh: !!refresh });
+    // Gather from the page first, then ask the server. A second or so here saves
+    // the server a yt-dlp extraction that YouTube may refuse outright.
+    collectPageTranscript().then((page) => {
+      if (!requestActive) return;              // cancelled while we were reading
+      port.postMessage({ type: "summarize", url, videoId, refresh: !!refresh, page });
+    });
     // Heartbeat: the page never suspends, so pinging every 20s keeps the MV3 service
     // worker alive through a long (60s+) summarize that would otherwise be killed.
     pingTimer = setInterval(() => {
