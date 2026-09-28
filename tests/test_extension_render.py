@@ -34,7 +34,7 @@ def test_reading_the_transcript_from_the_page():
     """The path that lets a summarize happen without the server contacting
     YouTube — track selection, and degrading instead of throwing."""
     proc = subprocess.run(
-        ["node", str(PAGE_CHECKS_JS), str(BACKGROUND_JS)],
+        ["node", str(PAGE_CHECKS_JS), str(CONTENT_JS)],
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
