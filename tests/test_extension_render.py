@@ -26,6 +26,20 @@ def test_answer_rendering_escaping_and_citations():
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+PAGE_CHECKS_JS = Path(__file__).parent / "js" / "page_transcript_checks.js"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_reading_the_transcript_from_the_page():
+    """The path that lets a summarize happen without the server contacting
+    YouTube — track selection, and degrading instead of throwing."""
+    proc = subprocess.run(
+        ["node", str(PAGE_CHECKS_JS), str(BACKGROUND_JS)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("script", ["content.js", "background.js", "options.js"])
 def test_extension_scripts_parse(script):

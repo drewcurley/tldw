@@ -48,7 +48,8 @@ def fetch_transcript(video_id: str, lang: str = "en", *, on_progress=None,
         log(f'"{meta.title}" by {meta.channel} ({format_dur(meta.duration_ms)}) '
             f"-- using {kind} ({lang_key})", pcts[1])
         cues = transcript.parse_subtitles(
-            md.download_subtitle(video_id, lang_key, is_auto, workdir))
+            md.subtitle_text(meta, lang_key, is_auto, workdir,
+                             on_progress=lambda m: log(m, pcts[1])))
         log(f"parsed {len(cues)} cues, "
             f"{sum(len(c.text.split()) for c in cues)} words", pcts[2])
         return meta, cues

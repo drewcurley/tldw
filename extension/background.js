@@ -72,8 +72,52 @@ api.runtime.onConnect.addListener((port) => {
   });
 });
 
+// Read what the watch page already has, and fetch its caption track from the page
+// itself. This runs in the MAIN world because ytInitialPlayerResponse is a page
+// variable — a content script can't see it. Everything here happens in the user's
+// own session, which is why it works when yt-dlp gets a 429.
+function readPageTranscript() {
+  const pr = window.ytInitialPlayerResponse;
+  const details = pr && pr.videoDetails;
+  const tracks = (pr && pr.captions
+    && pr.captions.playerCaptionsTracklistRenderer
+    && pr.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
+  const out = {
+    title: details && details.title,
+    channel: details && details.author,
+    duration_ms: details && Number(details.lengthSeconds) * 1000,
+  };
+  // Prefer a real transcript over an auto one, and English over whatever is first.
+  const score = (t) => (t.kind === "asr" ? 0 : 2)
+    + (String(t.languageCode || "").startsWith("en") ? 1 : 0);
+  const best = tracks.slice().sort((a, b) => score(b) - score(a))[0];
+  if (!best || !best.baseUrl) return out;
+  // fmt=vtt so the server's existing parser handles it unchanged.
+  return fetch(best.baseUrl + "&fmt=vtt", { credentials: "include" })
+    .then((r) => (r.ok ? r.text() : ""))
+    .then((captions) => ({ ...out, captions }))
+    .catch(() => out);
+}
+
+async function pageTranscript(tabId) {
+  if (!tabId) return null;
+  try {
+    const [res] = await api.scripting.executeScript({
+      target: { tabId }, world: "MAIN", func: readPageTranscript,
+    });
+    const data = res && res.result;
+    return data && typeof data.captions === "string" && data.captions.trim()
+      ? data : null;
+  } catch (_) {
+    return null;          // no MAIN world, no player data — the server fetches
+  }
+}
+
 async function handleSummarize(port, msg) {
   const { url, videoId, refresh } = msg;
+  // From the port, not the message: the page doesn't know its own tab id, and we
+  // must only ever script the tab the request actually came from.
+  const tabId = port.sender && port.sender.tab && port.sender.tab.id;
   if (videoId && cache.has(videoId) && !refresh) {
     safePost(port, { type: "result", payload: cache.get(videoId), cached: true });
     return;
@@ -88,11 +132,12 @@ async function handleSummarize(port, msg) {
   const timer = setTimeout(() => ctrl.abort(), CLIENT_TIMEOUT_MS);
   let gotTerminal = false;
   try {
+    const page = await pageTranscript(tabId);
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/summarize/stream", {
       method: "POST", signal: ctrl.signal,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
       body: JSON.stringify({ url, model, segment_ratio: segmentRatio,
-                             refresh: !!refresh }),
+                             refresh: !!refresh, page }),
     });
     if (!resp.ok) {
       let detail = "";

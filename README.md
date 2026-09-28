@@ -208,9 +208,27 @@ required. `tldw usage` will tell you how many hours it has saved you.
 
 ## YouTube rate limiting
 
-YouTube answers bursts of requests from one address with **HTTP 429**. tldw makes
-exactly two yt-dlp calls per video (metadata, then the subtitle track) and both now
-retry with exponential backoff, so a single 429 recovers instead of failing.
+**The extension doesn't ask YouTube for anything.** The watch page already has the
+title, channel, duration and caption tracks, and the browser can fetch its own
+caption track in your session — so the summary is built from what the page had, and
+the server makes no request to YouTube at all. That is why the extension keeps
+working when `yt-dlp` gets a 429 on its first request of the day: YouTube throttles
+unauthenticated extraction, not your browser.
+
+The `yt-dlp` path is still there, for the CLI and as a fallback when the page can't
+supply captions. It's cheaper than it was — the caption track is fetched directly
+from the URL the metadata already contains, instead of a second full extraction —
+and if it does get throttled you can lend it your browser session:
+
+```bash
+tldw config ytdlp_cookies chrome     # chromium, brave, edge, firefox, safari, opera, vivaldi
+```
+
+That reads your browser's cookie store so yt-dlp looks like you rather than like a
+bot. It's opt-in, off by default, and never settable from a request.
+
+YouTube answers bursts with **HTTP 429**; the remaining yt-dlp calls retry with
+exponential backoff, so a single 429 recovers instead of failing.
 
 Transcripts are cached to `~/.cache/youtube-tldw/transcripts/` for a fortnight and
 every path reads them — summarizing included — so restarting `tldw serve` no longer

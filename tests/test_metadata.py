@@ -122,3 +122,31 @@ def test_both_yt_dlp_calls_retry_with_backoff():
     for flag in ("--retries", "--extractor-retries", "--retry-sleep"):
         assert flag in metadata._RETRY
     assert any("exp=" in a for a in metadata._RETRY)
+
+
+# --- browser cookies for yt-dlp -------------------------------------------------
+
+def test_cookies_are_off_unless_configured(monkeypatch):
+    monkeypatch.delenv("TLDW_YTDLP_COOKIES", raising=False)
+    monkeypatch.setattr(metadata.config, "get", lambda *a, **k: None)
+    assert metadata._cookie_args() == []
+
+
+def test_a_configured_browser_is_passed_to_yt_dlp(monkeypatch):
+    monkeypatch.delenv("TLDW_YTDLP_COOKIES", raising=False)
+    monkeypatch.setattr(metadata.config, "get", lambda *a, **k: "Chrome")
+    assert metadata._cookie_args() == ["--cookies-from-browser", "chrome"]
+
+
+def test_an_unknown_browser_is_ignored_not_passed_through(monkeypatch):
+    """It reaches argv, so anything unrecognised is dropped rather than forwarded."""
+    monkeypatch.delenv("TLDW_YTDLP_COOKIES", raising=False)
+    for bad in ["../../etc/passwd", "chrome; rm -rf /", "", "netscape"]:
+        monkeypatch.setattr(metadata.config, "get", lambda *a, _b=bad, **k: _b)
+        assert metadata._cookie_args() == [], bad
+
+
+def test_the_env_var_wins(monkeypatch):
+    monkeypatch.setenv("TLDW_YTDLP_COOKIES", "firefox")
+    monkeypatch.setattr(metadata.config, "get", lambda *a, **k: "chrome")
+    assert metadata._cookie_args() == ["--cookies-from-browser", "firefox"]

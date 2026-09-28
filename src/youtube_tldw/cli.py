@@ -124,7 +124,7 @@ def _get_cues(
         lang_key, is_auto = md.choose_track(meta, lang)
         kind = "auto-captions" if is_auto else "subtitles"
         print(f'Using {kind} ({lang_key}) for "{meta.title}" by {meta.channel}.')
-        content = md.download_subtitle(video_id, lang_key, is_auto, workdir)
+        content = md.subtitle_text(meta, lang_key, is_auto, workdir)
         cues = transcript.parse_subtitles(content)
         print(f"Parsed {len(cues)} transcript cues "
               f"({transcript.word_count(cues)} words).")

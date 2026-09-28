@@ -6,10 +6,16 @@ upstream to [A-Za-z0-9_-]{11}, so the watch URL is safe to construct.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
+import urllib.error
+import urllib.request
+from urllib.parse import urlparse
+
 from . import NoTranscriptError, TldrError
+from . import config
 from .proc import run
 
 _OUTPUT_TMPL = "%(id)s.%(ext)s"  # static; never built from untrusted input
@@ -33,6 +39,20 @@ class VideoMeta:
 # YouTube rate-limits bursts from one address with HTTP 429, and without these a
 # single 429 is an immediate hard failure. Back off and retry rather than making the
 # user try again by hand — exponential from 2s, capped at 30s.
+MAX_CAPTION_BYTES = 8 * 1024 * 1024   # a very long auto-caption track is ~1MB
+
+# Opt-in: hand yt-dlp the browser's own YouTube session. Unauthenticated extraction
+# is what YouTube throttles, so this is the standard remedy when even a first
+# request of the day gets a 429. Allowlisted because it reaches argv, and never
+# request-controlled — it is operator config like the model command.
+COOKIE_BROWSERS = ("chrome", "chromium", "brave", "edge", "firefox", "safari",
+                   "opera", "vivaldi")
+
+
+def _cookie_args() -> list:
+    choice = (os.environ.get("TLDW_YTDLP_COOKIES")
+              or config.get("ytdlp_cookies") or "").strip().lower()
+    return ["--cookies-from-browser", choice] if choice in COOKIE_BROWSERS else []
 _RETRY = ["--retries", "3", "--extractor-retries", "3",
           "--retry-sleep", "extractor:exp=2:30", "--retry-sleep", "http:exp=2:30"]
 
@@ -60,7 +80,7 @@ def fetch_metadata(video_id: str, *, timeout: float = 120) -> VideoMeta:
     try:
         res = run(
             ["yt-dlp", "-J", "--no-playlist", "--skip-download", *_RETRY,
-             watch_url(video_id)],
+             *_cookie_args(), watch_url(video_id)],
             timeout=timeout,
         )
     except TldrError as exc:
@@ -104,6 +124,84 @@ def choose_track(meta: VideoMeta, lang: str) -> tuple[str, bool]:
     )
 
 
+# A caption URL comes from yt-dlp's output or, in the extension flow, from the page.
+# Either way it decides what we fetch, so it is checked before anything is requested.
+_CAPTION_HOSTS = ("youtube.com", "googlevideo.com", "ytimg.com")
+
+
+def is_safe_caption_url(url) -> bool:
+    if not isinstance(url, str) or len(url) > 4096:
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _CAPTION_HOSTS)
+
+
+def caption_url(meta: VideoMeta, lang_key: str, is_auto: bool):
+    """The caption track URL yt-dlp already handed us, preferring a format the
+    transcript parser understands."""
+    tracks = (meta.auto_captions if is_auto else meta.subtitles).get(lang_key) or []
+    for ext in ("vtt", "srt"):
+        for track in tracks:
+            if isinstance(track, dict) and track.get("ext") == ext:
+                if is_safe_caption_url(track.get("url")):
+                    return track["url"]
+    for track in tracks:
+        if isinstance(track, dict) and is_safe_caption_url(track.get("url")):
+            return track["url"]
+    return None
+
+
+def fetch_caption_text(url: str, *, timeout: float = 30) -> str:
+    """GET a caption track directly.
+
+    yt-dlp's second invocation re-ran its whole extraction just to save this file,
+    and that extraction is what YouTube fingerprints. A plain request for a URL we
+    already hold is both faster and far less likely to be rate-limited.
+    """
+    if not is_safe_caption_url(url):
+        raise TldrError("Refusing to fetch a caption track from an unexpected host.")
+    req = urllib.request.Request(url, headers={
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"),
+        "Accept-Language": "en-us,en;q=0.5",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(MAX_CAPTION_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise _translate(TldrError("HTTP Error 429: Too Many Requests")) from exc
+        raise TldrError(f"Caption download failed (HTTP {exc.code}).") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise TldrError(f"Caption download failed: {exc}") from exc
+    if len(raw) > MAX_CAPTION_BYTES:
+        raise TldrError("Caption track is implausibly large; refusing it.")
+    return raw.decode("utf-8", "replace")
+
+
+def subtitle_text(meta: VideoMeta, lang_key: str, is_auto: bool, workdir: Path,
+                  *, timeout: float = 120, on_progress=None) -> str:
+    """The chosen caption track's text, the cheapest way that works.
+
+    Direct first: we already have the URL, and a second yt-dlp run would repeat an
+    extraction that costs several requests and is what gets fingerprinted. Falls
+    back to yt-dlp if that fails for any reason.
+    """
+    log = on_progress or (lambda _m: None)
+    url = caption_url(meta, lang_key, is_auto)
+    if url:
+        try:
+            text = fetch_caption_text(url, timeout=timeout)
+            if text.strip():
+                return text
+        except TldrError as exc:
+            log(f"direct caption fetch failed ({exc}); falling back to yt-dlp")
+    return download_subtitle(meta.video_id, lang_key, is_auto, workdir, timeout=timeout)
+
+
 def download_subtitle(
     video_id: str, lang_key: str, is_auto: bool, workdir: Path, *, timeout: float = 120
 ) -> str:
@@ -114,7 +212,8 @@ def download_subtitle(
             [
                 "yt-dlp", "--skip-download", flag,
                 "--sub-langs", lang_key, "--sub-format", "vtt/srt/best",
-                "--no-playlist", *_RETRY, "-o", _OUTPUT_TMPL, watch_url(video_id),
+                "--no-playlist", *_RETRY, *_cookie_args(),
+            "-o", _OUTPUT_TMPL, watch_url(video_id),
             ],
             timeout=timeout,
             cwd=str(workdir),

@@ -137,9 +137,28 @@ def test_wrong_content_type(srv):
 
 
 def test_oversized_body(srv):
+    """Routes that carry only a request keep a small cap."""
     _, port = srv
-    status, _, _ = _req(port, body={"url": "x" * 20000}, headers=_auth())
+    status, _, _ = _req(port, "POST", "/segments/stream",
+                        {"url": "x" * 20000}, _auth())
     assert status == 413
+
+
+def test_summarize_accepts_a_transcript_sized_body_but_not_an_endless_one(srv):
+    """It may carry the caption track the page already fetched — but the cap still
+    exists, it's just sized for one."""
+    _, port = srv
+    assert server.MAX_SUMMARIZE_BYTES > 1_000_000
+    # A transcript-sized body is read (it fails later, on the URL, not on size).
+    big = {"url": "not-a-youtube-url", "page": {"captions": "x" * 200_000}}
+    status, _, _ = _req(port, "POST", "/summarize", big, _auth())
+    assert status == 400
+    # The cap itself, without pushing megabytes over a socket the server stops
+    # reading the moment it decides to refuse.
+    assert server._body_limit("/summarize/stream") == server.MAX_SUMMARIZE_BYTES
+    assert server._body_limit("/segments/stream") == server.MAX_BODY_BYTES
+    assert server._body_limit("/ask/stream") == server.MAX_ASK_BYTES
+    assert server._body_limit("/speak/stream") == server.MAX_SPEAK_BYTES
 
 
 def test_busy_returns_429(srv, monkeypatch):
@@ -1069,3 +1088,72 @@ def test_the_key_separates_backends(monkeypatch):
     assert server._summary_key("vid", None) != base
     monkeypatch.setenv("TLDW_LLM_CMD", "llm -m gpt-4o")
     assert server._summary_key("vid", None) != base
+
+
+# --- transcript supplied by the page ------------------------------------------
+
+VTT = ("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nhello there\n\n"
+       "00:00:02.000 --> 00:00:04.000\nsecond line\n")
+
+
+def test_the_page_can_supply_the_transcript(srv, monkeypatch):
+    """The whole point: the browser already has this, in its own session, so the
+    server asks YouTube for nothing."""
+    _, port = srv
+    monkeypatch.setattr(server.core, "fetch_transcript",
+                        lambda *a, **k: pytest.fail("contacted YouTube"))
+    monkeypatch.setattr(server.core.summarize, "summarize_text",
+                        lambda cues, channel, title, ratio, **k: TextResult(
+                            [f"{len(cues)} cues from {channel}"], title, 0.2, ""))
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    body = {"url": "https://youtu.be/dQw4w9WgXcQ",
+            "page": {"title": "Page Title", "channel": "Page Channel",
+                     "duration_ms": 600_000, "captions": VTT}}
+    result = _read_ndjson(port, body, _auth())[-1]
+    assert result["type"] == "result"
+    assert result["key_points"] == ["2 cues from Page Channel"]
+    assert result["title"] == "Page Title"
+
+
+def test_a_page_transcript_is_reused_by_questions(srv, monkeypatch):
+    """It lands in the same cache, so follow-ups never fetch either."""
+    _, port = srv
+    monkeypatch.setattr(server.core, "fetch_transcript",
+                        lambda *a, **k: pytest.fail("contacted YouTube"))
+    monkeypatch.setattr(server.core.summarize, "summarize_text",
+                        lambda *a, **k: TextResult(["k"], "b", 0.2, ""))
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                        "page": {"captions": VTT}}, _auth())
+    assert server._cache_get("dQw4w9WgXcQ") is not None
+
+
+@pytest.mark.parametrize("page", [
+    None, "a string", {}, {"captions": ""}, {"captions": "   "},
+    {"captions": "this is not a caption file at all"},
+    {"captions": 12345},
+])
+def test_junk_from_the_page_falls_back_to_fetching(srv, monkeypatch, page):
+    """Untrusted input: anything unusable means fetch it properly, not fail."""
+    _, port = srv
+    fetched = []
+    from youtube_tldw.transcript import Cue
+    monkeypatch.setattr(server.core, "fetch_transcript",
+                        lambda vid, lang="en", **k: fetched.append(vid) or
+                        (VideoMeta(vid, "T", "C", 1000, {}, {}), [Cue(0, 900, "x")]))
+    monkeypatch.setattr(server.core.summarize, "summarize_text",
+                        lambda *a, **k: TextResult(["k"], "b", 0.2, ""))
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ", "page": page}, _auth())
+    assert fetched == ["dQw4w9WgXcQ"]
+
+
+def test_page_metadata_is_bounded_and_has_fallbacks():
+    """Title and channel reach a prompt and a filename; duration reaches arithmetic."""
+    body = {"page": {"title": "T" * 5000, "channel": "", "duration_ms": -5,
+                     "captions": VTT}}
+    meta, cues = server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
+    assert len(meta.title) <= 300
+    assert meta.channel == "(unknown)"
+    assert meta.duration_ms == cues[-1].end_ms      # implausible value ignored
+    assert meta.video_id == "dQw4w9WgXcQ"

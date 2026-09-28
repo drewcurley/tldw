@@ -195,6 +195,7 @@ from . import (
     __version__,
 )
 from . import metadata as md
+from . import transcript
 from . import ask, audio, claude_client, config, core, textmode, txcache, usage
 from . import summarize
 from .summarize import SINGLE_PASS_CHARS
@@ -204,6 +205,10 @@ from .timing import format_length, parse_duration
 MAX_BODY_BYTES = 16 * 1024
 MAX_SPEAK_BYTES = 64 * 1024   # /speak carries the summary text
 MAX_ASK_BYTES = 64 * 1024     # /ask carries the question + conversation so far
+# A summarize request may carry the whole caption track the page already had, which
+# is the point: fetched by the browser, in its own session, so the server never
+# asks YouTube for anything.
+MAX_SUMMARIZE_BYTES = 8 * 1024 * 1024
 ASK_TIMEOUT = 300.0           # one answer; the transcript is already in hand
 PREVIEW_TEXT = "Hi — this is how your T L D W summaries will sound."
 _preview_cache: dict[str, bytes] = {}   # voice model -> mp3 (13 voices, ~40KB each)
@@ -290,6 +295,60 @@ def _summary_key(video_id: str, ratio) -> str:
         summarize.PROMPT_FINGERPRINT,
     ))
     return f"{video_id}-{hashlib.sha256(shape.encode()).hexdigest()[:16]}"
+
+
+def _body_limit(path: str) -> int:
+    """How much body a route may carry. Summarize is the outlier: it can bring the
+    caption track the page already fetched."""
+    if path in ("/speak", "/speak/stream"):
+        return MAX_SPEAK_BYTES
+    if path in ("/summarize", "/summarize/stream"):
+        return MAX_SUMMARIZE_BYTES
+    if path == "/ask/stream":
+        return MAX_ASK_BYTES
+    return MAX_BODY_BYTES
+
+
+def _page_transcript(body, url: str):
+    """(meta, cues) built from what the page already had, or None.
+
+    The extension runs on the watch page, where the title, channel, duration and
+    caption track are all present and the browser can fetch captions in its own
+    session. Taking them from there means the server makes no request to YouTube at
+    all — which is the whole difference between "works" and "429" for a tool that
+    isn't a browser.
+
+    Everything here is untrusted input. So is yt-dlp's output, and it flows to the
+    same places (a prompt, a sanitized filename), but this arrives over HTTP and is
+    checked before it's believed.
+    """
+    page = body.get("page") if isinstance(body, dict) else None
+    if not isinstance(page, dict):
+        return None
+    vtt = page.get("captions")
+    if not isinstance(vtt, str) or not vtt.strip():
+        return None
+    try:
+        vid = canonical_video_id(url)
+    except TldrError:
+        return None
+    try:
+        cues = transcript.parse_subtitles(vtt)
+    except TldrError:
+        return None                      # unparseable: fall back to fetching it
+    if not cues:
+        return None
+
+    def text(value, limit):
+        return value.strip()[:limit] if isinstance(value, str) and value.strip() else ""
+
+    duration = page.get("duration_ms")
+    duration = int(duration) if isinstance(duration, (int, float)) and \
+        0 < duration < 24 * 3600 * 1000 else cues[-1].end_ms
+    meta = md.VideoMeta(vid, text(page.get("title"), 300) or "(untitled)",
+                        text(page.get("channel"), 200) or "(unknown)",
+                        duration, {}, {})
+    return meta, cues
 
 
 def _cached_transcript(url: str):
@@ -391,7 +450,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._send_json(401, {"error": "missing or invalid token"})
             return
-        body = self._read_body(MAX_SPEAK_BYTES if speak else MAX_BODY_BYTES)
+        body = self._read_body(_body_limit(path))
         if body is None:
             return  # _read_body already responded
         if not speak:
@@ -572,7 +631,8 @@ class _Handler(BaseHTTPRequestHandler):
                 summary = core.summarize_url(
                     url, ratio, lang, timeout=REQUEST_TIMEOUT,
                     max_chars=SINGLE_PASS_CHARS, on_progress=progress,
-                    on_partial=partial, _prefetched=_cached_transcript(url))
+                    on_partial=partial,
+                    _prefetched=_cached_transcript(url) or _page_transcript(body, url))
                 usage.note_video(summary.meta.video_id, summary.meta.duration_ms,
                                  textmode.summary_word_count(summary.result))
         except TldrError as exc:

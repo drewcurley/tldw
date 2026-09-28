@@ -90,6 +90,15 @@ the **Model** picker (Opus/Sonnet), which it disables for other backends, and
 `tldw usage`, which needs the token and cost figures only that CLI reports. See
 [Choose your model](../README.md#choose-your-model) for configuration.
 
+## Where the transcript comes from
+
+The extension reads the title, channel, duration and caption track from the watch
+page you're already on, and fetches the captions in your own browser session. The
+server never contacts YouTube for a summary started this way — which is why the
+extension keeps working when `yt-dlp` alone gets rate-limited. If the page can't
+supply them (no captions exposed, or another browser), the server falls back to
+fetching them itself.
+
 ## How it stays local & safe
 
 - The extension only talks to `127.0.0.1:8765`; the server uses your local `claude`
