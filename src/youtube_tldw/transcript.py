@@ -181,6 +181,16 @@ def parse_subtitles(content: str) -> list[Cue]:
     return _normalize(cues)
 
 
+def normalize(cues: list[Cue]) -> list[Cue]:
+    """Public form of _normalize, for producers outside this module.
+
+    Every cue source has to end here: span maths and the numbered cue listing both
+    assume sorted, non-overlapping, non-empty cues, and a producer that skips this
+    quietly breaks them.
+    """
+    return _normalize(cues)
+
+
 def _normalize(cues: list[Cue]) -> list[Cue]:
     """Sort, fix inverted spans, and remove overlaps so cuts never collide."""
     cues = [c for c in cues if c.text and c.end_ms > c.start_ms]

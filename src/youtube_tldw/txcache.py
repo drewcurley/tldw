@@ -30,8 +30,17 @@ def _path(video_id: str) -> Path:
     return CACHE_DIR / f"{video_id}.json"
 
 
+CAPTIONS = "captions"             # the source of every entry written before this
+
+
 def get(video_id: str):
-    """(meta, cues) if a fresh copy is on disk, else None."""
+    """(meta, cues, source) if a fresh copy is on disk, else None.
+
+    `source` is "captions" or "audio:<model>". It is read with a default rather
+    than as a required key: treating it as required would turn every cache file
+    written by an older version into a miss, and on a captionless video a miss
+    now costs minutes of transcription rather than one yt-dlp call.
+    """
     try:
         raw = json.loads(_path(video_id).read_text(encoding="utf-8"))
         if time.time() - float(raw["saved_at"]) > TTL_SECONDS:
@@ -40,12 +49,16 @@ def get(video_id: str):
         meta = VideoMeta(m["video_id"], m["title"], m["channel"],
                          int(m["duration_ms"]), m.get("subtitles") or {},
                          m.get("auto_captions") or {})
-        return meta, [Cue(int(c[0]), int(c[1]), c[2]) for c in raw["cues"]]
+        source = raw.get("source") or CAPTIONS
+        if not isinstance(source, str):
+            source = CAPTIONS
+        return (meta, [Cue(int(c[0]), int(c[1]), c[2]) for c in raw["cues"]],
+                source)
     except (OSError, ValueError, KeyError, TypeError, IndexError):
         return None                       # missing, truncated, or from an older shape
 
 
-def put(video_id: str, meta, cues: list) -> None:
+def put(video_id: str, meta, cues: list, source: str = CAPTIONS) -> None:
     """Best effort: a cache that can't be written must not fail the request."""
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -55,6 +68,7 @@ def put(video_id: str, meta, cues: list) -> None:
                      "channel": meta.channel, "duration_ms": meta.duration_ms,
                      "subtitles": meta.subtitles, "auto_captions": meta.auto_captions},
             "cues": [[c.start_ms, c.end_ms, c.text] for c in cues],
+            "source": source,
         }
         tmp = _path(video_id).with_suffix(".tmp")
         tmp.write_text(json.dumps(payload), encoding="utf-8")

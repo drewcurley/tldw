@@ -46,6 +46,159 @@ _ask_sessions: dict = {}
 _seg_progress: dict = {}
 
 
+# --- transcribing a captionless video -----------------------------------------
+#
+# This is the one job in the server measured in minutes rather than seconds, and it
+# saturates the CPU while it runs. That makes it unlike everything else here:
+#
+# - It cannot live inside the request. _run_stream's `emit` has no OSError guard,
+#   so a closed socket would throw away the whole run; and a finished transcript is
+#   far too expensive to discard because someone shut a laptop lid.
+# - It gets its own single permit rather than a slot from MAX_CONCURRENCY, which
+#   was sized for 30-120s model calls. Two transcriptions holding both slots would
+#   429 every other request -- including the one asking to stop them.
+# - Two requests for the same video must produce one job, not two.
+_tx_jobs: dict = {}             # video_id -> job dict, while a transcription runs
+_tx_permit = threading.Semaphore(1)
+
+WHISPER_POLICIES = ("off", "ask", "always")
+DEFAULT_WHISPER_POLICY = "ask"
+# A ceiling on what may be transcribed at all, checked before any audio is fetched.
+# At the measured 5.5x realtime, two hours of video is already ~22 minutes of
+# full-core CPU; beyond that the honest answer is no.
+MAX_TRANSCRIBE_MS = 2 * 3600 * 1000
+# Wall-clock budget for one run: generous against the estimate, because being slow
+# is normal and being infinite is not.
+TRANSCRIBE_SLACK = 3.0
+TRANSCRIBE_FLOOR_S = 300.0
+
+
+def _max_transcribe_ms() -> int:
+    configured = config.get("whisper_max_minutes")
+    try:
+        minutes = int(configured)
+    except (TypeError, ValueError):
+        return MAX_TRANSCRIBE_MS
+    return max(1, minutes) * 60 * 1000
+
+
+def _whisper_policy(body):
+    """How this request wants captionless videos handled, or False after a 400.
+
+    Absent means "ask": an extension older than this feature sends no such field,
+    and the same is true of anyone who has never opened Options. An unrecognized
+    value is refused rather than quietly defaulted, the way _model does -- it
+    decides whether we spend minutes of someone's CPU.
+
+    A server-side `whisper` config key pins the answer regardless of what any
+    client sends, so "off" can be a property of the machine and not a preference
+    the browser happens to hold.
+    """
+    pinned = config.get("whisper")
+    if isinstance(pinned, str) and pinned in WHISPER_POLICIES:
+        return pinned
+    value = body.get("whisper") if isinstance(body, dict) else None
+    if value is None:
+        return DEFAULT_WHISPER_POLICY
+    if isinstance(value, str) and value in WHISPER_POLICIES:
+        return value
+    return None
+
+
+def _tx_progress(video_id: str):
+    """What a running transcription has published, or None if none is running."""
+    with _cache_lock:
+        job = _tx_jobs.get(video_id)
+        return dict(job["progress"]) if job else None
+
+
+def _stop_transcription(video_id: str) -> bool:
+    """Ask a running transcription to stop. True if there was one."""
+    with _cache_lock:
+        job = _tx_jobs.get(video_id)
+        if not job:
+            return False
+        job["cancel"].set()
+        return True
+
+
+def _start_transcription(meta, model: str):
+    """Start (or join) the transcription of this video. Returns its job.
+
+    The second caller for a video gets the first caller's job, so two tabs cost one
+    transcription. The job owns its own temp directory and removes it however it
+    ends, and writes to the transcript cache the moment it succeeds -- whether or
+    not anyone is still listening.
+    """
+    vid = meta.video_id
+    with _cache_lock:
+        existing = _tx_jobs.get(vid)
+        if existing:
+            return existing
+        job = {
+            "event": threading.Event(),
+            "cancel": threading.Event(),
+            "progress": {"message": "waiting for a free transcription slot...",
+                         "percent": 0.0,
+                         "estimate_s": whisper_transcribe.estimate_seconds(
+                             meta.duration_ms, model)},
+            "error": None,
+            "cues": None,
+            "meta": meta,
+            "model": model,
+            "started": time.monotonic(),
+        }
+        _tx_jobs[vid] = job
+
+    def _publish(message, percent=None):
+        with _cache_lock:
+            job["progress"]["message"] = message
+            if percent is not None:
+                job["progress"]["percent"] = percent
+
+    def _run():
+        import shutil
+        import tempfile
+        workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-audio-"))
+        try:
+            # One transcription at a time, machine-wide. A second video waits here
+            # rather than fighting the first one for cores.
+            _tx_permit.acquire()
+            try:
+                if job["cancel"].is_set():
+                    raise TldrError("Transcription cancelled.")
+                budget = max(TRANSCRIBE_FLOOR_S,
+                             job["progress"]["estimate_s"] * TRANSCRIBE_SLACK)
+                cues = whisper_transcribe.transcribe_video(
+                    vid, workdir,
+                    on_progress=_publish,
+                    should_cancel=job["cancel"].is_set,
+                    deadline=time.monotonic() + budget,
+                    model_size=model,
+                )
+            finally:
+                _tx_permit.release()
+            # Cache before anything else: this cost minutes, and whether a client
+            # is still connected has no bearing on whether it was worth keeping.
+            _cache_put(vid, meta, cues, f"audio:{model}")
+            job["cues"] = cues
+            print(f"  transcribed {vid} from audio: {len(cues)} cues "
+                  f"in {time.monotonic() - job['started']:.0f}s", flush=True)
+        except TldrError as exc:
+            job["error"] = str(exc)
+        except Exception as exc:
+            job["error"] = "Transcribing this video failed unexpectedly."
+            print(f"  transcription error: {exc!r}", flush=True)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+            job["event"].set()
+            with _cache_lock:
+                _tx_jobs.pop(vid, None)
+
+    threading.Thread(target=_run, daemon=True, name=f"tldw-transcribe-{vid}").start()
+    return job
+
+
 def _prune(cache: dict) -> None:
     """Drop expired entries, then the soonest-to-expire until under the cap."""
     now = time.monotonic()
@@ -57,11 +210,15 @@ def _prune(cache: dict) -> None:
             del cache[k]
 
 
-def _cache_put(video_id: str, meta, cues: list) -> None:
+def _cache_put(video_id: str, meta, cues: list, source: str | None = None) -> None:
+    # Resolved here rather than as a default: these helpers are defined above the
+    # imports, so txcache doesn't exist yet when this signature is evaluated.
+    source = source or txcache.CAPTIONS
     with _cache_lock:
-        _transcript_cache[video_id] = (time.monotonic() + _CACHE_TTL, meta, cues)
+        _transcript_cache[video_id] = (time.monotonic() + _CACHE_TTL,
+                                       meta, cues, source)
         _prune(_transcript_cache)
-    txcache.put(video_id, meta, cues)     # survives a restart; yt-dlp is rate-limited
+    txcache.put(video_id, meta, cues, source)  # survives a restart; yt-dlp is rate-limited
 
 
 def _cache_get(video_id: str, *, touch: bool = False):
@@ -69,21 +226,39 @@ def _cache_get(video_id: str, *, touch: bool = False):
 
     touch=True renews the TTL — an active Q&A conversation keeps its own transcript
     alive rather than expiring out from under the next question.
+
+    Deliberately still a 2-tuple: where a transcript came from matters to two
+    callers and to none of the rest, so provenance rides in the entry and is read
+    by _cache_source rather than widening what every call site has to unpack.
     """
     with _cache_lock:
         entry = _transcript_cache.get(video_id)
         if entry and entry[0] > time.monotonic():
             if touch:
                 _transcript_cache[video_id] = (time.monotonic() + _CACHE_TTL,
-                                               entry[1], entry[2])
+                                               *entry[1:])
             return entry[1], entry[2]
     # Not in memory: a previous run may still have it, which saves two yt-dlp calls.
     on_disk = txcache.get(video_id)
     if on_disk:
         with _cache_lock:
             _transcript_cache[video_id] = (time.monotonic() + _CACHE_TTL, *on_disk)
-        return on_disk
+        return on_disk[0], on_disk[1]
     return None
+
+
+def _cache_source(video_id: str) -> str:
+    """Where this video's cached transcript came from: "captions" or "audio:<model>".
+
+    Anything we have no record of is captions — that is what every entry written
+    before provenance existed holds.
+    """
+    with _cache_lock:
+        entry = _transcript_cache.get(video_id)
+        if entry and entry[0] > time.monotonic() and len(entry) > 3:
+            return entry[3]
+    on_disk = txcache.get(video_id)
+    return on_disk[2] if on_disk else txcache.CAPTIONS
 
 
 def _segment_ratio(body):
@@ -197,6 +372,7 @@ from . import (
 from . import metadata as md
 from . import transcript
 from . import ask, audio, claude_client, config, core, textmode, txcache, usage
+from . import whisper_transcribe
 from . import summarize
 from .summarize import SINGLE_PASS_CHARS
 from .urls import canonical_video_id
@@ -280,12 +456,19 @@ def _seg_progress_line(pos: dict, label: str, elapsed: float):
             round(min(20 + elapsed * 0.15, _SEG_CRAWL_CAP), 1))
 
 
-def _summary_key(video_id: str, ratio) -> str:
+def _summary_key(video_id: str, ratio, source: str | None = None) -> str:
     """Identity of a summary: the video, and everything that shapes the answer.
 
     The prompt fingerprint matters most — editing a prompt used to be invisible to a
     cache, so it would keep serving text the current code would never produce. The
     model comes from the request's own scope.
+
+    `source` is the transcript this summary was written from. Without it, swapping
+    whisper_model to get a better transcript would hand back the old summary — the
+    lookup happens before any transcript work, so the better transcript would never
+    be consulted. That is the same bug the backend fingerprint exists to prevent, on
+    a different axis. An unknown source is "captions", which is what every summary
+    written before this was.
     """
     shape = "|".join((
         video_id,
@@ -293,6 +476,7 @@ def _summary_key(video_id: str, ratio) -> str:
         claude_client.backend_fingerprint(),
         str(round(ratio, 3)) if isinstance(ratio, (int, float)) else "auto",
         summarize.PROMPT_FINGERPRINT,
+        source or txcache.CAPTIONS,
     ))
     return f"{video_id}-{hashlib.sha256(shape.encode()).hexdigest()[:16]}"
 
@@ -448,6 +632,24 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
         speak = path in ("/speak", "/speak/stream")
+        if path == "/transcribe/stop":
+            # Deliberately outside the concurrency semaphore. Transcriptions are the
+            # longest-running thing here, and if stopping one needed a slot then the
+            # request that could free the server would be the one getting a 429.
+            # It does no work of its own: it sets a flag.
+            if not self._authorized():
+                self._send_json(401, {"error": "missing or invalid token"})
+                return
+            body = self._read_body()
+            if body is None:
+                return
+            try:
+                vid = canonical_video_id(str(body.get("url") or body.get("video_id")))
+            except TldrError:
+                self._send_json(400, {"error": "bad video url"})
+                return
+            self._send_json(200, {"stopped": _stop_transcription(vid)})
+            return
         if path == "/preview":
             self._guarded(self._run_preview)
             return
@@ -609,8 +811,15 @@ class _Handler(BaseHTTPRequestHandler):
         # transcript: the point is to compare summaries, and re-fetching the video
         # would risk a rate limit for nothing.
         refresh = isinstance(body, dict) and body.get("refresh") is True
+        tx_source = None          # set when this request transcribed the audio
+        policy = _whisper_policy(body)
+        if policy is None:
+            emit({"type": "error", "status": 400,
+                  "error": "unknown whisper setting"})
+            return
         if vid and not refresh:
-            hit = txcache.get_summary(_summary_key(vid, ratio))
+            hit = txcache.get_summary(_summary_key(vid, ratio,
+                                                   _cache_source(vid)))
             if hit:
                 tlog(f"cached summary for {vid} (no model call)")
                 emit({"type": "meta", "video_id": hit.get("video_id", vid),
@@ -642,15 +851,32 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 emit({"type": "partial", "kind": ev["kind"], "text": ev["text"]})
 
-        try:
+        def _summarize(prefetched):
             with usage.interaction("summarize", _vid_of(url)):
-                summary = core.summarize_url(
+                result = core.summarize_url(
                     url, ratio, lang, timeout=REQUEST_TIMEOUT,
                     max_chars=SINGLE_PASS_CHARS, on_progress=progress,
-                    on_partial=partial,
-                    _prefetched=_cached_transcript(url) or _page_transcript(body, url))
-                usage.note_video(summary.meta.video_id, summary.meta.duration_ms,
-                                 textmode.summary_word_count(summary.result))
+                    on_partial=partial, _prefetched=prefetched)
+                usage.note_video(result.meta.video_id, result.meta.duration_ms,
+                                 textmode.summary_word_count(result.result))
+                return result
+
+        try:
+            try:
+                summary = _summarize(_cached_transcript(url)
+                                     or _page_transcript(body, url))
+            except NoTranscriptError as exc:
+                # No caption track anywhere. The audio is still there, and it comes
+                # from an endpoint YouTube does serve.
+                meta = getattr(exc, "meta", None)
+                if policy == "off" or meta is None:
+                    raise
+                produced = self._transcribe_fallback(meta, body, policy,
+                                                     emit, progress)
+                if produced is None:
+                    return
+                prefetched, tx_source = produced
+                summary = _summarize(prefetched)
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
             print(f"  failed ({status}) in {time.monotonic()-start:.1f}s: {exc}", flush=True)
@@ -662,7 +888,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s", flush=True)
         if summary.cues:
-            _cache_put(summary.meta.video_id, summary.meta, summary.cues)
+            # Without the source here, caching the summarize result would relabel a
+            # transcript we just made from audio as a caption track.
+            _cache_put(summary.meta.video_id, summary.meta, summary.cues,
+                       tx_source or _cache_source(summary.meta.video_id))
             # Kick off segment selection in the background so "play key moments" is
             # ready by the time the user reads the summary.
             # The prefetch has to produce the selection the page will ask for: a
@@ -670,10 +899,63 @@ class _Handler(BaseHTTPRequestHandler):
             _start_seg_prefetch(summary.meta, summary.cues,
                                 claude_client.current_model(),
                                 _segment_ratio(body))
-        payload = _to_payload(summary)
+        source = tx_source or (_cache_source(summary.meta.video_id)
+                               if summary.cues else txcache.CAPTIONS)
+        payload = _to_payload(summary, source)
         if vid:
-            txcache.put_summary(_summary_key(vid, ratio), payload)
+            txcache.put_summary(_summary_key(vid, ratio, source), payload)
         emit({"type": "result", **payload, "stats": usage.stats()})
+
+    def _transcribe_fallback(self, meta, body, policy, emit, progress):
+        """Offer, or carry out, transcription of a video that has no captions.
+
+        Returns ((meta, cues), source) to summarize from, or None when the answer
+        has already been sent -- an offer awaiting a click, a refusal, or a failure.
+        """
+        model = whisper_transcribe.resolve_model()
+        estimate = whisper_transcribe.estimate_seconds(meta.duration_ms, model)
+        installed = whisper_transcribe.is_available()
+        accepted = isinstance(body, dict) and body.get("transcribe") is True
+
+        # Checked against the duration yt-dlp reported, never one the request
+        # supplied: a client claiming a three-hour video is sixty seconds long must
+        # not be able to talk us into transcribing it.
+        ceiling = _max_transcribe_ms()
+        if meta.duration_ms > ceiling:
+            emit({"type": "error", "status": 413, "error":
+                  f"This video is {format_length(meta.duration_ms)} long and has no "
+                  f"captions. Transcribing its audio is limited to "
+                  f"{ceiling // 60000} minutes of video "
+                  f"(`tldw config set whisper-max-minutes N` to change that)."})
+            return None
+
+        # The dependency is checked before anything is downloaded or any estimate is
+        # agreed to -- it is the state most people will meet first.
+        if not installed or (policy == "ask" and not accepted):
+            emit({"type": "needs_transcription",
+                  "video_id": meta.video_id, "title": meta.title,
+                  "channel": meta.channel, "duration_ms": meta.duration_ms,
+                  "estimate_s": estimate, "model": model, "installed": installed,
+                  "install_hint": "" if installed else whisper_transcribe.INSTALL_HINT})
+            return None
+
+        job = _start_transcription(meta, model)
+        # Reporting progress writes to the socket. If the client has gone, that
+        # raises and this request ends -- while the job carries on and still caches
+        # what it produces, which is the whole reason it doesn't live in here.
+        while not job["event"].wait(0.5):
+            published = _tx_progress(meta.video_id)
+            if published:
+                progress(published["message"],
+                         round(10 + published["percent"] * 0.6, 1))
+        if job["error"]:
+            emit({"type": "error", "status": 500, "error": job["error"]})
+            return None
+        if not job["cues"]:
+            emit({"type": "error", "status": 500,
+                  "error": "Transcription produced nothing usable."})
+            return None
+        return (meta, job["cues"]), f"audio:{model}"
 
     def _validate_speak(self, body: dict):
         """Return (script, voice) or None (after sending the proper error status)."""
@@ -1060,9 +1342,14 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_bytes(200, "audio/mpeg", data)
 
 
-def _to_payload(summary: core.Summary) -> dict:
+def _to_payload(summary: core.Summary, source: str | None = None) -> dict:
     meta, result = summary.meta, summary.result
     return {
+        # Where the words came from. This rides in the payload, not just in the
+        # transcript cache, because a summary served from the summary cache never
+        # touches a transcript -- and that is exactly when the panel and the saved
+        # .md still have to say the transcript was machine-transcribed from audio.
+        "transcript_source": source or txcache.CAPTIONS,
         "video_id": meta.video_id,
         "title": meta.title,
         "channel": meta.channel,

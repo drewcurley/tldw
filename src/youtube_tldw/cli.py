@@ -134,16 +134,17 @@ def _get_cues(
             raise
         wt.require_whisper()  # raises with install instructions if missing
         model = wt.resolve_model()
-        size = wt._MODEL_SIZES.get(model, "?")
+        mins = wt.estimate_seconds(meta.duration_ms, model) / 60.0
         print(f"No captions found — transcribing audio with Whisper "
-              f"(model: {model}, {size}; downloads on first use)…")
-        audio_path = wt.download_audio(video_id, workdir)
+              f"(model: {model}, roughly {mins:.0f} min)…")
 
         def _progress(m: str, pct: float | None = None) -> None:
             prefix = f"  [{pct:.0f}%]" if pct is not None else "  "
             print(f"{prefix} {m}")
 
-        cues = wt.transcribe(audio_path, model, on_progress=_progress)
+        # Same orchestration the server uses, so the sequence exists in one place.
+        cues = wt.transcribe_video(video_id, workdir, on_progress=_progress,
+                                   model_size=model)
         print(f"Transcribed {len(cues)} segments "
               f"({transcript.word_count(cues)} words).")
         return meta, cues
