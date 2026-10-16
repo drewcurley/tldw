@@ -1262,7 +1262,19 @@ class _Handler(BaseHTTPRequestHandler):
                 tlog(f"cached transcript for {vid} ({len(cues)} cues)")
             else:
                 progress("Fetching the transcript…", 5)
-                meta, cues = core.fetch_transcript(vid, lang, on_progress=progress)
+                try:
+                    meta, cues = core.fetch_transcript(vid, lang,
+                                                       on_progress=progress)
+                except NoTranscriptError:
+                    # Questions never start a transcription -- an answer must not
+                    # quietly cost eight minutes of CPU. But "this video has no
+                    # subtitles" is the wrong story for a video that was summarized
+                    # from audio and has since aged out of the cache.
+                    raise NoTranscriptError(
+                        "The transcript for this video is no longer cached, and the "
+                        "video has no subtitles to re-fetch. Summarize it again to "
+                        "rebuild the transcript, then ask."
+                    ) from None
                 _cache_put(vid, meta, cues)
             if gone.is_set():
                 return

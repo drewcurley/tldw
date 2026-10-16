@@ -16,7 +16,7 @@
     .voicerow { display: flex; gap: 8px; align-items: stretch; }
     .voicerow select { flex: 1; min-width: 0; padding: 8px 10px; font: inherit;
       border: 1px solid #bbb; border-radius: 8px; background: #fff; }
-    #closeAction, #model, #segmentRatio { width: 100%; padding: 8px 10px; font: inherit;
+    #closeAction, #model, #segmentRatio, #whisper { width: 100%; padding: 8px 10px; font: inherit;
       background: #fff; border: 1px solid #bbb; border-radius: 8px; }
     #preview { margin-top: 0; flex: 0 0 auto; background: #444; }
     #preview[disabled] { opacity: .6; cursor: default; }
@@ -54,6 +54,17 @@
   <p class="hint">Applies to <strong>Play key moments</strong>, not the written
     summary. Auto lets a dense video stay long and a padded one get cut hard;
     anything else is both a target and a hard cap on the total clip time.</p>
+  <label for="whisper">Videos with no subtitles</label>
+  <select id="whisper">
+    <option value="ask">Offer to transcribe the audio (default)</option>
+    <option value="always">Transcribe without asking</option>
+    <option value="off">Don't transcribe — just say there's no transcript</option>
+  </select>
+  <p class="hint">Some videos have no subtitles or auto-captions at all. TL;DW can
+    transcribe the audio on this machine with Whisper instead, which takes roughly
+    a minute for every five and a half minutes of video and uses the CPU while it
+    runs. The transcript is kept, so it only happens once per video. Needs
+    <code>pipx inject youtube-tldw faster-whisper</code>.</p>
   <label for="closeAction">If you close the panel while it's still working</label>
   <select id="closeAction">
     <option value="continue">Keep working in the background</option>
