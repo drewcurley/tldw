@@ -390,6 +390,14 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
     true);
   check("...it is kept and shown when they come back",
     /pendingOffer = \{ offer: m\.offer, url, videoId \}/.test(panel), true);
+  // "Stop and discard" has to reach the longest-running job, not just the short
+  // ones. Closing with "continue" must still leave it alone.
+  check("closing with abort stops a transcription too",
+    /if \(txLive\) \{ stopTranscribe\(txLive\.url\); txLive = null; \}/.test(panel),
+    true);
+  check("...and that lives on the abort path, after the background early return",
+    panel.indexOf("if (txLive) { stopTranscribe(") >
+      panel.indexOf("if (policy.background)"), true);
   check("the stop button is labelled like every other control here",
     /stoptx[\s\S]{0,200}setAttribute\("aria-label"/.test(panel), true);
   check("stopping travels over the live port, not a fresh message",
@@ -443,6 +451,77 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
     transcribedNote({ transcript_source: { a: 1 } }), "");
   check("the label is escaped where it is shown",
     /esc\(transcribedNote\(p\)\)/.test(stripComments(src)), true);
+
+  // The saved .md is half of criterion 14, and regexing the source would not
+  // notice the note being dropped from it. Run the real function.
+  eval(grab("  function toMarkdown(p)", "\n\n"));
+  const payload = {
+    title: "T", channel: "C", original_length: "10m", length_label: "2m",
+    source_url: "https://youtu.be/x", key_points: ["one"], summary_md: "body",
+  };
+  const fromAudio = toMarkdown({ ...payload, transcript_source: "audio:small" });
+  check("the saved markdown records a machine transcription",
+    /transcribed from audio by Whisper \(small\)/.test(fromAudio), true);
+  check("...above the source line, with the rest intact",
+    fromAudio.indexOf("Whisper") < fromAudio.indexOf("Source:")
+      && /## Key points/.test(fromAudio) && /## Summary/.test(fromAudio), true);
+  check("a caption-sourced summary gains nothing",
+    toMarkdown({ ...payload, transcript_source: "captions" }),
+    toMarkdown(payload));
+}
+
+// --- the offer itself, executed rather than grepped ---
+{
+  // showTranscribeOffer is the function criterion 1 is about, so it is run against
+  // a stub DOM instead of being matched as source text.
+  const nodes = [];
+  const makeEl = () => ({
+    _html: "", className: "", disabled: false, textContent: "",
+    set innerHTML(v) { this._html = v; }, get innerHTML() { return this._html; },
+    querySelector: () => makeEl(), appendChild: () => {},
+    setAttribute: () => {}, addEventListener: () => {},
+  });
+  const content = makeEl();
+  global.document = { createElement: () => makeEl() };
+  global.root = { querySelector: () => content };
+  global.host = true;
+  global.clearTimers = () => {};
+  global.mount = () => content;
+  global.pendingOffer = null;
+  global.startSummarize = () => {};
+  global.api = { runtime: { sendMessage: () => {} } };
+  // `const` declared inside one eval doesn't reach the next, so the real esc has
+  // to be hoisted for this block -- the escaping is part of what's under test.
+  eval(grab("const esc = (s) =>", "function renderSummary")
+       .replace("const esc =", "global.esc ="));
+  eval(grab("  function fmtEstimate(seconds)", "\n  // Stop a transcription")
+       .replace(/^  function (showTranscribeOffer|fmtEstimate)/gm,
+                "global.$1 = function "));
+
+  showTranscribeOffer({ installed: true, estimate_s: 490, model: "small" },
+                      "https://youtu.be/x", "x");
+  check("the offer quotes the measured estimate",
+    /about 8 minutes/.test(content.innerHTML), true);
+  check("...and says the CPU will be busy",
+    /CPU busy/.test(content.innerHTML), true);
+  check("...and warns about the one-off model download",
+    /model \(a few hundred MB\)/.test(content.innerHTML), true);
+  check("...and offers a button to accept with",
+    /class="transcribe"/.test(content.innerHTML), true);
+
+  showTranscribeOffer({ installed: true, estimate_s: 0 }, "https://youtu.be/x", "x");
+  check("an unknown length says so instead of quoting a number",
+    /isn't known/.test(content.innerHTML) && !/about/.test(content.innerHTML), true);
+
+  showTranscribeOffer({ installed: false, install_hint: "pipx inject thing" },
+                      "https://youtu.be/x", "x");
+  check("a missing dependency shows the command instead of a button",
+    /pipx inject thing/.test(content.innerHTML)
+      && !/class="transcribe"/.test(content.innerHTML), true);
+  check("...and the hint is escaped",
+    (() => { showTranscribeOffer({ installed: false, install_hint: "<img>" },
+                                 "u", "v");
+             return !/<img>/.test(content.innerHTML); })(), true);
 }
 
 if (failures.length) {

@@ -181,14 +181,21 @@ def parse_subtitles(content: str) -> list[Cue]:
     return _normalize(cues)
 
 
-def normalize(cues: list[Cue]) -> list[Cue]:
+def normalize(cues: list[Cue], *, empty_message: str | None = None) -> list[Cue]:
     """Public form of _normalize, for producers outside this module.
 
     Every cue source has to end here: span maths and the numbered cue listing both
     assume sorted, non-overlapping, non-empty cues, and a producer that skips this
     quietly breaks them.
+
+    empty_message lets a caller say what *its* empty input means -- a Whisper run
+    that produced nothing has not got a subtitle file to blame.
     """
-    return _normalize(cues)
+    try:
+        return _normalize(cues)
+    except NoTranscriptError:
+        raise NoTranscriptError(
+            empty_message or "Subtitle file produced no usable text.") from None
 
 
 def _normalize(cues: list[Cue]) -> list[Cue]:

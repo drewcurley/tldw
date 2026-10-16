@@ -344,6 +344,19 @@ tldw config set whisper off             # never transcribe, whatever the extensi
 tldw config set whisper-max-minutes 120 # longest video to transcribe (default 120)
 ```
 
+**Upgrading:** summaries are now cached per transcript source, so switching
+`whisper-model` gets you a new transcript instead of the old summary. That changes
+every summary cache key, so the summaries cached before this upgrade are orphaned —
+the first summarize of each video costs one extra model call, and the stale files
+age out on their own. Transcripts are unaffected.
+
+While a transcription runs it downloads the audio to a temporary directory (up to
+300MB, removed when it finishes) and keeps a CPU busy. The very first run also
+downloads the model itself, which is several hundred MB and shows no progress while
+it happens — so the first captionless video you try will sit on "loading Whisper…"
+for a while. `tldw serve` clears any audio temp directories left behind by an
+interrupted run when it starts.
+
 ## Browser extension
 
 One toolbar click on a YouTube page summarizes the video in an on-page modal. The

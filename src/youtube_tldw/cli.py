@@ -313,6 +313,22 @@ def _serve_parser() -> argparse.ArgumentParser:
 
 def _run_config(args: list[str]) -> int:
     """`tldw config get` | `tldw config set output-dir <path>` | `tldw config unset <key>`."""
+    # A value the server will ignore is worse than a rejected one: the pin reads
+    # as set and does nothing.
+    def _check(flag: str, value: str) -> str | None:
+        if flag == "whisper" and value not in ("off", "ask", "always"):
+            return "whisper must be one of: off, ask, always"
+        if flag == "whisper-max-minutes":
+            try:
+                if int(value) <= 0:
+                    raise ValueError
+            except ValueError:
+                return "whisper-max-minutes must be a positive whole number"
+        if flag == "whisper-model" and value not in wt.VALID_MODELS:
+            return ("whisper-model must be one of: "
+                    + ", ".join(sorted(wt.VALID_MODELS)))
+        return None
+
     keymap = {"output-dir": "output_dir", "whisper-model": "whisper_model",
               # How captionless videos are handled by `tldw serve`, and the longest
               # video it will transcribe. `whisper` set here outranks the browser
@@ -333,6 +349,10 @@ def _run_config(args: list[str]) -> int:
     if args[0] == "set" and len(args) >= 3:
         key = keymap.get(args[1], args[1].replace("-", "_"))
         value = " ".join(args[2:])
+        problem = _check(args[1], value)
+        if problem:
+            print(f"error: {problem}")
+            return 2
         if key == "output_dir":
             value = str(Path(value).expanduser().resolve())
         config.set_value(key, value)

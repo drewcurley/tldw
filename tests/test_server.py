@@ -33,7 +33,8 @@ def _clear_caches(tmp_path, monkeypatch):
     from youtube_tldw import txcache
     monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path / "txcache")
     monkeypatch.setattr(txcache, "SUMMARY_DIR", tmp_path / "summaries")
-    caches = (server._transcript_cache, server._seg_cache, server._ask_sessions)
+    caches = (server._transcript_cache, server._seg_cache, server._ask_sessions,
+              server._tx_jobs)
     for cache in caches:
         cache.clear()
     yield
@@ -1307,6 +1308,19 @@ def _captionless(monkeypatch, duration_ms=600_000):
     return meta
 
 
+def _record_transcriptions(monkeypatch):
+    """Record every _start_transcription call so the test's own thread can assert.
+
+    A pytest.fail passed in as a stub runs inside the HTTP handler thread, where
+    socketserver.handle_error swallows it -- the test passes no matter what the
+    server does. Four guards in this file were decorative for exactly that reason.
+    """
+    started = []
+    monkeypatch.setattr(server, "_start_transcription",
+                        lambda meta, model: started.append((meta.video_id, model)))
+    return started
+
+
 def _kinds(events):
     return [e.get("type") for e in events]
 
@@ -1320,13 +1334,29 @@ def test_off_keeps_todays_error(srv, monkeypatch):
     assert events[-1]["status"] == 422
 
 
-def test_an_absent_setting_means_ask(srv, monkeypatch):
-    """An extension older than this feature sends no whisper field at all."""
+def test_an_absent_setting_keeps_the_old_behaviour_exactly(srv, monkeypatch):
+    """An extension that knows about this always sends the field. One that doesn't
+    has no branch for `needs_transcription` and would surface "the summary stream
+    ended unexpectedly" instead of the clear 422 it used to get."""
     _, port = srv
     _captionless(monkeypatch)
     monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    started = _record_transcriptions(monkeypatch)
     events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
-    assert "needs_transcription" in _kinds(events)
+    assert "needs_transcription" not in _kinds(events)
+    assert events[-1]["status"] == 422
+    assert started == []
+
+
+def test_a_ceiling_of_true_is_not_a_one_minute_ceiling():
+    """int(True) == 1, which would refuse every video over sixty seconds."""
+    import youtube_tldw.config as cfg
+    real = cfg.get
+    try:
+        cfg.get = lambda k, *a: True if k == "whisper_max_minutes" else real(k, *a)
+        assert server._max_transcribe_ms() == server.MAX_TRANSCRIBE_MS
+    finally:
+        cfg.get = real
 
 
 def test_an_unknown_setting_is_refused_not_defaulted(srv, monkeypatch):
@@ -1355,21 +1385,22 @@ def test_ask_does_not_transcribe_until_it_is_accepted(srv, monkeypatch):
     _, port = srv
     _captionless(monkeypatch)
     monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
-    monkeypatch.setattr(server, "_start_transcription",
-                        lambda *a, **k: pytest.fail("transcribed without being asked"))
-    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ", "whisper": "ask"},
-                 _auth())
+    started = _record_transcriptions(monkeypatch)
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                 "whisper": "ask"}, _auth())
+    assert started == []
+    assert "needs_transcription" in _kinds(events)
 
 
 def test_off_beats_an_accepted_offer(srv, monkeypatch):
     """`transcribe: true` is a client assertion; `off` is the user's own answer."""
     _, port = srv
     _captionless(monkeypatch)
-    monkeypatch.setattr(server, "_start_transcription",
-                        lambda *a, **k: pytest.fail("off was overridden"))
+    started = _record_transcriptions(monkeypatch)
     events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
                                  "whisper": "off", "transcribe": True}, _auth())
     assert events[-1]["status"] == 422
+    assert started == []
 
 
 def test_a_server_side_pin_overrides_whatever_the_client_sends(srv, monkeypatch):
@@ -1386,12 +1417,12 @@ def test_a_video_over_the_ceiling_is_refused_before_any_audio(srv, monkeypatch):
     _, port = srv
     _captionless(monkeypatch, duration_ms=5 * 3600 * 1000)
     monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
-    monkeypatch.setattr(server.whisper_transcribe, "download_audio",
-                        lambda *a, **k: pytest.fail("downloaded over the ceiling"))
+    started = _record_transcriptions(monkeypatch)
     events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
                                  "whisper": "always"}, _auth())
     assert events[-1]["status"] == 413
     assert "whisper-max-minutes" in events[-1]["error"]
+    assert started == []
 
 
 def test_a_missing_dependency_is_reported_before_anything_is_downloaded(srv,
@@ -1399,10 +1430,10 @@ def test_a_missing_dependency_is_reported_before_anything_is_downloaded(srv,
     _, port = srv
     _captionless(monkeypatch)
     monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: False)
-    monkeypatch.setattr(server.whisper_transcribe, "download_audio",
-                        lambda *a, **k: pytest.fail("downloaded without whisper"))
+    started = _record_transcriptions(monkeypatch)
     events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
                                  "whisper": "always", "transcribe": True}, _auth())
+    assert started == []
     offer = next(e for e in events if e["type"] == "needs_transcription")
     assert offer["installed"] is False
     assert "pipx inject" in offer["install_hint"]
@@ -1434,34 +1465,125 @@ def test_a_transcribed_summary_says_where_its_words_came_from(srv, monkeypatch):
 
 
 def test_two_requests_for_one_video_run_one_transcription(srv, monkeypatch):
-    """Two tabs must cost one eight-minute job, not two."""
+    """Two tabs must cost one eight-minute job -- and the second must get the
+    answer, not a 429 or a hang. Asserting only the run count would pass against
+    a second caller that failed outright."""
     _, port = srv
     _captionless(monkeypatch)
     from youtube_tldw.transcript import Cue
     runs = []
-    gate = threading.Event()
+    release = threading.Event()
 
     def slow(vid, wd, **k):
         runs.append(vid)
-        gate.wait(3)
+        release.wait(15)            # held until both requests have joined
         return [Cue(0, 900, "spoken words")]
 
     monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
     monkeypatch.setattr(server.whisper_transcribe, "transcribe_video", slow)
+
+    # Count arrivals at the job rather than sleeping and hoping: the job cannot
+    # finish until we release it, so once both callers are here the dedupe question
+    # is settled with no timing window at all.
+    real_start = server._start_transcription
+    joined = []
+    joined_lock = threading.Lock()
+
+    def counting_start(meta, model):
+        job = real_start(meta, model)
+        with joined_lock:
+            joined.append(model)
+        return job
+
+    monkeypatch.setattr(server, "_start_transcription", counting_start)
     out = []
 
     def call():
-        out.append(_read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
-                                       "whisper": "always"}, _auth()))
+        try:
+            out.append(_read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                           "whisper": "always"}, _auth()))
+        except Exception as exc:          # a 429 or a drop is a failure, not a pass
+            out.append(exc)
 
     threads = [threading.Thread(target=call) for _ in range(2)]
     for t in threads:
         t.start()
-    time.sleep(0.4)
-    gate.set()
+    deadline = time.monotonic() + 15
+    while len(joined) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert len(joined) == 2, "both requests should have reached the job"
+    release.set()
     for t in threads:
-        t.join(timeout=10)
-    assert len(runs) == 1
+        t.join(timeout=20)
+
+    assert runs == ["dQw4w9WgXcQ"]                       # exactly one run
+    assert len(out) == 2
+    for result in out:
+        assert not isinstance(result, Exception), f"a caller failed: {result!r}"
+        assert result[-1]["type"] == "result"            # both got the summary
+
+
+def test_the_second_caller_sees_the_running_jobs_progress(srv, monkeypatch):
+    """'The second attaches to it and sees its progress' -- otherwise the second
+    tab is a spinner with nothing behind it."""
+    from youtube_tldw.transcript import Cue
+    meta = VideoMeta("dQw4w9WgXcQ", "T", "C", 600_000, {}, {})
+    running, release = threading.Event(), threading.Event()
+
+    def slow(vid, wd, *, on_progress=None, **k):
+        if on_progress:
+            on_progress("transcribing... 10s / 600s", 42.0)
+        running.set()
+        release.wait(5)
+        return [Cue(0, 900, "spoken")]
+
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video", slow)
+    job = server._start_transcription(meta, "small")
+    assert running.wait(5)
+    published = server._tx_progress("dQw4w9WgXcQ")
+    assert published is not None
+    assert published["percent"] == 42.0
+    assert "transcribing" in published["message"]
+    # A second caller for the same video joins rather than starting another.
+    assert server._start_transcription(meta, "small") is job
+    release.set()
+    assert job["event"].wait(10)
+
+
+def test_a_different_model_is_a_different_job(monkeypatch):
+    """Keyed by video and model: joining across models would label a summary with
+    a model that did not produce it."""
+    from youtube_tldw.transcript import Cue
+    meta = VideoMeta("dQw4w9WgXcQ", "T", "C", 600_000, {}, {})
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video",
+                        lambda vid, wd, **k: [Cue(0, 900, "x")])
+    a = server._start_transcription(meta, "small")
+    b = server._start_transcription(meta, "medium")
+    assert a is not b
+    assert a["event"].wait(10) and b["event"].wait(10)
+
+
+def test_a_retry_does_not_inherit_the_previous_failure(monkeypatch):
+    """Joining a job that already gave up means the second click fails for the
+    first click's reason."""
+    from youtube_tldw.transcript import Cue
+    meta = VideoMeta("dQw4w9WgXcQ", "T", "C", 600_000, {}, {})
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video",
+                        lambda vid, wd, **k: (_ for _ in ()).throw(
+                            TldrError("the first failure")))
+    first = server._start_transcription(meta, "small")
+    assert first["event"].wait(10)
+    assert first["error"] == "the first failure"
+
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video",
+                        lambda vid, wd, **k: [Cue(0, 900, "second time lucky")])
+    second = server._start_transcription(meta, "small")
+    assert second is not first
+    assert second["event"].wait(10)
+    assert second["error"] is None
 
 
 def test_a_finished_transcript_is_cached_even_if_nobody_is_listening(monkeypatch):
@@ -1568,3 +1690,207 @@ def test_a_video_of_unknown_length_is_not_quoted_an_estimate(srv, monkeypatch):
                                  "whisper": "ask"}, _auth())
     offer = next(e for e in events if e["type"] == "needs_transcription")
     assert offer["estimate_s"] == 0        # the client renders this as "unknown"
+
+
+def test_a_transcription_survives_the_client_hanging_up(srv, monkeypatch):
+    """Criterion 8, as a client actually experiences it. This is the stated reason
+    the job lives outside the request: _run_stream's emit has no OSError guard, so
+    an in-request transcription would be discarded by a closed socket."""
+    _, port = srv
+    _captionless(monkeypatch)
+    from youtube_tldw.transcript import Cue
+    release, running = threading.Event(), threading.Event()
+
+    def slow(vid, wd, *, on_progress=None, **k):
+        running.set()
+        if on_progress:
+            on_progress("transcribing...", 20.0)
+        release.wait(15)
+        return [Cue(0, 900, "words from the audio")]
+
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video", slow)
+
+    payload = json.dumps({"url": "https://youtu.be/dQw4w9WgXcQ",
+                          "whisper": "always"}).encode()
+    request = (b"POST /summarize/stream HTTP/1.1\r\n"
+               b"Host: 127.0.0.1\r\n"
+               b"Authorization: Bearer " + TOKEN.encode() + b"\r\n"
+               b"Origin: " + EXT_ORIGIN.encode() + b"\r\n"
+               b"Content-Type: application/json\r\n"
+               b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.sendall(request)
+    assert sock.recv(4096)              # the stream has started
+    assert running.wait(5)
+    sock.close()                        # walk away mid-transcription
+    release.set()
+
+    deadline = time.monotonic() + 15
+    while server._cache_get("dQw4w9WgXcQ") is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    hit = server._cache_get("dQw4w9WgXcQ")
+    assert hit is not None, "a finished transcript was thrown away with the socket"
+    assert [c.text for c in hit[1]] == ["words from the audio"]
+    assert server._cache_source("dQw4w9WgXcQ") == "audio:small"
+
+
+def test_other_requests_are_served_while_a_transcription_runs(srv, monkeypatch):
+    """Waiting is not work. Holding a MAX_CONCURRENCY slot for the length of a
+    transcription would 429 every captioned summarize, question and stop -- the
+    starvation that putting the job outside the request was meant to prevent."""
+    _, port = srv
+    from youtube_tldw.transcript import Cue
+    release = threading.Event()
+    joined = []
+
+    meta = VideoMeta("dQw4w9WgXcQ", "No Captions", "Chan", 600_000, {}, {})
+
+    def captionless_then_normal(url, ratio, lang, *, timeout, max_chars,
+                                on_progress=None, on_partial=None, _prefetched=None):
+        if "oHg5SJYRHA0" in url:                 # a different, captioned video
+            return _summary()
+        if _prefetched:
+            return _summary()
+        exc = NoTranscriptError("no captions")
+        exc.meta = meta
+        raise exc
+
+    def slow(vid, wd, **k):
+        joined.append(vid)
+        release.wait(15)
+        return [Cue(0, 900, "spoken")]
+
+    monkeypatch.setattr(server.core, "summarize_url", captionless_then_normal)
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video", slow)
+
+    blocked = threading.Thread(target=lambda: _read_ndjson(
+        port, {"url": "https://youtu.be/dQw4w9WgXcQ", "whisper": "always"}, _auth()))
+    blocked.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not joined and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert joined, "the transcription never started"
+        # A completely unrelated, fully-captioned video must still be served.
+        events = _read_ndjson(port, {"url": "https://youtu.be/oHg5SJYRHA0"}, _auth())
+        assert events[-1]["type"] == "result"
+    finally:
+        release.set()
+        blocked.join(timeout=20)
+
+
+def test_changing_the_whisper_model_retranscribes(srv, monkeypatch):
+    """Criterion 6. The summary lookup runs before any transcript work, so without
+    the source in its key a better model returns a fortnight of the old answer."""
+    _, port = srv
+    _captionless(monkeypatch)
+    from youtube_tldw.transcript import Cue
+    models = []
+
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video",
+                        lambda vid, wd, **k: models.append(k.get("model_size"))
+                        or [Cue(0, 900, "spoken")])
+
+    monkeypatch.setattr(server.whisper_transcribe, "resolve_model", lambda: "small")
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                        "whisper": "always"}, _auth())
+    assert models == ["small"]
+    assert server._cache_source("dQw4w9WgXcQ") == "audio:small"
+
+    monkeypatch.setattr(server.whisper_transcribe, "resolve_model", lambda: "medium")
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                 "whisper": "always"}, _auth())
+    assert models == ["small", "medium"], "the cached small transcript was reused"
+    assert events[-1].get("cached") is not True
+    assert server._cache_source("dQw4w9WgXcQ") == "audio:medium"
+
+
+def test_the_same_model_still_uses_the_cache(monkeypatch):
+    """The model check must not turn every repeat into another eight minutes."""
+    from youtube_tldw.transcript import Cue
+    monkeypatch.setattr(server.whisper_transcribe, "resolve_model", lambda: "small")
+    meta = VideoMeta("dQw4w9WgXcQ", "T", "C", 1000, {}, {})
+    server._cache_put("dQw4w9WgXcQ", meta, [Cue(0, 900, "x")], "audio:small")
+    assert server._cached_transcript("https://youtu.be/dQw4w9WgXcQ") is not None
+
+
+def test_a_caption_transcript_is_never_invalidated_by_the_model(monkeypatch):
+    monkeypatch.setattr(server.whisper_transcribe, "resolve_model", lambda: "medium")
+    from youtube_tldw.transcript import Cue
+    meta = VideoMeta("dQw4w9WgXcQ", "T", "C", 1000, {}, {})
+    server._cache_put("dQw4w9WgXcQ", meta, [Cue(0, 900, "x")], txcache.CAPTIONS)
+    assert server._cached_transcript("https://youtu.be/dQw4w9WgXcQ") is not None
+
+
+def test_real_captions_from_the_page_beat_an_audio_transcript(monkeypatch):
+    """A video that has since gained a caption track should stop being served a
+    machine transcription of itself."""
+    from youtube_tldw.transcript import Cue
+    monkeypatch.setattr(server.whisper_transcribe, "resolve_model", lambda: "small")
+    meta = VideoMeta("dQw4w9WgXcQ", "T", "C", 1000, {}, {})
+    server._cache_put("dQw4w9WgXcQ", meta, [Cue(0, 900, "from audio")], "audio:small")
+    body = {"page": {"cues": [{"start_ms": 0, "text": "from real captions"}],
+                     "title": "T", "channel": "C"}}
+    chosen = server._preferred_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
+    assert [c.text for c in chosen[1]] == ["from real captions"]
+
+
+def test_a_transcription_failure_keeps_its_status(srv, monkeypatch):
+    """Criterion 13: the message said why, the status said 500 regardless."""
+    _, port = srv
+    _captionless(monkeypatch)
+    from youtube_tldw import TldrTimeoutError
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video",
+                        lambda vid, wd, **k: (_ for _ in ()).throw(
+                            TldrTimeoutError("took too long")))
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                 "whisper": "always"}, _auth())
+    assert events[-1]["status"] == 504          # not a blanket 500
+
+
+def test_silent_audio_is_reported_as_having_no_transcript(srv, monkeypatch):
+    _, port = srv
+    _captionless(monkeypatch)
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video",
+                        lambda vid, wd, **k: (_ for _ in ()).throw(
+                            NoTranscriptError("the audio may be silent")))
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                 "whisper": "always"}, _auth())
+    assert events[-1]["status"] == 422
+    assert "silent" in events[-1]["error"]
+
+
+def test_a_cached_summary_still_says_it_came_from_audio(srv, monkeypatch):
+    """The case criterion 14 was written for: the summary-cache path never touches
+    a transcript, so provenance has to live in the payload."""
+    _, port = srv
+    _captionless(monkeypatch)
+    from youtube_tldw.transcript import Cue
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video",
+                        lambda vid, wd, **k: [Cue(0, 900, "spoken")])
+    first = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                "whisper": "always"}, _auth())
+    assert first[-1]["transcript_source"] == "audio:small"
+    second = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                 "whisper": "always"}, _auth())
+    assert second[-1].get("cached") is True
+    assert second[-1]["transcript_source"] == "audio:small"
+
+
+def test_a_bad_body_to_the_stop_route_is_a_400(srv):
+    _, port = srv
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/transcribe/stop",
+        data=json.dumps([1, 2]).encode(), method="POST")
+    for k, v in _auth().items():
+        req.add_header(k, v)
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=5)
+    assert e.value.code == 400

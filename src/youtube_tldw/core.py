@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import TranscriptTooLongError
+from . import NoTranscriptError, TranscriptTooLongError
 from . import metadata as md
 from . import spans, summarize, transcript
 from .summarize import TextResult

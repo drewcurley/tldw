@@ -344,6 +344,10 @@
     // ask both keep going through a plain disconnect by design).
     if (busy && audioPort) { try { audioPort.postMessage({ type: "stopSpeak" }); } catch (_) {} }
     if (asking && askPort) { try { askPort.postMessage({ type: "stopAsk" }); } catch (_) {} }
+    // A transcription is the longest-running thing here, so "Stop and discard"
+    // has to reach it too. A bare disconnect would leave it saturating the CPU
+    // for minutes after the user asked for it to stop.
+    if (txLive) { stopTranscribe(txLive.url); txLive = null; }
     clearTimers();
     teardownAudio();
     teardownAsk();
