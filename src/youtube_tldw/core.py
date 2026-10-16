@@ -43,7 +43,15 @@ def fetch_transcript(video_id: str, lang: str = "en", *, on_progress=None,
     workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-tx-"))
     try:
         meta = md.fetch_metadata(video_id)
-        lang_key, is_auto = md.choose_track(meta, lang)  # NoTranscriptError
+        try:
+            lang_key, is_auto = md.choose_track(meta, lang)
+        except NoTranscriptError as exc:
+            # Hand the caller what we already paid for. Offering to transcribe the
+            # audio instead needs the title, channel and a *trusted* duration, and
+            # re-fetching them would be a second yt-dlp call on the path that is
+            # rate-limited in the first place.
+            exc.meta = meta
+            raise
         kind = "auto-captions" if is_auto else "subtitles"
         log(f'"{meta.title}" by {meta.channel} ({format_dur(meta.duration_ms)}) '
             f"-- using {kind} ({lang_key})", pcts[1])
