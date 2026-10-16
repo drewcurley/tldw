@@ -136,6 +136,9 @@ async function handleSummarize(port, msg) {
           safePost(port, { type: "meta", meta: {
             video_id: ev.video_id, title: ev.title, channel: ev.channel,
             source_url: ev.source_url, original_length: ev.original_length } });
+        } else if (ev.type === "transcribing") {
+          safePost(port, { type: "transcribing", videoId: ev.video_id,
+                           estimateS: ev.estimate_s });
         } else if (ev.type === "needs_transcription") {
           // The video has no captions; the server is waiting to be told whether to
           // transcribe the audio. Terminal for this request -- accepting sends a
