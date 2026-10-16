@@ -8,10 +8,16 @@
 const api = globalThis.browser ?? globalThis.chrome;
 
 const DEFAULTS = { serverUrl: "http://127.0.0.1:8765", token: "", voice: "amy",
-                   model: "opus", segmentRatio: "auto" };
+                   model: "opus", segmentRatio: "auto", whisper: "ask" };
 // Keep in step with the server's claude_client.MODELS; it refuses anything else.
 const MODELS = ["opus", "sonnet"];
+// Keep in step with the server's WHISPER_POLICIES; it refuses anything else.
+const WHISPER_POLICIES = ["off", "ask", "always"];
 const CLIENT_TIMEOUT_MS = 150000;
+// Transcribing a video's audio runs at roughly 5.5x realtime, so the two-and-a-half
+// minutes above would cap it at a ~14-minute video -- it would abort mid-run, after
+// the estimate had already been accepted. This budget is for that path only.
+const TRANSCRIBE_TIMEOUT_MS = 2400000;  // 40 min: a 2-hour video at the server ceiling
 const SEG_TIMEOUT_MS = 320000;          // segment selection can take 2-3 min (Claude JSON)
 const ASK_TIMEOUT_MS = 300000;          // one answer over an already-fetched transcript
 const SPEAK_TIMEOUT_MS = 600000;        // long summaries synthesize for minutes;
@@ -40,6 +46,8 @@ async function getSettings() {
   const ratio = parseFloat(s.segmentRatio);
   return { serverUrl: s.serverUrl || DEFAULTS.serverUrl, token: s.token || "",
            model: MODELS.includes(s.model) ? s.model : DEFAULTS.model,
+           whisper: WHISPER_POLICIES.includes(s.whisper) ? s.whisper
+                                                         : DEFAULTS.whisper,
            segmentRatio: ratio > 0 && ratio <= 1 ? ratio : null };
 }
 
@@ -68,31 +76,37 @@ api.runtime.onConnect.addListener((port) => {
     else if (msg.type === "getSegments") handleSegments(port, msg);
     else if (msg.type === "preview") handlePreview(port, msg);
     else if (msg.type === "ask") handleAsk(port, msg);
+    else if (msg.type === "stopTranscribe") handleStopTranscribe(msg);
     // "ping" is ignored; receiving it just keeps the worker alive
   });
 });
 
 async function handleSummarize(port, msg) {
-  const { url, videoId, refresh, page } = msg;
+  const { url, videoId, refresh, page, transcribe } = msg;
   if (videoId && cache.has(videoId) && !refresh) {
     safePost(port, { type: "result", payload: cache.get(videoId), cached: true });
     return;
   }
-  const { serverUrl, token, model, segmentRatio } = await getSettings();
+  const { serverUrl, token, model, segmentRatio, whisper } = await getSettings();
   if (!token) {
     safePost(port, { type: "error",
       error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
     return;
   }
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), CLIENT_TIMEOUT_MS);
+  // Accepting the offer means agreeing to wait minutes, so this request gets the
+  // budget that implies rather than the one sized for a model call.
+  const budget = transcribe || whisper === "always"
+    ? TRANSCRIBE_TIMEOUT_MS : CLIENT_TIMEOUT_MS;
+  const timer = setTimeout(() => ctrl.abort(), budget);
   let gotTerminal = false;
   try {
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/summarize/stream", {
       method: "POST", signal: ctrl.signal,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
       body: JSON.stringify({ url, model, segment_ratio: segmentRatio,
-                             refresh: !!refresh, page }),
+                             refresh: !!refresh, page, whisper,
+                             transcribe: transcribe === true }),
     });
     if (!resp.ok) {
       let detail = "";
@@ -122,6 +136,16 @@ async function handleSummarize(port, msg) {
           safePost(port, { type: "meta", meta: {
             video_id: ev.video_id, title: ev.title, channel: ev.channel,
             source_url: ev.source_url, original_length: ev.original_length } });
+        } else if (ev.type === "needs_transcription") {
+          // The video has no captions; the server is waiting to be told whether to
+          // transcribe the audio. Terminal for this request -- accepting sends a
+          // new one.
+          gotTerminal = true;
+          safePost(port, { type: "needsTranscription", offer: {
+            video_id: ev.video_id, title: ev.title, channel: ev.channel,
+            duration_ms: ev.duration_ms, estimate_s: ev.estimate_s,
+            model: ev.model, installed: ev.installed,
+            install_hint: ev.install_hint } });
         } else if (ev.type === "partial") {
           safePost(port, { type: "partial", kind: ev.kind, text: ev.text });
         } else if (ev.type === "result") {
@@ -140,14 +164,30 @@ async function handleSummarize(port, msg) {
     }
   } catch (e) {
     if (e.name === "AbortError") {
-      safePost(port, { type: "error",
-        error: "Summarizing timed out (over 150s). Try again, or use the tldw CLI for long videos." });
+      safePost(port, { type: "error", error: budget === TRANSCRIBE_TIMEOUT_MS
+        ? "Transcribing timed out. The transcript may still finish on the server — try again in a few minutes."
+        : "Summarizing timed out (over 150s). Try again, or use the tldw CLI for long videos." });
     } else {
       safePost(port, { type: "error",
         error: "Can't reach the tldw server. Is it running? In a terminal:  tldw serve" });
     }
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function handleStopTranscribe(msg) {
+  const { serverUrl, token } = await getSettings();
+  if (!token || !msg.url) return;
+  try {
+    await fetch(serverUrl.replace(/\/+$/, "") + "/transcribe/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json",
+                 "Authorization": "Bearer " + token },
+      body: JSON.stringify({ url: msg.url }),
+    });
+  } catch (_) {
+    // Best effort. The run also stops on its own budget.
   }
 }
 

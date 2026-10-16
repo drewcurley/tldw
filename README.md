@@ -300,23 +300,49 @@ pip install faster-whisper                # if using a venv
 ```
 
 The model downloads once to `~/.cache/youtube-tldw/whisper/` on first use.
-Default model is `small` (~244 MB, good accuracy/speed). Change it with:
+Default model is `small`. Change it with:
 
 ```bash
 tldw config set whisper-model small    # tiny/base/small/medium/large
 ```
 
-| Model | Size | Speed (relative) | Notes |
-|-------|------|-----------------|-------|
+| Model | On disk | Speed | Notes |
+|-------|---------|-------|-------|
 | tiny | 75 MB | fastest | usable for simple speech |
 | base | 145 MB | fast | |
-| small | **244 MB** | **default** | good balance |
-| medium | 769 MB | slower | noticeably better accuracy |
-| large | 1.5 GB | slowest | best accuracy |
+| small | **484 MB** | **default** | measured at 5.5× realtime |
+| medium | 1.5 GB | slower | noticeably better accuracy |
+| large | 3.1 GB | slowest | best accuracy |
 
-Transcription typically takes 0.5–2× the video length on CPU. The browser
-extension does not use this fallback (requests would time out for long videos);
-use the CLI instead.
+`small` transcribes at roughly **5.5× realtime** on an Apple Silicon laptop, so a
+45-minute video takes about 8 minutes and uses the CPU while it runs. Transcripts
+are cached for a fortnight, so a given video is only ever transcribed once.
+
+### In the browser extension
+
+The extension supports this too. Because it costs minutes rather than seconds, it
+is offered rather than simply done: a video with no captions shows what it would
+take for *that* video, and nothing starts until you click. Options → **Videos with
+no subtitles**:
+
+- **Offer to transcribe the audio** (default) — ask each time.
+- **Transcribe without asking** — for people who hit captionless videos often.
+- **Don't transcribe** — keep the old "no transcript" error.
+
+A running transcription can be stopped from the panel, survives closing the panel
+(subject to your close-panel setting), and is cached the moment it finishes even if
+you have navigated away. Two tabs on the same video share one transcription.
+
+Summaries written this way are labelled, in the panel and in the saved `.md` — a
+machine transcription has different failure modes from a real caption track, and
+that is worth knowing when you read it back later.
+
+Server-side limits, which outrank the browser setting:
+
+```bash
+tldw config set whisper off             # never transcribe, whatever the extension asks
+tldw config set whisper-max-minutes 120 # longest video to transcribe (default 120)
+```
 
 ## Browser extension
 

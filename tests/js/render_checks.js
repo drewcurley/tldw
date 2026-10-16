@@ -345,6 +345,87 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
   }
 }
 
+// --- transcribing a video with no captions ---
+//
+// This path spends minutes of someone's CPU, so what the client does before it
+// starts, and whether it can be stopped once it has, both matter.
+{
+  const panel = stripComments(src);
+  const optionsSrc = process.argv[4]
+    ? stripComments(fs.readFileSync(process.argv[4], "utf8")) : "";
+
+  // The offer renders the real estimate and does nothing until it is clicked.
+  eval(grab("  function fmtEstimate(seconds)", "\n  // A video with no captions"));
+  check("under a minute reads as words", fmtEstimate(30), "under a minute");
+  check("one minute is singular", fmtEstimate(60), "about a minute");
+  check("a 45-minute video reads in minutes", fmtEstimate(490), "about 8 minutes");
+  check("a missing estimate still reads", fmtEstimate(undefined), "under a minute");
+
+  check("accepting the offer re-runs with the transcribe flag",
+    /startSummarize\(url, videoId, false, true\)/.test(panel), true);
+  check("the flag reaches the worker",
+    /transcribe: !!transcribe/.test(panel), true);
+  check("a missing dependency shows the command, not a time estimate",
+    /offer\.installed === false/.test(panel) && /install_hint/.test(panel), true);
+  check("the install hint is escaped like everything else",
+    /esc\(hint\)/.test(panel), true);
+
+  // An eight-minute job the user cannot interrupt is a trap.
+  check("a transcription gets a stop control",
+    /if \(transcribe\) addStopControl\(url\)/.test(panel), true);
+  check("stopping travels over the live port, not a fresh message",
+    /port\.postMessage\(\{ type: "stopTranscribe", url \}\)/.test(panel), true);
+  check("the panel's own safety timer does not fire mid-transcription",
+    /transcribe \? 24\d{5} : 160000/.test(panel), true);
+
+  if (worker) {
+    const bg = stripComments(worker);
+    check("a transcribing request gets a budget sized for it",
+      /transcribe \|\| whisper === "always"[\s\S]{0,60}TRANSCRIBE_TIMEOUT_MS/.test(bg),
+      true);
+    check("...and that budget is minutes, not the 150s model-call one",
+      /TRANSCRIBE_TIMEOUT_MS = (\d+)/.test(bg)
+        && Number(RegExp.$1) >= 600000, true);
+    check("the setting is sent to the server", /whisper,/.test(bg), true);
+    check("the offer is forwarded to the panel",
+      /needs_transcription/.test(bg) && /needsTranscription/.test(bg), true);
+    check("the offer ends the request rather than leaving it hanging",
+      /needs_transcription"\) \{[\s\S]{0,200}gotTerminal = true/.test(bg), true);
+
+    // Three files hold this list; the server 400s anything not in its own.
+    const policiesOf = (text) => {
+      const m = /WHISPER_POLICIES = \[([^\]]+)\]/.exec(text);
+      return m ? m[1].replace(/["'\s]/g, "") : null;
+    };
+    const fromWorker = policiesOf(bg);
+    check("the worker knows the allowed settings", fromWorker !== null, true);
+    if (optionsSrc) {
+      check("options and the worker agree on them",
+        policiesOf(optionsSrc), fromWorker);
+    }
+  }
+}
+
+// --- saying where the words came from ---
+//
+// A summary written from a machine transcription is a different artifact from one
+// written from the video's own captions, and the person reading it months later
+// has no other way to tell.
+{
+  eval(grab("  function transcribedNote(p)", "\n  function toMarkdown"));
+  check("an audio transcript is labelled",
+    transcribedNote({ transcript_source: "audio:small" }),
+    "transcribed from audio by Whisper (small)");
+  check("a caption transcript says nothing",
+    transcribedNote({ transcript_source: "captions" }), "");
+  check("a payload from before provenance says nothing",
+    transcribedNote({}), "");
+  check("a non-string source is ignored rather than rendered",
+    transcribedNote({ transcript_source: { a: 1 } }), "");
+  check("the label is escaped where it is shown",
+    /esc\(transcribedNote\(p\)\)/.test(stripComments(src)), true);
+}
+
 if (failures.length) {
   console.log("FAILURES:\n" + failures.join("\n"));
   process.exit(1);

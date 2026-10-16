@@ -313,7 +313,12 @@ def _serve_parser() -> argparse.ArgumentParser:
 
 def _run_config(args: list[str]) -> int:
     """`tldw config get` | `tldw config set output-dir <path>` | `tldw config unset <key>`."""
-    keymap = {"output-dir": "output_dir", "whisper-model": "whisper_model"}
+    keymap = {"output-dir": "output_dir", "whisper-model": "whisper_model",
+              # How captionless videos are handled by `tldw serve`, and the longest
+              # video it will transcribe. `whisper` set here outranks the browser
+              # setting, so "off" can be a property of the machine rather than a
+              # preference whichever extension happens to be installed holds.
+              "whisper": "whisper", "whisper-max-minutes": "whisper_max_minutes"}
     if not args or args[0] == "get":
         cfg = config.load()
         if cfg:

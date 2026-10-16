@@ -535,7 +535,7 @@
     } catch (_) {}
   }
 
-  function startSummarize(url, videoId, refresh) {
+  function startSummarize(url, videoId, refresh, transcribe) {
     // A new run abandons whatever the last one left connected (mount() no longer
     // does this, and it must not — see the comment there).
     clearTimers();
@@ -543,6 +543,7 @@
     lastProgress = null;
     partialState = null;
     showLoading();
+    if (transcribe) addStopControl(url);
     requestActive = true;
     currentVideoId = videoId;
     backgrounded = false;
@@ -556,6 +557,13 @@
         return;
       }
       if (m.type === "meta" || m.type === "partial") { onPartial(m); return; }
+      if (m.type === "needsTranscription") {
+        requestActive = false;
+        partialState = null;
+        if (backgrounded) { endBackground("TL;DW needs an answer about this video"); }
+        showTranscribeOffer(m.offer, url, videoId);
+        return;
+      }
       requestActive = false;
       partialState = null;
       if (m.type === "result") {
@@ -577,20 +585,23 @@
     // the server a yt-dlp extraction that YouTube may refuse outright.
     collectPageTranscript().then((page) => {
       if (!requestActive) return;              // cancelled while we were reading
-      port.postMessage({ type: "summarize", url, videoId, refresh: !!refresh, page });
+      port.postMessage({ type: "summarize", url, videoId, refresh: !!refresh,
+                         page, transcribe: !!transcribe });
     });
     // Heartbeat: the page never suspends, so pinging every 20s keeps the MV3 service
     // worker alive through a long (60s+) summarize that would otherwise be killed.
     pingTimer = setInterval(() => {
       try { port.postMessage({ type: "ping" }); } catch (_) {}
     }, 20000);
+    // Transcribing audio legitimately runs for many minutes; the ordinary ceiling
+    // would fire part-way through a wait the user has already agreed to.
     safetyTimer = setTimeout(() => {
       if (!requestActive) return;
       requestActive = false;
       const msg = "This is taking too long. Make sure `tldw serve` is running, then try again.";
       if (backgrounded) endBackground(msg, true);
       else showError(msg);
-    }, 160000);
+    }, transcribe ? 2460000 : 160000);
   }
 
   function showLoading() {
@@ -602,6 +613,25 @@
         <div class="bar"><div class="fill"></div></div>
         <div class="pct">0%</div>
       </div>`;
+  }
+
+  // Only for transcription: everything else here finishes in under a minute, so a
+  // stop button would be noise. An eight-minute job without one is a trap.
+  function addStopControl(url) {
+    const status = root && root.querySelector(".status");
+    if (!status) return;
+    const row = document.createElement("div");
+    row.className = "audiorow";
+    const btn = document.createElement("button");
+    btn.className = "stoptx";
+    btn.textContent = "⏹ Stop transcribing";
+    btn.addEventListener("click", () => {
+      btn.disabled = true;
+      btn.textContent = "Stopping…";
+      stopTranscribe(url);
+    });
+    row.appendChild(btn);
+    status.appendChild(row);
   }
 
   function updateProgress(msg, pct, creep) {
@@ -672,6 +702,56 @@
     };
     document.body.appendChild(el);
     setTimeout(dismiss, isError ? 12000 : 20000);
+  }
+
+  function fmtEstimate(seconds) {
+    const secs = Number(seconds) || 0;
+    // Rounding first would make 30 seconds "about a minute", since JS rounds .5 up.
+    if (secs < 60) return "under a minute";
+    const mins = Math.round(secs / 60);
+    return mins === 1 ? "about a minute" : `about ${mins} minutes`;
+  }
+
+  // A video with no captions. The audio can still be transcribed locally, but that
+  // costs minutes of CPU, so it is offered rather than simply done.
+  function showTranscribeOffer(offer, url, videoId) {
+    if (!host) mount();
+    clearTimers();
+    const c = root.querySelector(".content");
+    if (!offer || offer.installed === false) {
+      const hint = (offer && offer.install_hint) || "pipx inject youtube-tldw faster-whisper";
+      c.innerHTML = `
+        <div class="status err">
+          <p>This video has no subtitles or auto-captions. TL;DW can transcribe the
+          audio locally instead, but that needs Whisper, which isn't installed yet.</p>
+          <p>Install it, then restart <code>tldw serve</code>:</p>
+          <pre class="installhint">${esc(hint)}</pre>
+        </div>`;
+      return;
+    }
+    c.innerHTML = `
+      <div class="status">
+        <p>This video has no subtitles or auto-captions.</p>
+        <p>TL;DW can transcribe the audio on your own machine instead. For this
+        video that takes <strong>${esc(fmtEstimate(offer.estimate_s))}</strong>,
+        and the transcript is kept so it only happens once.</p>
+        <div class="audiorow">
+          <button class="transcribe">Transcribe the audio</button>
+        </div>
+      </div>`;
+    const btn = c.querySelector(".transcribe");
+    if (btn) {
+      btn.addEventListener("click", () => {
+        startSummarize(url, videoId, false, true);
+      });
+    }
+  }
+
+  // Stop a transcription that is already running. Unlike closing the panel -- which
+  // deliberately leaves work going -- this is an explicit cancel, and it travels
+  // over the live port the worker is already listening on.
+  function stopTranscribe(url) {
+    try { if (port) port.postMessage({ type: "stopTranscribe", url }); } catch (_) {}
   }
 
   function showError(msg) {
@@ -767,7 +847,8 @@
     const points = (p.key_points || []).map((k) => `<li>${esc(k)}</li>`).join("");
     c.innerHTML = `
       <div class="meta">${esc(p.channel)} · ${esc(p.original_length)} → ~${esc(p.length_label)} read${esc(trimmedNote())} ·
-        <a href="${esc(p.source_url)}" target="_blank" rel="noopener noreferrer">original</a></div>
+        <a href="${esc(p.source_url)}" target="_blank" rel="noopener noreferrer">original</a>${
+          transcribedNote(p) ? ` · <span class="txsrc">${esc(transcribedNote(p))}</span>` : ""}</div>
       <h1 style="margin-bottom:10px">${esc(p.title)}</h1>
       ${audioRowHtml(false)}
       ${points ? `<h2>Key points</h2><ul class="points">${points}</ul>` : ""}
@@ -1722,9 +1803,20 @@
     if (status) { status.textContent = msg; status.classList.add("audioerr"); }
   }
 
+  // A summary written from a machine transcription of the audio is not the same
+  // artifact as one written from the video's own captions -- different accuracy,
+  // different failure modes. Whoever reads this later should be told which it was.
+  function transcribedNote(p) {
+    const source = p && p.transcript_source;
+    if (typeof source !== "string" || !source.startsWith("audio:")) return "";
+    return "transcribed from audio by Whisper (" + source.slice(6) + ")";
+  }
+
   function toMarkdown(p) {
     const kp = (p.key_points || []).map((k) => "- " + k).join("\n");
+    const note = transcribedNote(p);
     return `# ${p.title}\n${p.channel} · ${p.original_length} → ~${p.length_label} read\n` +
+      (note ? `_${note}_\n` : "") +
       `Source: ${p.source_url}\n\n## Key points\n${kp}\n\n## Summary\n${p.summary_md}\n`;
   }
 
