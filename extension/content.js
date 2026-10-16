@@ -62,6 +62,12 @@
       background: pref !== "abort",
     };
   }
+  // { url } while the server is transcribing this video's audio. The panel can't
+  // work this out for itself: on the "always" setting it never asked to transcribe,
+  // and after a close/re-open it has no memory of having done so. The server says.
+  let txLive = null;
+  // An offer that arrived while the panel was closed, shown when they come back.
+  let pendingOffer = null;
   let askLive = null;         // { text, bubble } while an answer is streaming
   let lastSegments = null;    // { videoId, segments } — re-skip without re-fetching
   // Skip-playback engine state.
@@ -171,6 +177,14 @@
         .pct { font-size: 12px; color: #888; margin-top: 6px; text-align: right; }
         .err { color: #c0392b; } .err code { background: rgba(128,128,128,.15);
           padding: 1px 6px; border-radius: 5px; }
+        /* The install command is the one thing on that screen to act on, so it
+           reads as a command rather than as more of the red error text. */
+        .installhint { color: #e9e9ea; background: rgba(128,128,128,.18);
+          padding: 8px 10px; border-radius: 6px; margin: 6px 0;
+          font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+          white-space: pre-wrap; word-break: break-word; user-select: all; }
+        .hint { font-size: 12px; color: #888; margin: 4px 0; }
+        .txsrc { color: #888; }
         .audiorow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
           margin: 4px 0 6px; }
         .audiorow select { font: inherit; font-size: 13px; padding: 4px 6px;
@@ -542,8 +556,8 @@
     if (port) { try { port.disconnect(); } catch (_) {} port = null; }
     lastProgress = null;
     partialState = null;
+    txLive = null;
     showLoading();
-    if (transcribe) addStopControl(url);
     requestActive = true;
     currentVideoId = videoId;
     backgrounded = false;
@@ -557,15 +571,39 @@
         return;
       }
       if (m.type === "meta" || m.type === "partial") { onPartial(m); return; }
+      if (m.type === "transcribing") {
+        txLive = { url };
+        if (!partialState) addStopControl(url);
+        // The ordinary ceiling is sized for a model call and would declare failure
+        // part-way through a wait that is behaving exactly as promised.
+        if (safetyTimer) clearTimeout(safetyTimer);
+        safetyTimer = setTimeout(() => {
+          if (!requestActive) return;
+          requestActive = false;
+          const msg = "Transcribing is taking longer than expected. It may still "
+            + "finish on the server — try again in a few minutes.";
+          if (backgrounded) endBackground(msg, true);
+          else showError(msg);
+        }, 2460000);
+        return;
+      }
       if (m.type === "needsTranscription") {
         requestActive = false;
         partialState = null;
-        if (backgrounded) { endBackground("TL;DW needs an answer about this video"); }
+        txLive = null;
+        pendingOffer = { offer: m.offer, url, videoId };
+        if (backgrounded) {
+          // The panel was closed deliberately. Say there's something to decide and
+          // let them come back to it, rather than reopening over the video.
+          endBackground("TL;DW needs an answer about this video");
+          return;
+        }
         showTranscribeOffer(m.offer, url, videoId);
         return;
       }
       requestActive = false;
       partialState = null;
+      txLive = null;
       if (m.type === "result") {
         if (backgrounded) { lastPayload = m.payload; endBackground("TL;DW summary ready"); }
         else showResult(m.payload, m.cached);
@@ -625,6 +663,7 @@
     const btn = document.createElement("button");
     btn.className = "stoptx";
     btn.textContent = "⏹ Stop transcribing";
+    btn.setAttribute("aria-label", "Stop transcribing this video's audio");
     btn.addEventListener("click", () => {
       btn.disabled = true;
       btn.textContent = "Stopping…";
@@ -698,14 +737,23 @@
     const dismiss = () => { if (el.parentNode) el.parentNode.removeChild(el); };
     el.onclick = () => {
       dismiss();
+      if (pendingOffer) {
+        const p = pendingOffer;
+        showTranscribeOffer(p.offer, p.url, p.videoId);
+        return;
+      }
       if (!isError && lastPayload) showResult(lastPayload, true);
     };
     document.body.appendChild(el);
     setTimeout(dismiss, isError ? 12000 : 20000);
   }
 
+  // "" means the server couldn't size this video, which is different from "quick".
+  // Quoting the smallest possible figure for a video of unknown length would be a
+  // promise we have no basis for.
   function fmtEstimate(seconds) {
     const secs = Number(seconds) || 0;
+    if (secs <= 0) return "";
     // Rounding first would make 30 seconds "about a minute", since JS rounds .5 up.
     if (secs < 60) return "under a minute";
     const mins = Math.round(secs / 60);
@@ -717,26 +765,35 @@
   function showTranscribeOffer(offer, url, videoId) {
     if (!host) mount();
     clearTimers();
+    pendingOffer = null;
     const c = root.querySelector(".content");
     if (!offer || offer.installed === false) {
       const hint = (offer && offer.install_hint) || "pipx inject youtube-tldw faster-whisper";
       c.innerHTML = `
-        <div class="status err">
+        <div class="status err" role="status" aria-live="polite">
           <p>This video has no subtitles or auto-captions. TL;DW can transcribe the
           audio locally instead, but that needs Whisper, which isn't installed yet.</p>
-          <p>Install it, then restart <code>tldw serve</code>:</p>
+          <p>Install it, then restart <code>tldw serve</code> and click TL;DW again:</p>
           <pre class="installhint">${esc(hint)}</pre>
+          <p>If you installed tldw with pip rather than pipx, use
+          <code>pip install faster-whisper</code> instead.</p>
         </div>`;
       return;
     }
+    const estimate = fmtEstimate(offer.estimate_s);
+    const howLong = estimate
+      ? `that takes roughly <strong>${esc(estimate)}</strong>`
+      : "its length isn't known, so this could take a while";
     c.innerHTML = `
-      <div class="status">
+      <div class="status" role="status" aria-live="polite">
         <p>This video has no subtitles or auto-captions.</p>
         <p>TL;DW can transcribe the audio on your own machine instead. For this
-        video that takes <strong>${esc(fmtEstimate(offer.estimate_s))}</strong>,
-        and the transcript is kept so it only happens once.</p>
+        video ${howLong}, and it will keep a CPU busy while it runs. The
+        transcript is kept, so it only happens once.</p>
+        <p class="hint">The first transcription also downloads a one-off
+        ${esc(offer.model || "speech")} model (a few hundred MB).</p>
         <div class="audiorow">
-          <button class="transcribe">Transcribe the audio</button>
+          <button class="transcribe" aria-label="Transcribe this video's audio locally">Transcribe the audio</button>
         </div>
       </div>`;
     const btn = c.querySelector(".transcribe");
@@ -1842,6 +1899,9 @@
         if (lastProgress) {
           updateProgress(lastProgress.message, lastProgress.percent, lastProgress.creep);
         }
+        // showLoading() rebuilt .content from scratch; without this an eight-minute
+        // job becomes uncancellable simply because the panel was closed once.
+        if (txLive) addStopControl(txLive.url);
         applyWidth();
       } else startSummarize(msg.url, msg.videoId);
     } else if (msg.type === "TLDW_ERROR") showError(msg.error);

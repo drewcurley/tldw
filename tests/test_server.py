@@ -1538,3 +1538,33 @@ def test_stopping_needs_a_token(srv):
     with pytest.raises(urllib.error.HTTPError) as e:
         urllib.request.urlopen(req, timeout=5)
     assert e.value.code == 401
+
+
+def test_the_server_announces_a_transcription_before_waiting_on_it(srv, monkeypatch):
+    """The panel can't infer this: on "always" it never asked to transcribe, and
+    after a close/re-open it has no memory of having done so. Without the event
+    there is no stop button and the panel's own timer fires mid-run."""
+    _, port = srv
+    _captionless(monkeypatch)
+    from youtube_tldw.transcript import Cue
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video",
+                        lambda vid, wd, **k: [Cue(0, 900, "spoken")])
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                 "whisper": "always"}, _auth())
+    announced = next(e for e in events if e["type"] == "transcribing")
+    assert announced["video_id"] == "dQw4w9WgXcQ"
+    assert announced["estimate_s"] > 0
+    assert _kinds(events).index("transcribing") < len(events) - 1
+
+
+def test_a_video_of_unknown_length_is_not_quoted_an_estimate(srv, monkeypatch):
+    """yt-dlp reports 0 when it doesn't know. Quoting that would promise "under a
+    minute" for a video of any length, and it would slip past the ceiling."""
+    _, port = srv
+    _captionless(monkeypatch, duration_ms=0)
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                 "whisper": "ask"}, _auth())
+    offer = next(e for e in events if e["type"] == "needs_transcription")
+    assert offer["estimate_s"] == 0        # the client renders this as "unknown"

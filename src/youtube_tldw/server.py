@@ -921,7 +921,12 @@ class _Handler(BaseHTTPRequestHandler):
         # supplied: a client claiming a three-hour video is sixty seconds long must
         # not be able to talk us into transcribing it.
         ceiling = _max_transcribe_ms()
-        if meta.duration_ms > ceiling:
+        # yt-dlp reports 0 when it doesn't know. Quoting that as an estimate would
+        # promise "under a minute" for a video of any length, and comparing it
+        # against the ceiling would wave through the very videos we can't size.
+        if not meta.duration_ms:
+            estimate = 0
+        elif meta.duration_ms > ceiling:
             emit({"type": "error", "status": 413, "error":
                   f"This video is {format_length(meta.duration_ms)} long and has no "
                   f"captions. Transcribing its audio is limited to "
@@ -940,6 +945,12 @@ class _Handler(BaseHTTPRequestHandler):
             return None
 
         job = _start_transcription(meta, model)
+        # Say so explicitly. The panel cannot infer this from its own request: on
+        # "always" it never asked to transcribe, and after the panel is closed and
+        # re-opened it has no memory of having done so. Both cases need a stop
+        # button and a timeout measured in minutes.
+        emit({"type": "transcribing", "video_id": meta.video_id,
+              "estimate_s": job["progress"]["estimate_s"]})
         # Reporting progress writes to the socket. If the client has gone, that
         # raises and this request ends -- while the job carries on and still caches
         # what it produces, which is the whole reason it doesn't live in here.

@@ -359,7 +359,10 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
   check("under a minute reads as words", fmtEstimate(30), "under a minute");
   check("one minute is singular", fmtEstimate(60), "about a minute");
   check("a 45-minute video reads in minutes", fmtEstimate(490), "about 8 minutes");
-  check("a missing estimate still reads", fmtEstimate(undefined), "under a minute");
+  // An unknown length is not "quick". Quoting the smallest possible figure for a
+  // video we couldn't size would be a promise with nothing behind it.
+  check("an unknown length is not quoted as a time", fmtEstimate(undefined), "");
+  check("...nor is a zero estimate", fmtEstimate(0), "");
 
   check("accepting the offer re-runs with the transcribe flag",
     /startSummarize\(url, videoId, false, true\)/.test(panel), true);
@@ -371,8 +374,24 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
     /esc\(hint\)/.test(panel), true);
 
   // An eight-minute job the user cannot interrupt is a trap.
-  check("a transcription gets a stop control",
-    /if \(transcribe\) addStopControl\(url\)/.test(panel), true);
+  // The panel cannot infer this from its own request: on "always" it never asked
+  // to transcribe, and after a close/re-open it has no memory of having done so.
+  check("the server announces the transcription",
+    /m\.type === "transcribing"/.test(panel), true);
+  check("...which is what adds the stop control",
+    /txLive = \{ url \}[\s\S]{0,120}addStopControl\(url\)/.test(panel), true);
+  check("re-opening the panel mid-run restores it",
+    /if \(txLive\) addStopControl\(txLive\.url\)/.test(panel), true);
+  check("...and the long run gets a matching safety timer",
+    /m\.type === "transcribing"[\s\S]{0,600}safetyTimer = setTimeout/.test(panel),
+    true);
+  check("an offer while the panel is closed does not reopen it",
+    /if \(backgrounded\) \{[\s\S]{0,200}endBackground\([\s\S]{0,80}return;/.test(panel),
+    true);
+  check("...it is kept and shown when they come back",
+    /pendingOffer = \{ offer: m\.offer, url, videoId \}/.test(panel), true);
+  check("the stop button is labelled like every other control here",
+    /stoptx[\s\S]{0,200}setAttribute\("aria-label"/.test(panel), true);
   check("stopping travels over the live port, not a fresh message",
     /port\.postMessage\(\{ type: "stopTranscribe", url \}\)/.test(panel), true);
   check("the panel's own safety timer does not fire mid-transcription",
