@@ -60,6 +60,29 @@ _seg_progress: dict = {}
 # - Two requests for the same video must produce one job, not two.
 _tx_jobs: dict = {}             # video_id -> job dict, while a transcription runs
 _tx_permit = threading.Semaphore(1)
+_AUDIO_TMP_PREFIX = "youtube-tldw-audio-"
+
+
+def sweep_stale_audio() -> int:
+    """Remove audio temp directories left behind by an earlier run.
+
+    The job cleans up after itself, but its thread is a daemon: Ctrl-C at the wrong
+    moment kills it at interpreter exit without unwinding, stranding up to 300MB per
+    interrupted run. Nothing else ever collects those, so `tldw serve` does it on
+    the way up.
+    """
+    import shutil
+    import tempfile
+    removed = 0
+    try:
+        root = Path(tempfile.gettempdir())
+        for stale in root.glob(_AUDIO_TMP_PREFIX + "*"):
+            if stale.is_dir():
+                shutil.rmtree(stale, ignore_errors=True)
+                removed += 1
+    except OSError:
+        pass
+    return removed
 
 WHISPER_POLICIES = ("off", "ask", "always")
 DEFAULT_WHISPER_POLICY = "ask"
@@ -73,8 +96,20 @@ TRANSCRIBE_SLACK = 3.0
 TRANSCRIBE_FLOOR_S = 300.0
 
 
+def _wait_budget(job) -> float:
+    """How long a request will narrate a job before giving up on it.
+
+    Deliberately longer than the job's own budget: a job may be queued behind
+    another before it starts, and giving up here says nothing about the job, which
+    carries on and caches its result either way.
+    """
+    return (job.get("budget_s") or TRANSCRIBE_FLOOR_S) * 2 + 300.0
+
+
 def _max_transcribe_ms() -> int:
     configured = config.get("whisper_max_minutes")
+    if isinstance(configured, bool):      # int(True) == 1: a one-minute ceiling
+        return MAX_TRANSCRIBE_MS
     try:
         minutes = int(configured)
     except (TypeError, ValueError):
@@ -85,10 +120,14 @@ def _max_transcribe_ms() -> int:
 def _whisper_policy(body):
     """How this request wants captionless videos handled, or False after a 400.
 
-    Absent means "ask": an extension older than this feature sends no such field,
-    and the same is true of anyone who has never opened Options. An unrecognized
-    value is refused rather than quietly defaulted, the way _model does -- it
-    decides whether we spend minutes of someone's CPU.
+    Absent means "off". An extension that knows about this always sends the field,
+    defaulting it client-side, so an absent one is a client that has no way to
+    render the offer -- it would meet `needs_transcription` with "the summary
+    stream ended unexpectedly" instead of the clear 422 it used to get. Silence is
+    therefore the old behaviour, exactly.
+
+    An unrecognized value is refused rather than quietly defaulted, the way _model
+    does -- it decides whether we spend minutes of someone's CPU.
 
     A server-side `whisper` config key pins the answer regardless of what any
     client sends, so "off" can be a property of the machine and not a preference
@@ -99,7 +138,7 @@ def _whisper_policy(body):
         return pinned
     value = body.get("whisper") if isinstance(body, dict) else None
     if value is None:
-        return DEFAULT_WHISPER_POLICY
+        return "off"
     if isinstance(value, str) and value in WHISPER_POLICIES:
         return value
     return None
@@ -108,18 +147,25 @@ def _whisper_policy(body):
 def _tx_progress(video_id: str):
     """What a running transcription has published, or None if none is running."""
     with _cache_lock:
-        job = _tx_jobs.get(video_id)
-        return dict(job["progress"]) if job else None
+        for (vid, _model), job in _tx_jobs.items():
+            if vid == video_id:
+                return dict(job["progress"])
+        return None
 
 
 def _stop_transcription(video_id: str) -> bool:
-    """Ask a running transcription to stop. True if there was one."""
+    """Ask this video's transcription to stop. True if there was one.
+
+    Keyed on the video rather than the model: whoever presses stop means "the one
+    running for this video", not one of several it could have been.
+    """
+    stopped = False
     with _cache_lock:
-        job = _tx_jobs.get(video_id)
-        if not job:
-            return False
-        job["cancel"].set()
-        return True
+        for (vid, _model), job in _tx_jobs.items():
+            if vid == video_id:
+                job["cancel"].set()
+                stopped = True
+    return stopped
 
 
 def _start_transcription(meta, model: str):
@@ -131,24 +177,36 @@ def _start_transcription(meta, model: str):
     not anyone is still listening.
     """
     vid = meta.video_id
+    key = (vid, model)
+    estimate = whisper_transcribe.estimate_seconds(meta.duration_ms, model)
+    # A video of unknown length still needs a finite budget, and the floor would
+    # kill it after five minutes of saturated CPU. Size it as the longest video we
+    # would have accepted.
+    budget_basis = estimate or whisper_transcribe.estimate_seconds(
+        _max_transcribe_ms(), model)
     with _cache_lock:
-        existing = _tx_jobs.get(vid)
-        if existing:
+        existing = _tx_jobs.get(key)
+        # Joining a job that has already given up would hand this caller the
+        # previous caller's failure -- a second click failing for the first
+        # click's reason.
+        if existing and not existing["cancel"].is_set() and not existing["error"]:
             return existing
         job = {
             "event": threading.Event(),
             "cancel": threading.Event(),
             "progress": {"message": "waiting for a free transcription slot...",
                          "percent": 0.0,
-                         "estimate_s": whisper_transcribe.estimate_seconds(
-                             meta.duration_ms, model)},
+                         "estimate_s": estimate},
             "error": None,
+            "budget_s": max(TRANSCRIBE_FLOOR_S, budget_basis * TRANSCRIBE_SLACK),
+            "status": 500,          # overwritten from the exception's own type
+            "cancelled": False,
             "cues": None,
             "meta": meta,
             "model": model,
             "started": time.monotonic(),
         }
-        _tx_jobs[vid] = job
+        _tx_jobs[key] = job
 
     def _publish(message, percent=None):
         with _cache_lock:
@@ -159,16 +217,20 @@ def _start_transcription(meta, model: str):
     def _run():
         import shutil
         import tempfile
-        workdir = Path(tempfile.mkdtemp(prefix="youtube-tldw-audio-"))
+        workdir = Path(tempfile.mkdtemp(prefix=_AUDIO_TMP_PREFIX))
         try:
             # One transcription at a time, machine-wide. A second video waits here
             # rather than fighting the first one for cores.
-            _tx_permit.acquire()
+            # Wait for the permit *and* watch for a stop: acquiring blind means a
+            # cancel is accepted and then ignored for as long as the job ahead
+            # runs, which can be the better part of an hour.
+            while not _tx_permit.acquire(timeout=0.5):
+                if job["cancel"].is_set():
+                    raise _Cancelled("Transcription cancelled.")
             try:
                 if job["cancel"].is_set():
-                    raise TldrError("Transcription cancelled.")
-                budget = max(TRANSCRIBE_FLOOR_S,
-                             job["progress"]["estimate_s"] * TRANSCRIBE_SLACK)
+                    raise _Cancelled("Transcription cancelled.")
+                budget = job["budget_s"]
                 cues = whisper_transcribe.transcribe_video(
                     vid, workdir,
                     on_progress=_publish,
@@ -184,8 +246,19 @@ def _start_transcription(meta, model: str):
             job["cues"] = cues
             print(f"  transcribed {vid} from audio: {len(cues)} cues "
                   f"in {time.monotonic() - job['started']:.0f}s", flush=True)
+        except _Cancelled as exc:
+            job["error"], job["cancelled"], job["status"] = str(exc), True, 499
+        except ImportError as exc:
+            # A half-installed faster-whisper passes find_spec and fails here. That
+            # is the likeliest real-world failure, so it says what to do about it.
+            job["error"] = ("Whisper is installed but could not be loaded. Try "
+                            f"reinstalling it: {whisper_transcribe.INSTALL_HINT}")
+            job["status"] = 500
+            print(f"  whisper import failed: {exc!r}", flush=True)
         except TldrError as exc:
             job["error"] = str(exc)
+            job["status"] = next(
+                (st for cls, st in _STATUS.items() if isinstance(exc, cls)), 500)
         except Exception as exc:
             job["error"] = "Transcribing this video failed unexpectedly."
             print(f"  transcription error: {exc!r}", flush=True)
@@ -193,9 +266,16 @@ def _start_transcription(meta, model: str):
             shutil.rmtree(workdir, ignore_errors=True)
             job["event"].set()
             with _cache_lock:
-                _tx_jobs.pop(vid, None)
+                _tx_jobs.pop(key, None)
 
-    threading.Thread(target=_run, daemon=True, name=f"tldw-transcribe-{vid}").start()
+    try:
+        threading.Thread(target=_run, daemon=True,
+                         name=f"tldw-transcribe-{vid}").start()
+    except Exception:
+        with _cache_lock:
+            _tx_jobs.pop(key, None)
+        job["error"] = "Could not start transcribing this video."
+        job["event"].set()
     return job
 
 
@@ -389,6 +469,10 @@ ASK_TIMEOUT = 300.0           # one answer; the transcript is already in hand
 PREVIEW_TEXT = "Hi — this is how your T L D W summaries will sound."
 _preview_cache: dict[str, bytes] = {}   # voice model -> mp3 (13 voices, ~40KB each)
 _preview_lock = threading.Lock()
+class _Cancelled(TldrError):
+    """A stop the user asked for, as distinct from something going wrong."""
+
+
 MAX_CONCURRENCY = 2
 REQUEST_TIMEOUT = 120.0   # text summarize budget
 SEGMENTS_TIMEOUT = 300.0  # segment selection needs structured JSON — allow more time
@@ -545,6 +629,36 @@ def _page_transcript(body, url: str):
     return meta, cues
 
 
+def _preferred_transcript(body, url: str):
+    """The best transcript already in hand: real captions ahead of audio."""
+    cached = _cached_transcript(url)
+    vid = _vid_of(url)
+    if cached and vid and _cache_source(vid).startswith("audio:"):
+        from_page = _page_transcript(body, url)
+        if from_page:
+            return from_page
+    return cached or _page_transcript(body, url)
+
+
+def _audio_source(model: str) -> str:
+    return f"audio:{model}"
+
+
+def _effective_source(video_id: str) -> str:
+    """The transcript source this request would actually use.
+
+    A cached `audio:small` entry is not what a server now configured for `medium`
+    would produce. Saying so here is what makes both the transcript lookup and the
+    summary lookup miss, so changing whisper_model gets you the better transcript
+    instead of a fortnight of the old one.
+    """
+    source = _cache_source(video_id)
+    if not source.startswith("audio:"):
+        return source
+    wanted = _audio_source(whisper_transcribe.resolve_model())
+    return source if source == wanted else wanted
+
+
 def _cached_transcript(url: str):
     """(meta, cues) for this video if we already have them, else None.
 
@@ -553,7 +667,12 @@ def _cached_transcript(url: str):
     thing most likely to get the machine rate-limited.
     """
     vid = _vid_of(url)
-    return _cache_get(vid, touch=True) if vid else None
+    if not vid:
+        return None
+    source = _cache_source(vid)
+    if source.startswith("audio:") and source != _effective_source(vid):
+        return None        # made by a different Whisper model; make it again
+    return _cache_get(vid, touch=True)
 
 
 def _vid_of(url: str) -> str:
@@ -642,6 +761,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             body = self._read_body()
             if body is None:
+                return
+            if not isinstance(body, dict):
+                self._send_json(400, {"error": "expected a JSON object"})
                 return
             try:
                 vid = canonical_video_id(str(body.get("url") or body.get("video_id")))
@@ -819,7 +941,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if vid and not refresh:
             hit = txcache.get_summary(_summary_key(vid, ratio,
-                                                   _cache_source(vid)))
+                                                   _effective_source(vid)))
             if hit:
                 tlog(f"cached summary for {vid} (no model call)")
                 emit({"type": "meta", "video_id": hit.get("video_id", vid),
@@ -925,6 +1047,9 @@ class _Handler(BaseHTTPRequestHandler):
         # promise "under a minute" for a video of any length, and comparing it
         # against the ceiling would wave through the very videos we can't size.
         if not meta.duration_ms:
+            # yt-dlp reports 0 when it doesn't know. We can neither quote a figure
+            # nor let it slip the cap, so it is budgeted as though it were a
+            # maximum-length video and offered without a number.
             estimate = 0
         elif meta.duration_ms > ceiling:
             emit({"type": "error", "status": 413, "error":
@@ -945,22 +1070,48 @@ class _Handler(BaseHTTPRequestHandler):
             return None
 
         job = _start_transcription(meta, model)
+        model = job["model"]        # we may have joined someone else's run
         # Say so explicitly. The panel cannot infer this from its own request: on
         # "always" it never asked to transcribe, and after the panel is closed and
         # re-opened it has no memory of having done so. Both cases need a stop
         # button and a timeout measured in minutes.
         emit({"type": "transcribing", "video_id": meta.video_id,
               "estimate_s": job["progress"]["estimate_s"]})
-        # Reporting progress writes to the socket. If the client has gone, that
-        # raises and this request ends -- while the job carries on and still caches
-        # what it produces, which is the whole reason it doesn't live in here.
-        while not job["event"].wait(0.5):
-            published = _tx_progress(meta.video_id)
-            if published:
-                progress(published["message"],
-                         round(10 + published["percent"] * 0.6, 1))
+        # Waiting is not work, and holding a general request slot for the length of
+        # a transcription would 429 every captioned summarize, every question and
+        # every stop -- which is the starvation that putting the job outside the
+        # request was meant to avoid in the first place.
+        self.server.sem.release()
+        gone = False
+        try:
+            deadline = time.monotonic() + _wait_budget(job)
+            while not job["event"].wait(0.5):
+                if time.monotonic() > deadline:
+                    emit({"type": "error", "status": 504, "error":
+                          "Transcribing this video is taking longer than expected. "
+                          "It may still finish; try again in a few minutes."})
+                    return None
+                if gone:
+                    continue        # the job runs on; we just stop narrating it
+                published = _tx_progress(meta.video_id)
+                if not published:
+                    continue
+                try:
+                    progress(published["message"],
+                             round(10 + published["percent"] * 0.6, 1))
+                except OSError:
+                    # The client hung up. That is not a failure of the job, which
+                    # keeps running and still caches what it produces -- and it is
+                    # not something to spray a traceback over the server log for.
+                    gone = True
+        finally:
+            # Re-taken before anything else happens: do_POST's finally releases it.
+            self.server.sem.acquire()
+        if gone:
+            return None
         if job["error"]:
-            emit({"type": "error", "status": 500, "error": job["error"]})
+            emit({"type": "error", "status": job.get("status") or 500,
+                  "error": job["error"]})
             return None
         if not job["cues"]:
             emit({"type": "error", "status": 500,
@@ -1282,9 +1433,10 @@ class _Handler(BaseHTTPRequestHandler):
                     # subtitles" is the wrong story for a video that was summarized
                     # from audio and has since aged out of the cache.
                     raise NoTranscriptError(
-                        "The transcript for this video is no longer cached, and the "
-                        "video has no subtitles to re-fetch. Summarize it again to "
-                        "rebuild the transcript, then ask."
+                        "This video has no subtitles, so there's no transcript to "
+                        "answer from. If it was summarized from its audio, that "
+                        "transcript has since expired -- summarize it again to "
+                        "rebuild it, then ask."
                     ) from None
                 _cache_put(vid, meta, cues)
             if gone.is_set():
@@ -1403,8 +1555,12 @@ def serve(host: str = "127.0.0.1", port: int = 8765,
             "API billing — see docs/reviews/PLAN-extension.md."
         )
     token, persisted = load_or_create_token(token)
+    stale = sweep_stale_audio()
     httpd = _Server((host, port), token, allow_origin)
     print(f"tldw serve listening on http://{host}:{port}", flush=True)
+    if stale:
+        print(f"  (cleared {stale} leftover audio temp director"
+              f"{'y' if stale == 1 else 'ies'} from an interrupted run)")
     print(f"  token: {token}")
     if persisted:
         print(f"  (saved to {TOKEN_FILE} — stable across restarts; configure the "

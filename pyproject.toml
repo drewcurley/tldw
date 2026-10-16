@@ -23,3 +23,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# This project does its work in threads -- the HTTP handlers, the segment
+# prefetch, the transcription job. An assertion that fires inside one of those
+# only raises a warning, so a guard like `lambda: pytest.fail(...)` passed as a
+# monkeypatched callable would be silently decorative. Four of them were.
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+]

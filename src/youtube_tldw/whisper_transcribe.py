@@ -81,6 +81,7 @@ def resolve_model() -> str:
     return DEFAULT_MODEL
 
 
+DOWNLOAD_TIMEOUT = 600.0
 MAX_AUDIO_BYTES = 300 * 1024 * 1024   # ~5 hours of opus; a muxed video blows past it
 MAX_CUES = 50_000
 MAX_CUE_CHARS = 1_000
@@ -98,7 +99,8 @@ def estimate_seconds(duration_ms: int, model_size: str | None = None) -> int:
     return max(1, int((duration_ms / 1000.0) / factor))
 
 
-def download_audio(video_id: str, workdir: Path, *, timeout: float = 600) -> Path:
+def download_audio(video_id: str, workdir: Path, *,
+                   timeout: float = DOWNLOAD_TIMEOUT) -> Path:
     """Download video_id's audio into workdir and return the file.
 
     Bounded deliberately, because unlike every other yt-dlp call in this project
@@ -184,10 +186,17 @@ def transcribe(
 
     log = on_progress or (lambda _m, _p=None: None)
     cancelled = should_cancel or (lambda: False)
+    if cancelled():
+        raise TldrError("Transcription cancelled.")
     size_label = _MODEL_SIZES.get(model_size, "?")
     log(f"loading Whisper '{model_size}' model "
         f"({size_label} -- downloads on first use)...", None)
 
+    # The first use of a model downloads it from Hugging Face. That happens inside
+    # the constructor below, where neither the cancel check nor the deadline can
+    # reach it, so a stalled connection would hold the transcription permit for the
+    # life of the process. A per-request timeout turns that into a failure.
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     model = WhisperModel(
         model_size,
@@ -243,7 +252,8 @@ def transcribe(
     # Every other cue producer ends here. Span maths and the numbered cue listing
     # assume sorted, non-overlapping cues; Whisper segments are usually already in
     # order, but "usually" is not the contract the rest of the code is written to.
-    cues = normalize(cues)
+    cues = normalize(cues, empty_message=(
+        "Whisper produced no usable text -- the audio may be silent or inaudible."))
     log(f"transcription complete -- {len(cues)} segments", 100)
     return cues
 
@@ -266,9 +276,18 @@ def transcribe_video(
     require_whisper()
     log = on_progress or (lambda _m, _p=None: None)
     model = model_size or resolve_model()
+    if should_cancel and should_cancel():
+        raise TldrError("Transcription cancelled.")
     log(f"downloading audio for transcription ({_MODEL_SIZES.get(model, '?')} "
         f"model: {model})...", None)
-    audio_path = download_audio(video_id, workdir)
+    # Bounded by whatever is left of the whole-run budget, so the download can't
+    # spend the entire allowance and leave nothing for the transcription. (A stop
+    # pressed during the download takes effect when it returns -- yt-dlp is a
+    # subprocess and this is the honest limit of what a flag can do.)
+    timeout = DOWNLOAD_TIMEOUT
+    if deadline is not None:
+        timeout = max(30.0, min(timeout, deadline - time.monotonic()))
+    audio_path = download_audio(video_id, workdir, timeout=timeout)
     if should_cancel and should_cancel():
         raise TldrError("Transcription cancelled.")
     return transcribe(audio_path, model, on_progress=on_progress,

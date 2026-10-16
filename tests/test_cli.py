@@ -250,3 +250,99 @@ def test_no_transcript_aborts_cleanly(monkeypatch, tmp_path, capsys):
     code = cli.main([URL, "--mode", "text", "--output-dir", str(tmp_path)])
     assert code == 1
     assert "no subtitles" in capsys.readouterr().err
+
+
+# --- the CLI's captionless path ------------------------------------------------
+#
+# Criterion 16: CLI behaviour unchanged, with the orchestration shared with the
+# server rather than written twice. Nothing covered this before, so "unchanged"
+# was an assertion rather than a fact.
+
+def test_cli_without_the_flag_still_refuses_a_captionless_video(monkeypatch):
+    from youtube_tldw import NoTranscriptError, cli
+    from youtube_tldw import metadata as md
+    meta = md.VideoMeta("dQw4w9WgXcQ", "T", "C", 600_000, {}, {})
+    monkeypatch.setattr(cli.md, "fetch_metadata", lambda vid: meta)
+    monkeypatch.setattr(cli.md, "choose_track",
+                        lambda m, l: (_ for _ in ()).throw(NoTranscriptError("none")))
+    monkeypatch.setattr(cli.wt, "transcribe_video",
+                        lambda *a, **k: pytest.fail("transcribed without the flag"))
+    with pytest.raises(NoTranscriptError):
+        cli._get_cues("dQw4w9WgXcQ", "en", Path("/tmp"), whisper_fallback=False)
+
+
+def test_cli_uses_the_same_orchestration_as_the_server(monkeypatch, tmp_path):
+    """Both callers go through transcribe_video, so the download-then-transcribe
+    sequence exists in one place."""
+    from youtube_tldw import NoTranscriptError, cli
+    from youtube_tldw import metadata as md
+    from youtube_tldw.transcript import Cue
+    meta = md.VideoMeta("dQw4w9WgXcQ", "T", "C", 600_000, {}, {})
+    monkeypatch.setattr(cli.md, "fetch_metadata", lambda vid: meta)
+    monkeypatch.setattr(cli.md, "choose_track",
+                        lambda m, l: (_ for _ in ()).throw(NoTranscriptError("none")))
+    monkeypatch.setattr(cli.wt, "require_whisper", lambda: None)
+    monkeypatch.setattr(cli.wt, "resolve_model", lambda: "small")
+    calls = []
+
+    def fake(video_id, workdir, **kw):
+        calls.append((video_id, kw.get("model_size")))
+        return [Cue(0, 900, "spoken words")]
+
+    monkeypatch.setattr(cli.wt, "transcribe_video", fake)
+    got_meta, cues = cli._get_cues("dQw4w9WgXcQ", "en", tmp_path,
+                                   whisper_fallback=True)
+    assert calls == [("dQw4w9WgXcQ", "small")]
+    assert [c.text for c in cues] == ["spoken words"]
+    assert got_meta is meta
+
+
+def test_cli_quotes_an_estimate_from_the_measured_rate(monkeypatch, tmp_path, capsys):
+    from youtube_tldw import NoTranscriptError, cli
+    from youtube_tldw import metadata as md
+    from youtube_tldw.transcript import Cue
+    meta = md.VideoMeta("dQw4w9WgXcQ", "T", "C", 45 * 60 * 1000, {}, {})
+    monkeypatch.setattr(cli.md, "fetch_metadata", lambda vid: meta)
+    monkeypatch.setattr(cli.md, "choose_track",
+                        lambda m, l: (_ for _ in ()).throw(NoTranscriptError("none")))
+    monkeypatch.setattr(cli.wt, "require_whisper", lambda: None)
+    monkeypatch.setattr(cli.wt, "resolve_model", lambda: "small")
+    monkeypatch.setattr(cli.wt, "transcribe_video",
+                        lambda *a, **k: [Cue(0, 900, "x")])
+    cli._get_cues("dQw4w9WgXcQ", "en", tmp_path, whisper_fallback=True)
+    assert "roughly 8 min" in capsys.readouterr().out
+
+
+# --- config values the server would silently ignore ---------------------------
+
+@pytest.mark.parametrize("args", [
+    ["set", "whisper", "of"],
+    ["set", "whisper", "yes"],
+    ["set", "whisper-max-minutes", "zero"],
+    ["set", "whisper-max-minutes", "0"],
+    ["set", "whisper-max-minutes", "-5"],
+    ["set", "whisper-model", "enormous"],
+])
+def test_a_setting_the_server_would_ignore_is_refused(args, monkeypatch, capsys):
+    """A pin that reads as set and does nothing is worse than a rejected one."""
+    from youtube_tldw import cli
+    written = []
+    monkeypatch.setattr(cli.config, "set_value",
+                        lambda k, v: written.append((k, v)))
+    assert cli._run_config(args) == 2
+    assert written == []
+    assert "error:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("args", [
+    ["set", "whisper", "off"], ["set", "whisper", "ask"],
+    ["set", "whisper", "always"], ["set", "whisper-max-minutes", "90"],
+    ["set", "whisper-model", "medium"],
+])
+def test_valid_settings_are_written(args, monkeypatch):
+    from youtube_tldw import cli
+    written = []
+    monkeypatch.setattr(cli.config, "set_value",
+                        lambda k, v: written.append((k, v)))
+    assert cli._run_config(args) == 0
+    assert len(written) == 1

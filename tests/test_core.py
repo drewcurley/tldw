@@ -57,3 +57,39 @@ def test_summarize_url_cleans_tempdir(monkeypatch, tmp_path):
     monkeypatch.setattr(core.tempfile, "mkdtemp", fake_mkdtemp)
     core.summarize_url("u")
     assert not d.exists()  # cleaned up in finally
+
+
+# --- the handoff the whole captionless path hangs off --------------------------
+
+def test_a_captionless_video_raises_with_its_metadata_attached(monkeypatch):
+    """Offering to transcribe needs the title, channel and a trusted duration, and
+    re-fetching them would be a second call on the rate-limited path.
+
+    This exercises the real fetch_transcript. Every server-level test stubs
+    summarize_url wholesale, so an exception handler that was itself broken --
+    NoTranscriptError wasn't imported, so the clause raised NameError and turned
+    every captionless video into a 500 -- passed the entire suite.
+    """
+    from youtube_tldw import NoTranscriptError, metadata as md
+    meta = md.VideoMeta("dQw4w9WgXcQ", "A Title", "A Channel", 600_000, {}, {})
+    monkeypatch.setattr(core.md, "fetch_metadata", lambda vid: meta)
+
+    def no_track(_meta, _lang):
+        raise NoTranscriptError("This video has no subtitles or auto-captions.")
+
+    monkeypatch.setattr(core.md, "choose_track", no_track)
+    with pytest.raises(NoTranscriptError) as caught:
+        core.fetch_transcript("dQw4w9WgXcQ")
+    assert caught.value.meta is meta
+    assert caught.value.meta.duration_ms == 600_000
+
+
+def test_a_captionless_video_is_still_a_NoTranscriptError_not_a_500(monkeypatch):
+    """The handler must not replace the typed error the status mapping relies on."""
+    from youtube_tldw import NoTranscriptError, TldrError, metadata as md
+    monkeypatch.setattr(core.md, "fetch_metadata",
+                        lambda vid: md.VideoMeta(vid, "T", "C", 1000, {}, {}))
+    monkeypatch.setattr(core.md, "choose_track",
+                        lambda m, l: (_ for _ in ()).throw(NoTranscriptError("none")))
+    with pytest.raises(TldrError):            # not NameError, not a bare Exception
+        core.fetch_transcript("dQw4w9WgXcQ")
