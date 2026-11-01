@@ -134,16 +134,21 @@ def _claude_process_opts(persist: bool) -> dict:
     """
     env = dict(os.environ)
     if persist:
-        env.pop("DISABLE_PROMPT_CACHING", None)
+        # Every variant: the CLI also has per-model switches (_OPUS, _SONNET...),
+        # and any one of them exported in the shell would turn Q&A caching off.
+        for name in [k for k in env if k.startswith("DISABLE_PROMPT_CACHING")]:
+            env.pop(name)
     else:
         env["DISABLE_PROMPT_CACHING"] = "1"
     # Created on every call, not once at startup: a cleaned ~/.cache would
-    # otherwise surface as "`claude` is not installed".
-    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+    # otherwise surface as "`claude` is not installed". If it can't be created at
+    # all (a root-owned ~/.cache), run from the current directory as before rather
+    # than failing every summary.
     try:
+        CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(CLAUDE_DIR, 0o700)
     except OSError:
-        pass
+        return {"env": env}
     return {"env": env, "cwd": str(CLAUDE_DIR)}
 
 
@@ -388,6 +393,7 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
 
     saw_delta = False
     saw_result = False
+    result_error = None
     completed = False
     killed = False
     try:
@@ -400,6 +406,14 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
                 u = usage.parse_usage(event, step)
                 u.resumed = bool(resume)
                 usage.record(u)
+                if event.get("is_error"):
+                    # The CLI reports failures -- not logged in, usage limit,
+                    # API overloaded part-way through -- as a result event too.
+                    # Treating that as an answer cached a half-written summary for
+                    # 14 days and served "Not logged in" as a Q&A reply.
+                    msg = event.get("result") or event.get("subtype") or "error"
+                    result_error = str(msg).strip()
+                    break
                 if on_meta:
                     on_meta({"session_id": u.session_id, "usage": u})
                 saw_result = True
@@ -429,11 +443,17 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
         with lock:
             state["drained"] = True        # from here on, the timer may not kill
         timer.cancel()
-        try:
-            proc.stdout.close()
-        except OSError:
-            pass
         if completed:
+            # Keep reading whatever follows the answer, rather than closing the pipe
+            # under a CLI that may still be writing: a persisted Q&A session is
+            # flushed as it exits, and a broken pipe then could cost the session.
+            def _drain_stdout():
+                try:
+                    for _ in proc.stdout:
+                        pass
+                except (OSError, ValueError):
+                    pass
+            threading.Thread(target=_drain_stdout, daemon=True).start()
             # Let it exit on its own. poll() can still read None while a finished
             # process is being reaped, and killing it then turned a clean exit into
             # a reported "failure".
@@ -443,7 +463,15 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
                 proc.kill()
                 killed = True
                 ret = proc.wait(timeout=5)
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
         else:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
             # Unwinding early — the consumer hung up (Stop), or something raised.
             # Kill now: waiting on a process that is still streaming would stall
             # the abort.
@@ -451,6 +479,9 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
             killed = True
             ret = proc.wait(timeout=5)
 
+    # The CLI's own error report wins over everything: it's the real reason.
+    if result_error is not None:
+        raise ClaudeError(f"`claude` failed: {result_error}")
     # A complete answer is a success, whatever exit code our own kill produced.
     if saw_result:
         return

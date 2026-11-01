@@ -2274,3 +2274,76 @@ def test_a_failure_is_never_remembered(srv, monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(TldrError("429")))
     _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
     assert server._captionless_meta == {}
+
+
+# --- build-review fixes ----------------------------------------------------------
+
+def test_a_prefetch_during_a_live_selection_doesnt_start_a_second(srv, monkeypatch):
+    """Play key moments, then Summarize: the summary's prefetch used to start a
+    second selection behind the live one."""
+    _, port = srv
+    meta, cues = _meta_cues()
+    server._cache_put("dQw4w9WgXcQ", meta, cues)
+    started, release, calls = threading.Event(), threading.Event(), []
+
+    def slow(url, ratio, lang, *, timeout, _prefetched=None, max_length_ms=None,
+             on_progress=None, on_segment_ready=None):
+        calls.append(1)
+        started.set()
+        release.wait(10)
+        return _prefetched[0], [{"start": 1.0, "end": 9.0, "label": "0:01"}]
+
+    monkeypatch.setattr(server.core, "select_segments", slow)
+    live = threading.Thread(target=lambda: _read_ndjson(
+        port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth(), path="/segments/stream"))
+    live.start()
+    assert started.wait(5)
+    server._start_seg_prefetch(meta, cues, None, None, txcache.CAPTIONS)
+    release.set()
+    live.join(10)
+    _wait_prefetch_idle()
+    assert len(calls) == 1
+
+
+def test_using_a_remembered_captionless_answer_doesnt_renew_it(srv, monkeypatch):
+    """Otherwise a video reopened every few minutes is never re-checked."""
+    _, port = srv
+    _captionless_counting(monkeypatch)
+    url = "https://youtu.be/dQw4w9WgXcQ"
+    _read_ndjson(port, {"url": url, "whisper": "off"}, _auth())
+    first_expiry = server._captionless_meta["dQw4w9WgXcQ"][0]
+    time.sleep(0.05)
+    _read_ndjson(port, {"url": url, "whisper": "off"}, _auth())
+    assert server._captionless_meta["dQw4w9WgXcQ"][0] == first_expiry
+
+
+def test_the_probe_reads_ratio_exactly_as_the_real_request_does(srv, monkeypatch):
+    _, port = srv
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post_json(port, "/summarize/cached",
+                   {"url": "https://youtu.be/dQw4w9WgXcQ", "ratio": 7}, _auth())
+    assert e.value.code == 400                     # out of range, like the stream
+    got = _post_json(port, "/summarize/cached",
+                     {"url": "https://youtu.be/dQw4w9WgXcQ", "ratio": "0.5"}, _auth())
+    assert got == {"type": "miss"}                 # coerced, not rejected
+
+
+def test_a_failing_startup_cleanup_never_stops_the_server(monkeypatch, capsys):
+    """Tidying up is never a reason not to serve."""
+    class FakeServer:
+        def __init__(self, *a, **k):
+            pass
+
+        def serve_forever(self, *a, **k):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    def broken():
+        raise PermissionError("voices dir not traversable")
+
+    monkeypatch.setattr(server, "_Server", FakeServer)
+    monkeypatch.setattr(server, "startup_hygiene", broken)
+    server.serve(token="t" * 20)                   # must not raise
+    assert "skipped startup cleanup" in capsys.readouterr().out

@@ -239,5 +239,5 @@ def test_served_rows_are_not_counted_as_model_calls(monkeypatch, tmp_path, capsy
     assert cli._run_usage(["--file", str(log)]) == 0
     out = capsys.readouterr().out
     assert "3 model call(s)" in out
-    assert "1 prefetched ($0.07), 1 on request, 2 played" in out
+    assert "1 prefetch call(s) ($0.07), 1 on request, 2 selection(s) played" in out
     assert "1 recorded before tracking began" in out

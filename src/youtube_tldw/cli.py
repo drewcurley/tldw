@@ -557,15 +557,17 @@ def _run_usage(argv: list[str]) -> int:
     # Key moments are prefetched after every summary whether or not anyone plays
     # them, and that prefetch is most of the spend. This is the number that says
     # whether it's worth it.
-    selections = [r for r in rows if r.get("step") == "segments"]
+    # Every selection call -- including a retry, a chunk of a long transcript, or
+    # the batch fallback after a stream -- so these are calls, not selections.
+    selections = [r for r in rows if str(r.get("step") or "").startswith("segments")]
     if selections or served:
         prefetched = [r for r in selections if r.get("trigger") == "prefetch"]
         requested = [r for r in selections if r.get("trigger") == "request"]
         untagged = len(selections) - len(prefetched) - len(requested)
         print()
-        print(f"key moments: {len(prefetched)} prefetched "
+        print(f"key moments: {len(prefetched)} prefetch call(s) "
               f"(${sum(float(r.get('cost_usd') or 0) for r in prefetched):.2f}), "
-              f"{len(requested)} on request, {len(served)} played"
+              f"{len(requested)} on request, {len(served)} selection(s) played"
               + (f" · {untagged} recorded before tracking began" if untagged else ""))
     print(f"\n(from {path or usage_mod.USAGE_FILE})")
     return 0
