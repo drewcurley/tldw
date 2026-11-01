@@ -674,6 +674,32 @@ def _preferred_transcript(body, url: str):
     return cached or _page_transcript(body, url)
 
 
+# video_id -> (expires_at, NoTranscriptError with its .meta): what a captionless
+# video looked like the last time YouTube was asked. Short-lived on purpose --
+# long enough to cover an offer and its acceptance, short enough that a video
+# which gains captions is noticed. Only an answer is kept, never a failure.
+_captionless_meta: dict = {}
+_CAPTIONLESS_TTL = 30 * 60
+
+
+def _captionless_put(video_id: str, exc) -> None:
+    with _cache_lock:
+        _captionless_meta[video_id] = (time.monotonic() + _CAPTIONLESS_TTL, exc)
+        _prune(_captionless_meta)
+
+
+def _captionless_get(video_id: str):
+    """A fresh copy of the remembered error (meta and message intact), or None."""
+    with _cache_lock:
+        entry = _captionless_meta.get(video_id)
+        if not entry or entry[0] <= time.monotonic():
+            return None
+        original = entry[1]
+    again = NoTranscriptError(str(original))
+    again.meta = original.meta
+    return again
+
+
 def _audio_source(model: str) -> str:
     return f"audio:{model}"
 
@@ -1025,12 +1051,21 @@ class _Handler(BaseHTTPRequestHandler):
 
         try:
             try:
-                summary = _summarize(_cached_transcript(url)
-                                     or _page_transcript(body, url))
+                prefetched = _cached_transcript(url) or _page_transcript(body, url)
+                known = _captionless_get(vid) if vid and prefetched is None else None
+                if known is not None:
+                    # Asked YouTube about this very video minutes ago -- typically
+                    # the offer whose acceptance this request is. Fetching its
+                    # metadata again is ~4s and a request to a rate-limited host
+                    # for an answer we already have.
+                    raise known
+                summary = _summarize(prefetched)
             except NoTranscriptError as exc:
                 # No caption track anywhere. The audio is still there, and it comes
                 # from an endpoint YouTube does serve.
                 meta = getattr(exc, "meta", None)
+                if meta is not None and vid:
+                    _captionless_put(vid, exc)
                 if policy == "off" or meta is None:
                     raise
                 produced = self._transcribe_fallback(meta, body, policy,
