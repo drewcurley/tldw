@@ -2197,3 +2197,77 @@ def test_a_bad_probe_is_a_400(srv, body):
     with pytest.raises(urllib.error.HTTPError) as e:
         _post_json(port, "/summarize/cached", body, _auth())
     assert e.value.code == 400
+
+
+# --- a captionless video's metadata, asked for once ----------------------------
+
+def _captionless_counting(monkeypatch):
+    """Like _captionless, but counts how often YouTube would have been asked."""
+    asked = []
+    meta = VideoMeta("dQw4w9WgXcQ", "No Captions", "Chan", 600_000, {}, {})
+
+    def fake(url, ratio, lang, *, timeout, max_chars, on_progress=None,
+             on_partial=None, _prefetched=None):
+        if _prefetched:
+            return _summary()
+        asked.append(url)
+        exc = NoTranscriptError("This video has no subtitles or auto-captions.")
+        exc.meta = meta
+        raise exc
+
+    monkeypatch.setattr(server.core, "summarize_url", fake)
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    return asked
+
+
+def test_accepting_the_offer_does_not_ask_youtube_again(srv, monkeypatch):
+    """The offer already fetched the metadata; the acceptance used to fetch it
+    again -- ~4s and a request to a rate-limited host."""
+    _, port = srv
+    asked = _captionless_counting(monkeypatch)
+    from youtube_tldw.transcript import Cue
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video",
+                        lambda vid, wd, **k: [Cue(0, 900, "spoken")])
+    url = "https://youtu.be/dQw4w9WgXcQ"
+    offer = _read_ndjson(port, {"url": url, "whisper": "ask"}, _auth())
+    assert "needs_transcription" in _kinds(offer)
+    accepted = _read_ndjson(port, {"url": url, "whisper": "ask", "transcribe": True},
+                            _auth())
+    assert accepted[-1]["type"] == "result"
+    assert len(asked) == 1
+
+
+def test_off_still_gets_the_original_message_from_the_remembered_answer(srv,
+                                                                        monkeypatch):
+    _, port = srv
+    asked = _captionless_counting(monkeypatch)
+    url = "https://youtu.be/dQw4w9WgXcQ"
+    first = _read_ndjson(port, {"url": url, "whisper": "off"}, _auth())
+    second = _read_ndjson(port, {"url": url, "whisper": "off"}, _auth())
+    assert len(asked) == 1
+    assert first[-1]["status"] == second[-1]["status"] == 422
+    assert first[-1]["error"] == second[-1]["error"]
+
+
+def test_the_remembered_answer_expires(srv, monkeypatch):
+    """Short-lived, so a video that gains captions is noticed."""
+    _, port = srv
+    asked = _captionless_counting(monkeypatch)
+    url = "https://youtu.be/dQw4w9WgXcQ"
+    _read_ndjson(port, {"url": url, "whisper": "off"}, _auth())
+    with server._cache_lock:
+        exp, exc = server._captionless_meta["dQw4w9WgXcQ"]
+        server._captionless_meta["dQw4w9WgXcQ"] = (time.monotonic() - 1, exc)
+    _read_ndjson(port, {"url": url, "whisper": "off"}, _auth())
+    assert len(asked) == 2
+
+
+def test_a_failure_is_never_remembered(srv, monkeypatch):
+    """Only an answer is kept. A 429 or a timeout must be retried, not cached."""
+    _, port = srv
+    from youtube_tldw import TldrError
+    monkeypatch.setattr(server.core, "summarize_url",
+                        lambda *a, **k: (_ for _ in ()).throw(TldrError("429")))
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
+    assert server._captionless_meta == {}
