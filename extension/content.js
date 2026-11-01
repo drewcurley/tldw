@@ -574,13 +574,16 @@
     requestActive = true;
     currentVideoId = videoId;
     backgrounded = false;
-    port = api.runtime.connect({ name: "tldw" });
+    const myPort = port = api.runtime.connect({ name: "tldw" });
     // Read the page's transcript, then ask for a summary: the flow as it has
     // always been, and what every miss falls back to.
     const summarizeFromPage = () => collectPageTranscript().then((page) => {
-      if (!requestActive) return;              // cancelled while we were reading
-      port.postMessage({ type: "summarize", url, videoId, refresh: !!refresh,
-                         page, transcribe: !!transcribe });
+      // Cancelled -- or superseded by a newer run, for another video -- while we
+      // were reading. Checking requestActive alone isn't enough: a newer run sets
+      // it again, and this video's transcript would go out on that run's request.
+      if (!requestActive || port !== myPort) return;
+      myPort.postMessage({ type: "summarize", url, videoId, refresh: !!refresh,
+                           page, transcribe: !!transcribe });
     });
     port.onMessage.addListener((m) => {
       if (!requestActive) return;
