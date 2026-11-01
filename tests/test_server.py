@@ -2087,3 +2087,113 @@ def test_every_way_a_selection_reaches_the_panel_is_counted(srv, monkeypatch):
     _read_ndjson(port, {"url": url}, _auth(), path="/segments/stream")    # cache
     served = [r["how"] for r in _usage_rows() if r.get("kind") == "segments_served"]
     assert served == ["live", "cache"]
+
+
+# --- asking for a cached summary before reading the page -------------------------
+#
+# The panel used to open YouTube's transcript panel (0.5-13s, plus a request to
+# YouTube) before anything checked whether the summary was already cached.
+
+def _post_json(port, path, body, headers):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                 data=json.dumps(body).encode(), method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.loads(r.read())
+
+
+def _summarize_once(port, monkeypatch, model):
+    monkeypatch.setattr(server.core, "summarize_url",
+                        lambda *a, **k: core.Summary(_summary().meta, _summary().result,
+                                                     2, _meta_cues()[1]))
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                 "model": model}, _auth())
+    assert events[-1]["type"] == "result"
+    return events[-1]
+
+
+@pytest.mark.parametrize("model", ["opus", "sonnet"])
+def test_a_cached_summary_is_found_without_the_page(srv, monkeypatch, model):
+    """Under the request's model: the key includes the backend fingerprint, so a
+    lookup outside that scope would quietly miss every time."""
+    _, port = srv
+    written = _summarize_once(port, monkeypatch, model)
+    monkeypatch.setattr(server.core, "summarize_url",
+                        lambda *a, **k: pytest.fail("summarized again"))
+    got = _post_json(port, "/summarize/cached",
+                     {"url": "https://youtu.be/dQw4w9WgXcQ", "model": model}, _auth())
+    assert got["type"] == "result" and got["cached"] is True
+    assert got["summary_md"] == written["summary_md"]
+    assert "stats" in got
+
+
+def test_the_probe_finds_exactly_what_the_real_request_would(srv, monkeypatch):
+    """Same key, not a look-alike: whatever /summarize/stream serves from cache,
+    the probe must find, and vice versa."""
+    _, port = srv
+    _summarize_once(port, monkeypatch, "opus")
+    stream = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                 "model": "opus"}, _auth())
+    probe = _post_json(port, "/summarize/cached",
+                       {"url": "https://youtu.be/dQw4w9WgXcQ", "model": "opus"}, _auth())
+    assert stream[-1].get("cached") is True and probe["type"] == "result"
+    assert stream[-1]["summary_md"] == probe["summary_md"]
+
+
+def test_a_summary_by_another_model_is_a_miss(srv, monkeypatch):
+    _, port = srv
+    _summarize_once(port, monkeypatch, "sonnet")
+    got = _post_json(port, "/summarize/cached",
+                     {"url": "https://youtu.be/dQw4w9WgXcQ", "model": "opus"}, _auth())
+    assert got == {"type": "miss"}
+
+
+def test_a_miss_fetches_and_starts_nothing(srv, monkeypatch):
+    """Read-only: the panel's own flow does the work on a miss."""
+    _, port = srv
+    monkeypatch.setattr(server.core, "fetch_transcript",
+                        lambda *a, **k: pytest.fail("fetched on a probe"))
+    monkeypatch.setattr(server.core, "summarize_url",
+                        lambda *a, **k: pytest.fail("summarized on a probe"))
+    started = _record_transcriptions(monkeypatch)
+    got = _post_json(port, "/summarize/cached",
+                     {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
+    assert got == {"type": "miss"}
+    assert started == []
+
+
+def test_a_hit_still_gets_key_moments_ready(srv, monkeypatch):
+    """What the cached path through /summarize/stream has always done."""
+    _, port = srv
+    _summarize_once(port, monkeypatch, "opus")
+    meta, cues = _meta_cues()
+    server._cache_put("dQw4w9WgXcQ", meta, cues)
+    seen = []
+    monkeypatch.setattr(server, "_start_seg_prefetch",
+                        lambda m, c, model=None, ratio=None, source=None:
+                        seen.append((model, ratio)))
+    _post_json(port, "/summarize/cached", {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                           "model": "opus", "segment_ratio": 0.25},
+               _auth())
+    assert seen == [("opus", 0.25)]
+
+
+def test_the_probe_needs_a_token(srv):
+    _, port = srv
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/summarize/cached",
+        data=json.dumps({"url": "https://youtu.be/dQw4w9WgXcQ"}).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=5)
+    assert e.value.code == 401
+
+
+@pytest.mark.parametrize("body", [{"url": "not a video"}, {}])
+def test_a_bad_probe_is_a_400(srv, body):
+    _, port = srv
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _post_json(port, "/summarize/cached", body, _auth())
+    assert e.value.code == 400

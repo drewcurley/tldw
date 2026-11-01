@@ -553,6 +553,15 @@
     } catch (_) {}
   }
 
+  // What the cache probe's answer means. A hit is a finished summary, delivered
+  // exactly as a streamed one would be. Anything else -- a miss, a 404 from an
+  // older server, an error -- means "do what we always did".
+  function probeOutcome(m) {
+    return m && m.hit && m.payload
+      ? { type: "result", payload: m.payload, cached: true }
+      : null;
+  }
+
   function startSummarize(url, videoId, refresh, transcribe) {
     // A new run abandons whatever the last one left connected (mount() no longer
     // does this, and it must not — see the comment there).
@@ -566,8 +575,20 @@
     currentVideoId = videoId;
     backgrounded = false;
     port = api.runtime.connect({ name: "tldw" });
+    // Read the page's transcript, then ask for a summary: the flow as it has
+    // always been, and what every miss falls back to.
+    const summarizeFromPage = () => collectPageTranscript().then((page) => {
+      if (!requestActive) return;              // cancelled while we were reading
+      port.postMessage({ type: "summarize", url, videoId, refresh: !!refresh,
+                         page, transcribe: !!transcribe });
+    });
     port.onMessage.addListener((m) => {
       if (!requestActive) return;
+      if (m.type === "probe") {
+        const hit = probeOutcome(m);
+        if (!hit) { summarizeFromPage(); return; }
+        m = hit;          // falls through to the ordinary result handling below
+      }
       if (m.type === "progress") {
         lastProgress = m;          // replayed if the panel is re-opened mid-run
         // Once the summary is on screen the loading bar is gone; don't redraw it.
@@ -623,13 +644,13 @@
       if (backgrounded) endBackground(msg, true);
       else showError(msg);
     });
-    // Gather from the page first, then ask the server. A second or so here saves
-    // the server a yt-dlp extraction that YouTube may refuse outright.
-    collectPageTranscript().then((page) => {
-      if (!requestActive) return;              // cancelled while we were reading
-      port.postMessage({ type: "summarize", url, videoId, refresh: !!refresh,
-                         page, transcribe: !!transcribe });
-    });
+    // Ask whether a summary already exists before reading the page. Reading it
+    // opens YouTube's transcript panel -- 0.5 to 13 seconds and a request to
+    // YouTube -- and used to happen even for a summary already in the cache. A
+    // refresh or an accepted transcription wants new work, so those go straight
+    // to the page as before.
+    if (refresh || transcribe) summarizeFromPage();
+    else port.postMessage({ type: "probeCache", url, videoId });
     // Heartbeat: the page never suspends, so pinging every 20s keeps the MV3 service
     // worker alive through a long (60s+) summarize that would otherwise be killed.
     pingTimer = setInterval(() => {
