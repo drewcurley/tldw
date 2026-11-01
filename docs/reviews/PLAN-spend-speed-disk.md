@@ -1,6 +1,6 @@
 # PLAN — spend less, wait less, keep less
 
-**Status: PLAN, amended after review — awaiting confirmation. No code written yet.**
+**Status: PLAN — reviewed; both reviewers' blockers cleared. Building.**
 
 Brief: "do whatever you think is best to improve speed, reduce token spend, and
 reduce disk clutter." Scope is those three things. Correctness findings from the
@@ -147,6 +147,12 @@ simplified. What changed and why is recorded under *Plan review* at the end.
    - `/summarize/stream` is unchanged, so old extensions are unaffected and an
      older server fails closed.
    - No token: reported straight away, instead of after the page read.
+   - Goes through `_guarded` (token, body limit, model scope) and the route
+     list. Without the model scope, `backend_fingerprint` makes every call miss.
+   - A hit carries `stats` like the stream does.
+   - A hit starts the key-moments prefetch exactly as today's cached-summary
+     path does. Item 3's new fingerprint means existing summaries have no
+     matching selection yet.
 7. **Captionless metadata cached for 30 minutes**, so accepting the
    transcription offer doesn't run `yt-dlp -J` again. Failures are not cached.
 8. **Watchdog on the `claude` stream.**
@@ -160,6 +166,9 @@ simplified. What changed and why is recorded under *Plan review* at the end.
      answers).
    - stderr is drained on a thread into a bounded buffer. Today >64 KB of
      stderr can block the child, which is a second way to hang forever.
+   - Precedence: a `result` seen wins over `timed_out`, and the read loop
+     **stops at the `result` event**. A CLI that hangs after answering no longer
+     holds the answer until the deadline.
    - The timer factory is injectable, so the race test is deterministic.
    - A resumed Q&A that *timed out* no longer retries.
 9. **Test teardown:** `poll_interval=0.05` in the `srv` fixture (~37s of ~50s
@@ -180,12 +189,18 @@ simplified. What changed and why is recorded under *Plan review* at the end.
     loudly.
 11. **Fixture rows removed from `usage.jsonl`: a one-time, manual operation, not
     shipped code.**
-    - Rule: `kind == "video"`, `video_id == "dQw4w9WgXcQ"`, and `video_ms` one
-      of the test durations. The real video is ~212 s.
-    - A dry run must count exactly 1,572, or it aborts.
-    - Owner-only backup that never overwrites; atomic replace.
-    - Only with no server running (none is) and only after item 10 has
-      merged, so the suite can't write them back.
+    - Rule: `kind == "video"`, `video_id == "dQw4w9WgXcQ"`, and `video_ms` one of
+      the four test durations (600,000, 1,000, 4,000, 10,000).
+    - Counted from the log, not from either review: those durations give
+      **1,570** rows. The other two rows for that id have `video_ms` 213,000.
+      That is the real video's length (3:33), and each sits beside one of the
+      two real summaries.
+    - The audit's "1,572" counted those two real rows. A dry run that must equal
+      1,572 would have aborted, and a looser rule would have deleted them.
+    - The dry run must equal **1,570** or it aborts.
+    - The backup is owner-only and never overwritten; the replace is atomic.
+    - Only with no server running, and only after item 10 has merged.
+
 12. **The transcript cache stops storing caption-URL maps.** They are only ever
     used on freshly fetched metadata. No compaction, TTL or prune changes:
     existing files age out on today's 14-day TTL.
@@ -201,8 +216,11 @@ simplified. What changed and why is recorded under *Plan review* at the end.
     - A voice's model file is touched when it is used to *speak*, not to
       preview.
     - `tldw cache clean` removes voices not spoken in 30 days, never the
-      default and never the most recently spoken. Pruning one costs at most a
-      re-download if you pick it again, never data.
+      default and never the most recently spoken.
+    - **Grace period:** a marker records when tracking began. Nothing is pruned
+      until tracking has run 30 days, because until then a file's timestamp is
+      its download date, not its last use.
+    - Pruning one costs at most a re-download if you pick it again, never data.
     - At most two voice models are kept loaded in memory.
 15. **`tldw cache`** reports tldw's disk use by area. It also lists Hugging
     Face's faster-whisper models (honouring `HF_HOME`/`HF_HUB_CACHE`), each
@@ -302,3 +320,11 @@ Warnings taken:
 - The chunked listing path.
 - `tldw usage` must not count served rows as calls.
 - No retry on a timed-out resumed Q&A.
+
+**Confirmation round:** Architect/Data — all three blockers CLEARED.
+Backend/SDET — PASS WITH ITEMS, all four blockers CLEARED. Their build notes are
+folded in above:
+- `/summarize/cached` uses auth and model scope, carries `stats`, and starts the
+  prefetch on a hit.
+- Watchdog precedence: a `result` ends the loop.
+- The voice grace period is restored.
