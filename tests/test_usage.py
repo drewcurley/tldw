@@ -217,3 +217,27 @@ def test_usage_report_breaks_cost_down_by_model(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "claude-opus-5 " in out            # the [1m] context suffix is folded
     assert "claude-sonnet-5" in out
+
+
+def test_served_rows_are_not_counted_as_model_calls(monkeypatch, tmp_path, capsys):
+    """A selection reaching the panel costs nothing and isn't a call; counting it
+    would inflate the totals and every per-step average."""
+    import json
+    from youtube_tldw import cli
+    log = tmp_path / "u.jsonl"
+    rows = [
+        {"ts": 1, "kind": "segments", "step": "segments", "trigger": "prefetch",
+         "cost_usd": 0.07, "video_id": "a"},
+        {"ts": 2, "kind": "segments", "step": "segments", "trigger": "request",
+         "cost_usd": 0.07, "video_id": "b"},
+        {"ts": 3, "kind": "segments", "step": "segments", "cost_usd": 0.12,
+         "video_id": "c"},                                  # from before tracking
+        {"ts": 4, "kind": "segments_served", "video_id": "a", "how": "cache"},
+        {"ts": 5, "kind": "segments_served", "video_id": "b", "how": "live"},
+    ]
+    log.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    assert cli._run_usage(["--file", str(log)]) == 0
+    out = capsys.readouterr().out
+    assert "3 model call(s)" in out
+    assert "1 prefetched ($0.07), 1 on request, 2 played" in out
+    assert "1 recorded before tracking began" in out

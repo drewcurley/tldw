@@ -28,6 +28,7 @@ HOME_PATHS = [
     ("youtube_tldw.usage", "USAGE_FILE", ".config/youtube-tldw/usage.jsonl"),
     ("youtube_tldw.txcache", "CACHE_DIR", ".cache/youtube-tldw/transcripts"),
     ("youtube_tldw.txcache", "SUMMARY_DIR", ".cache/youtube-tldw/summaries"),
+    ("youtube_tldw.txcache", "SEGMENT_DIR", ".cache/youtube-tldw/segments"),
     ("youtube_tldw.whisper_transcribe", "_CACHE_DIR", ".cache/youtube-tldw/whisper"),
     ("youtube_tldw.audio", "VOICE_DIR", ".cache/youtube-tldw/voices"),
     ("youtube_tldw.cli", "DEFAULT_OUTPUT", "Downloads/youtube-tldw/tldws"),

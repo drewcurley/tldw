@@ -357,27 +357,50 @@ def _segment_ratio(body):
     return value if 0 < value <= 1 else None
 
 
-def _seg_key(video_id: str, ratio):
-    """Selections differ by how aggressively they trim, so the trim strength is part
-    of the cache identity — otherwise asking for a tighter cut returns the looser
-    selection that was prefetched earlier."""
-    return (video_id, round(ratio, 3) if isinstance(ratio, (int, float)) else None)
+def _seg_key(video_id: str, ratio, source: str | None = None) -> tuple:
+    """Everything that shapes a segment selection.
+
+    The trim strength, so asking for a tighter cut doesn't return a looser one
+    prefetched earlier. The selection prompt, listing and span constants, so a
+    change to any of them misses rather than serving what today's code wouldn't
+    produce. The backend -- command, flags *and model* -- so a selection made by
+    Sonnet is never handed to an Opus request. And the transcript it was made from.
+
+    backend_fingerprint() reads the calling thread's model scope, so this must be
+    built in the request thread, under that request's model, and passed along --
+    never rebuilt later on another thread, where it would quietly describe the
+    default model and miss every time.
+    """
+    return (video_id,
+            round(ratio, 3) if isinstance(ratio, (int, float)) else None,
+            core.SEGMENT_FINGERPRINT,
+            claude_client.backend_fingerprint(),
+            source or txcache.CAPTIONS)
 
 
-def _seg_cache_put(video_id: str, meta, segments: list, ratio=None) -> None:
+def _seg_file(key: tuple) -> str:
+    return f"{key[0]}-{hashlib.sha256(repr(key).encode()).hexdigest()[:16]}"
+
+
+def _seg_cache_put(key: tuple, meta, segments: list) -> None:
     with _cache_lock:
-        _seg_cache[_seg_key(video_id, ratio)] = (
-            time.monotonic() + _CACHE_TTL, meta, segments)
+        _seg_cache[key] = (time.monotonic() + _CACHE_TTL, meta, segments)
         _prune(_seg_cache)
+    txcache.put_segments(_seg_file(key), meta, segments)   # survives a restart
 
 
-def _seg_cache_get(video_id: str, ratio=None):
-    """Return (meta, segments) if a fresh entry exists, else None."""
+def _seg_cache_get(key: tuple):
+    """(meta, segments) from memory, or from disk, else None."""
     with _cache_lock:
-        entry = _seg_cache.get(_seg_key(video_id, ratio))
+        entry = _seg_cache.get(key)
         if entry and entry[0] > time.monotonic():
             return entry[1], entry[2]
-        return None
+    on_disk = txcache.get_segments(_seg_file(key))         # outside the lock: I/O
+    if on_disk:
+        with _cache_lock:
+            _seg_cache[key] = (time.monotonic() + _CACHE_TTL, *on_disk)
+            _prune(_seg_cache)
+    return on_disk
 
 
 def _session_get(video_id: str):
@@ -392,15 +415,25 @@ def _session_put(video_id: str, session_id: str) -> None:
         _prune(_ask_sessions)
 
 
-def _start_seg_prefetch(meta, cues: list, model: str | None = None, ratio=None) -> None:
-    """Start background segment selection. No-op if one is already running for this video.
-    Stores a threading.Event in _seg_prefetch_events so _run_segments can wait instead
-    of spawning a second concurrent Claude call."""
+def _start_seg_prefetch(meta, cues: list, model: str | None = None, ratio=None,
+                        source: str | None = None) -> None:
+    """Start background segment selection, unless it's already cached or running.
+
+    Both checks live here, under one lock, rather than at each call site: a
+    check-then-start split across callers is what let a selection be paid for
+    twice. The key is built here, in the caller's thread, under the model this
+    selection will run with -- see _seg_key. `source` is that of the cues being
+    handed over, not whatever the transcript cache happens to say.
+    """
     vid = meta.video_id
-    key = _seg_key(vid, ratio)
+    with claude_client.use_model(model):
+        key = _seg_key(vid, ratio, source)
+    if _seg_cache_get(key):
+        return                  # already made: on disk from a previous run, or here
     with _cache_lock:
-        if key in _seg_prefetch_events:
-            return  # already running — don't spawn a second one
+        entry = _seg_cache.get(key)
+        if key in _seg_prefetch_events or (entry and entry[0] > time.monotonic()):
+            return              # running, or finished between the check and here
         evt = threading.Event()
         _seg_prefetch_events[key] = evt
 
@@ -418,7 +451,8 @@ def _start_seg_prefetch(meta, cues: list, model: str | None = None, ratio=None) 
                     p["pos_ms"] = max(p["pos_ms"], int(seg.get("end", 0) * 1000))
 
             # A new thread: the request's model scope doesn't follow it here.
-            with claude_client.use_model(model), usage.interaction("segments", vid):
+            with claude_client.use_model(model), \
+                    usage.interaction("segments", vid, trigger="prefetch"):
                 _meta, segs = core.select_segments(
                     _md.watch_url(vid), ratio, "en",
                     timeout=SEGMENTS_TIMEOUT,
@@ -428,7 +462,7 @@ def _start_seg_prefetch(meta, cues: list, model: str | None = None, ratio=None) 
                     on_progress=lambda *a, **k: None,
                     on_segment_ready=note,
                 )
-            _seg_cache_put(vid, _meta, segs, ratio)
+            _seg_cache_put(key, _meta, segs)
             print(f"  prefetched {len(segs)} segments for {vid}", flush=True)
         except Exception as exc:
             print(f"  segment prefetch failed for {vid}: {exc}", flush=True)
@@ -951,10 +985,13 @@ class _Handler(BaseHTTPRequestHandler):
                 emit({"type": "result", **hit, "cached": True,
                       "stats": usage.stats()})
                 tx = _cache_get(vid, touch=True)
-                if tx and not _seg_cache_get(vid, ratio):
+                if tx:
                     # Still worth having key moments ready by the time they look.
+                    # It checks its own cache, under the *segment* ratio -- this
+                    # used to check under the summary ratio, which the extension
+                    # never sends, and so re-ran the selection on every re-open.
                     _start_seg_prefetch(tx[0], tx[1], claude_client.current_model(),
-                                        _segment_ratio(body))
+                                        _segment_ratio(body), _cache_source(vid))
                 return
 
         page = body.get("page") if isinstance(body, dict) else None
@@ -1009,20 +1046,19 @@ class _Handler(BaseHTTPRequestHandler):
             print(f"  unexpected error: {exc!r}", flush=True)
             return
         print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s", flush=True)
+        source = tx_source or (_cache_source(summary.meta.video_id)
+                               if summary.cues else txcache.CAPTIONS)
         if summary.cues:
             # Without the source here, caching the summarize result would relabel a
             # transcript we just made from audio as a caption track.
-            _cache_put(summary.meta.video_id, summary.meta, summary.cues,
-                       tx_source or _cache_source(summary.meta.video_id))
+            _cache_put(summary.meta.video_id, summary.meta, summary.cues, source)
             # Kick off segment selection in the background so "play key moments" is
             # ready by the time the user reads the summary.
             # The prefetch has to produce the selection the page will ask for: a
             # looser one cached under a different key would never be used.
             _start_seg_prefetch(summary.meta, summary.cues,
                                 claude_client.current_model(),
-                                _segment_ratio(body))
-        source = tx_source or (_cache_source(summary.meta.video_id)
-                               if summary.cues else txcache.CAPTIONS)
+                                _segment_ratio(body), source)
         payload = _to_payload(summary, source)
         if vid:
             txcache.put_summary(_summary_key(vid, ratio, source), payload)
@@ -1187,7 +1223,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if elapsed >= SEGMENTS_TIMEOUT:
                     return False
                 with _cache_lock:
-                    pos = dict(_seg_progress.get(_seg_key(vid, ratio)) or {})
+                    pos = dict(_seg_progress.get(key) or {})
                 msg, pct = _seg_progress_line(pos, cue_label, elapsed)
                 if msg != last_msg:        # only when something actually changed
                     progress(msg, pct)
@@ -1208,29 +1244,37 @@ class _Handler(BaseHTTPRequestHandler):
             emit({"type": "segments_done", "title": meta.title,
                   "channel": meta.channel, "source_url": md.watch_url(meta.video_id)})
 
-        # 1. Instant cache hit
-        if vid and max_ms is None:
-            seg_hit = _seg_cache_get(vid, ratio)
+        # The transcript this selection would be made from, and so its key -- built
+        # here, in the request thread, under this request's model (see _seg_key).
+        # A request with max_length gets no key at all: a capped selection must
+        # neither be served from, nor written over, the uncapped one.
+        tx_hit = _cache_get(vid) if vid else None
+        source = _cache_source(vid) if tx_hit else txcache.CAPTIONS
+        key = _seg_key(vid, ratio, source) if vid and max_ms is None else None
+        cue_label = f"{len(tx_hit[1])} cues" if tx_hit else "transcript"
+
+        # 1. Instant cache hit (memory, or disk from an earlier run)
+        if key:
+            seg_hit = _seg_cache_get(key)
             if seg_hit:
                 meta, segments = seg_hit
                 print(f"  cached segments for {vid} ({len(segments)} moments, "
                       f"{time.monotonic()-start:.1f}s)", flush=True)
+                usage.note_served(vid, "cache")
                 _emit_segments(meta, segments)
                 return
 
-        # Cue count for informative heartbeat messages
-        tx_hit = _cache_get(vid) if vid else None
-        cue_label = f"{len(tx_hit[1])} cues" if tx_hit else "transcript"
-
-        # 2. Wait for in-progress prefetch (heartbeat while blocked)
-        if vid and max_ms is None:
+        # 2. Wait for in-progress prefetch (heartbeat while blocked). Same key, so a
+        #    prefetch running under another model is not waited on.
+        if key:
             with _cache_lock:
-                prefetch_evt = _seg_prefetch_events.get(_seg_key(vid, ratio))
+                prefetch_evt = _seg_prefetch_events.get(key)
             if prefetch_evt:
                 print(f"  waiting for prefetch for {vid}", flush=True)
                 _wait_with_heartbeat(prefetch_evt, cue_label)
-                seg_hit = _seg_cache_get(vid, ratio)
+                seg_hit = _seg_cache_get(key)
                 if seg_hit:
+                    usage.note_served(vid, "prefetch")
                     _emit_segments(*seg_hit)
                     return
                 # prefetch failed — fall through to direct call
@@ -1251,7 +1295,7 @@ class _Handler(BaseHTTPRequestHandler):
             progress(msg, pct)
 
         try:
-            with usage.interaction("segments", vid or ""):
+            with usage.interaction("segments", vid or "", trigger="request"):
                 meta, segments = core.select_segments(
                     url, ratio, lang, max_length_ms=max_ms,
                     timeout=SEGMENTS_TIMEOUT, on_progress=progress,
@@ -1267,8 +1311,10 @@ class _Handler(BaseHTTPRequestHandler):
             print(f"  unexpected error: {exc!r}", flush=True)
             emit({"type": "error", "status": 500, "error": "internal error"})
             return
+        if key:
+            _seg_cache_put(key, meta, segments)
         if vid:
-            _seg_cache_put(vid, meta, segments, ratio)
+            usage.note_served(vid, "live")
         if streamed_segs:
             _emit_segments_done(meta, segments)
         else:
