@@ -328,3 +328,221 @@ def test_a_multibyte_character_split_across_chunks_survives(monkeypatch):
               "    sys.stdout.buffer.write(b[i:i+3]); sys.stdout.buffer.flush()\n")
     monkeypatch.setenv("TLDW_LLM_CMD", f'{sys.executable} -c "{script}"')
     assert "".join(cc._stream_deltas("p", "x", timeout=30)) == "café — résumé"
+
+
+# --- the stock claude process: environment, directory, and a watchdog ------------
+#
+# These drive the real _stream_deltas against a real child process standing in
+# for the CLI. Every earlier test of this path replaced it with a stub, so the
+# code that actually talks to `claude` -- and the hang the audit found in it --
+# had no coverage at all.
+
+import os
+import time
+from pathlib import Path
+
+from youtube_tldw import TldrTimeoutError
+
+RESULT = json.dumps({"type": "result", "result": "", "usage": {}, "session_id": "s"})
+DELTA = json.dumps({"type": "stream_event", "event": {
+    "type": "content_block_delta", "delta": {"type": "text_delta", "text": "hello"}}})
+
+
+def _fake_cli(monkeypatch, script: str):
+    """Make _stream_deltas launch `python -c script` as though it were claude."""
+    monkeypatch.setattr(cc, "is_claude_cli", lambda: True)
+    monkeypatch.setattr(cc, "_claude_argv",
+                        lambda *a, **k: [sys.executable, "-c", script])
+
+
+def _capture_popen(monkeypatch):
+    seen = {}
+    real = cc.subprocess.Popen
+
+    def spy(*a, **kw):
+        seen.update(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(cc.subprocess, "Popen", spy)
+    return seen
+
+
+def test_one_shot_streams_run_with_prompt_caching_off(monkeypatch):
+    """Nothing resumes a summary or a segment selection, so the cache they write
+    is never read -- and the CLI bills that write at twice the input rate."""
+    _fake_cli(monkeypatch, f"print({RESULT!r})")
+    seen = _capture_popen(monkeypatch)
+    list(cc._stream_deltas("p", "x", timeout=10, persist=False))
+    assert seen["env"]["DISABLE_PROMPT_CACHING"] == "1"
+
+
+def test_qa_keeps_caching_even_if_the_shell_turned_it_off(monkeypatch):
+    """Follow-up questions resume the session and do read its cache."""
+    monkeypatch.setenv("DISABLE_PROMPT_CACHING", "1")
+    _fake_cli(monkeypatch, f"print({RESULT!r})")
+    seen = _capture_popen(monkeypatch)
+    list(cc._stream_deltas("p", "x", timeout=10, persist=True))
+    assert "DISABLE_PROMPT_CACHING" not in seen["env"]
+
+
+def test_the_cache_setting_never_leaks_into_the_server_process(monkeypatch):
+    """Per call, never os.environ: Q&A runs alongside summaries on other threads."""
+    _fake_cli(monkeypatch, f"print({RESULT!r})")
+    list(cc._stream_deltas("p", "x", timeout=10, persist=False))
+    assert "DISABLE_PROMPT_CACHING" not in os.environ
+
+
+def test_claude_runs_in_its_own_directory(monkeypatch):
+    """Not wherever `tldw serve` was started, where Q&A sessions used to land
+    among the user's own Claude Code sessions."""
+    _fake_cli(monkeypatch, "import os; print(os.getcwd())")
+    seen = _capture_popen(monkeypatch)
+    list(cc._stream_deltas("p", "x", timeout=10))
+    assert Path(seen["cwd"]) == cc.CLAUDE_DIR
+    assert cc.CLAUDE_DIR.is_dir()
+    assert (cc.CLAUDE_DIR.stat().st_mode & 0o777) == 0o700
+
+
+def test_the_directory_is_recreated_if_something_cleaned_it(monkeypatch):
+    import shutil
+    _fake_cli(monkeypatch, f"print({RESULT!r})")
+    list(cc._stream_deltas("p", "x", timeout=10))
+    shutil.rmtree(cc.CLAUDE_DIR)
+    list(cc._stream_deltas("p", "x", timeout=10))       # must not fail
+    assert cc.CLAUDE_DIR.is_dir()
+
+
+def test_buffered_calls_get_the_same_treatment(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cc, "run", lambda argv, **kw: (seen.update(kw), ProcResult(
+        0, json.dumps({"type": "result", "result": '{"a": 1}'}), ""))[1])
+    _claude_backend(monkeypatch)
+    cc.ask_json("p", "x", validate=lambda d: d, timeout=5)
+    assert seen["env"]["DISABLE_PROMPT_CACHING"] == "1"
+    assert Path(seen["cwd"]) == cc.CLAUDE_DIR
+
+
+def test_custom_backends_keep_their_own_directory_and_environment():
+    """A relative `./model.sh` resolves against the working directory, so moving
+    it would break the backend; and its caching is its own business."""
+    assert cc._launch_opts(["./model.sh", "--x"]) == {}
+    assert cc._launch_opts(["llm", "-m", "gpt"]) == {}
+
+
+# --- the watchdog -----------------------------------------------------------------
+
+def test_a_silent_claude_is_killed_at_its_deadline(monkeypatch, tmp_path):
+    """(a) The audit's one High: the deadline was only checked when a line
+    arrived, so a process that went quiet held a request and a slot forever."""
+    pid_file = tmp_path / "pid"
+    _fake_cli(monkeypatch,
+              f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); "
+              "time.sleep(20)")
+    t0 = time.monotonic()
+    with pytest.raises(TldrTimeoutError):
+        list(cc._stream_deltas("p", "x", timeout=0.5))
+    assert time.monotonic() - t0 < 5
+    pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)                           # really gone, not orphaned
+
+
+def test_a_flood_of_stderr_cannot_wedge_the_stream(monkeypatch):
+    """(b) stderr used to be read only on failure. A CLI writing more than a
+    pipe's worth of it would block forever."""
+    _fake_cli(monkeypatch,
+              "import sys; sys.stderr.write('x' * 1_000_000); sys.stderr.flush(); "
+              f"print({DELTA!r}); print({RESULT!r})")
+    assert "".join(cc._stream_deltas("p", "x", timeout=10)) == "hello"
+
+
+def test_a_cli_that_lingers_after_answering_still_succeeds(monkeypatch):
+    """(c) A complete answer is a success. The loop stops at the result rather
+    than waiting for EOF, and our own kill of the lingering process is not an
+    error."""
+    monkeypatch.setattr(cc, "_EXIT_GRACE", 0.2)
+    _fake_cli(monkeypatch,
+              f"import sys, time; print({DELTA!r}); print({RESULT!r}); "
+              "sys.stdout.flush(); time.sleep(60)")
+    t0 = time.monotonic()
+    assert "".join(cc._stream_deltas("p", "x", timeout=30)) == "hello"
+    assert time.monotonic() - t0 < 5             # nowhere near the 30s deadline
+
+
+def test_the_watchdog_firing_after_eof_does_not_kill_or_fail(monkeypatch):
+    """(d) The race fixed in bc22a4f, made deterministic: the timer fires after
+    the stream has drained. It must neither kill a process exiting 0 nor turn a
+    clean run into an error."""
+    fired = []
+
+    class HandTimer:
+        def __init__(self, _t, fn):
+            self.fn, self.daemon = fn, False
+
+        def start(self):
+            fired.append(self)
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(cc, "_Timer", HandTimer)
+    _fake_cli(monkeypatch, f"print({DELTA!r}); print({RESULT!r})")
+    procs = []
+    real = cc.subprocess.Popen
+    monkeypatch.setattr(cc.subprocess, "Popen",
+                        lambda *a, **k: procs.append(real(*a, **k)) or procs[-1])
+    assert "".join(cc._stream_deltas("p", "x", timeout=30)) == "hello"
+    fired[0].fn()                                # the deadline, arriving too late
+    assert procs[0].returncode == 0              # exited cleanly, was not killed
+
+
+def test_a_failing_cli_reports_its_stderr(monkeypatch):
+    """Draining stderr on a thread must not lose the message a failure needs."""
+    _fake_cli(monkeypatch,
+              "import sys; sys.stderr.write('auth expired\\n'); sys.exit(3)")
+    with pytest.raises(ClaudeError, match="auth expired"):
+        list(cc._stream_deltas("p", "x", timeout=10))
+
+
+def test_a_timed_out_resume_is_not_retried_from_scratch(monkeypatch):
+    """A resumed call that ran out of time would only run out of time again,
+    doubling the wait."""
+    from youtube_tldw import ask
+    calls = []
+
+    def stream(*a, resume=None, **k):
+        calls.append(resume)
+        raise TldrTimeoutError("slow")
+
+    monkeypatch.setattr(ask, "stream_text", stream)
+    meta = type("M", (), {"title": "T", "channel": "C"})()
+    with pytest.raises(TldrTimeoutError):
+        ask.stream_answer(meta, [], [], "q", session_id="old-session")
+    assert calls == ["old-session"]
+
+
+def test_a_complete_answer_beats_a_deadline_that_fires_mid_stream(monkeypatch):
+    """The precedence rule: once the whole answer has been written, the deadline
+    firing -- and our kill -- must not turn it into a timeout."""
+    fired = []
+
+    class HandTimer:
+        def __init__(self, _t, fn):
+            self.fn, self.daemon = fn, False
+
+        def start(self):
+            fired.append(self)
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(cc, "_Timer", HandTimer)
+    monkeypatch.setattr(cc, "_EXIT_GRACE", 0.2)
+    # Both lines are written and flushed before the child sleeps, so the answer is
+    # already in the pipe when the deadline fires.
+    _fake_cli(monkeypatch, f"import sys, time; print({DELTA!r}); print({RESULT!r}); "
+                           "sys.stdout.flush(); time.sleep(20)")
+    gen = cc._stream_deltas("p", "x", timeout=30)
+    assert next(gen) == "hello"
+    fired[0].fn()                                # deadline fires now, mid-stream
+    assert list(gen) == []                       # finishes cleanly, no timeout

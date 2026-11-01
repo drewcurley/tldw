@@ -10,7 +10,7 @@ from its own knowledge, so an answer can always be checked against the video.
 
 from __future__ import annotations
 
-from . import TldrError
+from . import TldrError, TldrTimeoutError
 from .claude_client import ask_text, stream_text
 from .timing import format_clock
 
@@ -126,6 +126,10 @@ def stream_answer(meta, cues, history, question: str, *,
 
     try:
         answer = run(session_id)
+    except TldrTimeoutError:
+        # A resumed call that ran out of time would only run out of time again,
+        # from scratch, doubling the wait. A stale session id is another matter.
+        raise
     except TldrError:
         if not session_id:
             raise

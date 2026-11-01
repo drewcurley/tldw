@@ -13,6 +13,7 @@ The backend command itself is OPERATOR config (env/flag), never request-controll
 from __future__ import annotations
 
 import codecs
+import collections
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ import subprocess
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Callable
 
 from . import ClaudeError, TldrError, TldrTimeoutError
@@ -107,6 +109,50 @@ _SYSTEM_PROMPT = ("You are the text engine for tldw, a YouTube video summarizer.
                   "Follow the task instructions in the message exactly.")
 _LEAN = ["--tools", "", "--strict-mcp-config", "--setting-sources", "",
          "--system-prompt", _SYSTEM_PROMPT]
+
+# Where tldw's own `claude` calls run. Its own directory rather than wherever
+# `tldw serve` happened to be started: the CLI files a persisted session under the
+# working directory's project, so Q&A sessions -- third-party transcripts -- were
+# landing among the user's own Claude Code sessions, one `claude -c` away from a
+# session that has tools. --resume finds a session by id from any directory
+# (verified), so moving them costs nothing.
+CLAUDE_DIR = Path.home() / ".cache" / "youtube-tldw" / "claude"
+
+
+def _claude_process_opts(persist: bool) -> dict:
+    """Environment and working directory for a stock `claude` invocation.
+
+    One-shot calls run with prompt caching off. They write a cache entry that
+    nothing ever reads -- nothing resumes a summary or a segment selection -- and
+    the CLI bills that write at twice the input rate. Measured on a real segment
+    selection: $0.122 -> $0.070 per call, output unchanged. Q&A keeps caching,
+    since its follow-ups resume the session and do read it, and explicitly drops
+    an inherited setting so that stays true whatever the user's shell exports.
+
+    Passed per call, never by changing os.environ: the server is threaded, and Q&A
+    runs alongside summaries.
+    """
+    env = dict(os.environ)
+    if persist:
+        env.pop("DISABLE_PROMPT_CACHING", None)
+    else:
+        env["DISABLE_PROMPT_CACHING"] = "1"
+    # Created on every call, not once at startup: a cleaned ~/.cache would
+    # otherwise surface as "`claude` is not installed".
+    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(CLAUDE_DIR, 0o700)
+    except OSError:
+        pass
+    return {"env": env, "cwd": str(CLAUDE_DIR)}
+
+
+def _launch_opts(argv: list[str], *, persist: bool = False) -> dict:
+    """Process options for whichever backend argv is. Custom backends get none:
+    a relative `./model.sh` resolves against the working directory, so moving it
+    would break them, and their caching is their own business."""
+    return _claude_process_opts(persist) if argv and argv[0] == "claude" else {}
+
 
 # Request value -> CLI model alias. An allowlist, because the choice arrives from the
 # extension and ends up in argv.
@@ -240,6 +286,16 @@ def _stream_custom(prompt: str, stdin_payload: str, *, timeout: float):
         yield tail
 
 
+# The watchdog's timer, as a seam: tests replace it to fire on command, which is
+# the only way to exercise the EOF-versus-deadline race deterministically.
+_Timer = threading.Timer
+_STDERR_LINES = 50
+# How long a process that has finished streaming gets to exit by itself before it
+# is killed. Not shorter: a persisted Q&A session is still being written to disk
+# as the CLI exits, and killing it then would truncate the session file.
+_EXIT_GRACE = 5.0
+
+
 def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
                    step: str = "", resume: str | None = None, on_meta=None,
                    persist: bool = False):
@@ -275,7 +331,10 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
+        **_claude_process_opts(persist),
     )
     # Write stdin in a thread — large payloads can block if not drained concurrently
     def _write():
@@ -290,15 +349,49 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
                 pass
     threading.Thread(target=_write, daemon=True).start()
 
-    deadline = time.monotonic() + timeout
+    # stderr is read as it arrives into a bounded tail. Left unread, a CLI that
+    # writes more than a pipe's worth of it blocks forever -- a second way to hang.
+    err_tail: collections.deque = collections.deque(maxlen=_STDERR_LINES)
+
+    def _drain_stderr():
+        try:
+            for line in proc.stderr:
+                err_tail.append(line)
+        except (OSError, ValueError):
+            pass
+    err_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    err_thread.start()
+
+    # The deadline is enforced by a timer rather than checked between lines: a
+    # process that goes silent never produces the next line, so a check there never
+    # runs. That hung a request, and one of the server's two slots, indefinitely.
+    #
+    # EOF and the timer share a lock so exactly one of them decides. Once the
+    # stream is drained the timer may not kill: a process on its way out with exit
+    # 0 must not be turned into a reported failure (the race fixed in bc22a4f).
+    lock = threading.Lock()
+    state = {"drained": False, "timed_out": False}
+
+    def _expire():
+        with lock:
+            if state["drained"]:
+                return
+            state["timed_out"] = True
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    timer = _Timer(timeout, _expire)
+    timer.daemon = True
+    timer.start()
+
     saw_delta = False
+    saw_result = False
+    completed = False
     killed = False
-    drained = False
     try:
         for raw in proc.stdout:
-            if time.monotonic() > deadline:
-                proc.kill()
-                raise TldrTimeoutError(f"`claude` timed out after {timeout}s.")
             try:
                 event = json.loads(raw)
             except json.JSONDecodeError:
@@ -309,47 +402,65 @@ def _stream_deltas(prompt: str, stdin_payload: str, *, timeout: float,
                 usage.record(u)
                 if on_meta:
                     on_meta({"session_id": u.session_id, "usage": u})
+                saw_result = True
             elif event.get("type") == "system" and event.get("session_id") and on_meta:
                 on_meta({"session_id": event["session_id"]})   # available early
             text = _delta_text(event)
             if text:
                 saw_delta = True
                 yield text
-                continue
             # Fallback for a CLI that doesn't do partials: the complete message
             # arrives as one `assistant` event. Only use it if nothing streamed,
             # otherwise it would duplicate every delta we already yielded.
-            if not saw_delta and event.get("type") == "assistant":
+            elif not saw_delta and event.get("type") == "assistant":
                 whole = "".join(
                     block.get("text", "")
                     for block in event.get("message", {}).get("content", [])
                     if isinstance(block, dict) and block.get("type") == "text")
                 if whole:
                     yield whole
-        drained = True          # stdout reached EOF: the process is on its way out
+            if saw_result:
+                # The answer is complete. Stop here rather than waiting for EOF, so
+                # a CLI that lingers after answering can't hold the answer hostage
+                # until the deadline.
+                break
+        completed = True
     finally:
-        proc.stdout.close()
-        if drained:
+        with lock:
+            state["drained"] = True        # from here on, the timer may not kill
+        timer.cancel()
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+        if completed:
             # Let it exit on its own. poll() can still read None while a finished
             # process is being reaped, and killing it then turned a clean exit into
             # a reported "failure".
             try:
-                ret = proc.wait(timeout=5)
+                ret = proc.wait(timeout=_EXIT_GRACE)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 killed = True
                 ret = proc.wait(timeout=5)
         else:
-            # Unwinding early — a timeout, or the consumer hung up (Stop). Kill now:
-            # waiting on a process that is still streaming would stall the abort.
+            # Unwinding early — the consumer hung up (Stop), or something raised.
+            # Kill now: waiting on a process that is still streaming would stall
+            # the abort.
             proc.kill()
             killed = True
             ret = proc.wait(timeout=5)
 
+    # A complete answer is a success, whatever exit code our own kill produced.
+    if saw_result:
+        return
+    if state["timed_out"]:
+        raise TldrTimeoutError(f"`claude` timed out after {timeout}s.")
     # A process we killed on purpose isn't a failure. Don't test for a specific
     # code: POSIX reports -9 for SIGKILL, Windows reports 1 from TerminateProcess.
     if ret and not killed:
-        tail = proc.stderr.read().strip().splitlines()[-3:]
+        err_thread.join(timeout=1)
+        tail = "".join(err_tail).strip().splitlines()[-3:]
         raise ClaudeError(f"`claude` failed (exit {ret}): " + " | ".join(tail))
 
 
@@ -450,7 +561,7 @@ def ask_text(
     argv, extract = _backend()
     try:
         result = run(argv, stdin=prompt + "\n\n" + stdin_payload, timeout=timeout,
-                     check=False)
+                     check=False, **_launch_opts(argv))
     except TldrTimeoutError:
         raise                                    # surfaces as 504
     except TldrError as exc:
@@ -485,7 +596,8 @@ def ask_json(
                 "markdown fences."
             )
         try:
-            result = run(argv, stdin=full, timeout=timeout, check=False)
+            result = run(argv, stdin=full, timeout=timeout, check=False,
+                         **_launch_opts(argv))
         except TldrTimeoutError:
             raise  # surfaces as 504, not swallowed by the retry
         except TldrError as exc:

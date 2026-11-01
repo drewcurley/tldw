@@ -31,6 +31,7 @@ HOME_PATHS = [
     ("youtube_tldw.whisper_transcribe", "_CACHE_DIR", ".cache/youtube-tldw/whisper"),
     ("youtube_tldw.audio", "VOICE_DIR", ".cache/youtube-tldw/voices"),
     ("youtube_tldw.cli", "DEFAULT_OUTPUT", "Downloads/youtube-tldw/tldws"),
+    ("youtube_tldw.claude_client", "CLAUDE_DIR", ".cache/youtube-tldw/claude"),
 ]
 
 _REFUSE = """#!/bin/sh

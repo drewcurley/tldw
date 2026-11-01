@@ -70,6 +70,7 @@ def run(
     timeout: float | None = None,
     cwd: "str | None" = None,
     check: bool = True,
+    env: "dict | None" = None,
 ) -> ProcResult:
     """Run argv with no shell. Untrusted data must be discrete argv items or `stdin`.
 
@@ -85,6 +86,7 @@ def run(
             text=True,
             timeout=timeout,
             cwd=cwd,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         raise TldrTimeoutError(f"`{argv[0]}` timed out after {timeout}s.") from exc
