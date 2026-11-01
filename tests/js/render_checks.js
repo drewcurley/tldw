@@ -524,6 +524,36 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
              return !/<img>/.test(content.innerHTML); })(), true);
 }
 
+// --- asking for a cached summary before reading the page ---
+{
+  eval(grab("  function probeOutcome(m)", "\n  function startSummarize"));
+  const payload = { title: "T", summary_md: "s" };
+  check("a hit becomes an ordinary result",
+    JSON.stringify(probeOutcome({ type: "probe", hit: true, payload })),
+    JSON.stringify({ type: "result", payload, cached: true }));
+  check("a miss runs the old flow", probeOutcome({ type: "probe", hit: false }), null);
+  check("a hit with no payload is not trusted",
+    probeOutcome({ type: "probe", hit: true }), null);
+  check("nothing at all is a miss", probeOutcome(undefined), null);
+
+  const panel = stripComments(src);
+  check("refresh and an accepted transcription skip the probe",
+    /if \(refresh \|\| transcribe\) summarizeFromPage\(\);\s*else port\.postMessage\(\{ type: "probeCache"/.test(panel),
+    true);
+  check("a miss falls back to reading the page",
+    /if \(!hit\) \{ summarizeFromPage\(\); return; \}/.test(panel), true);
+  check("the probe is handled before the catch-all that ends a run",
+    panel.indexOf('m.type === "probe"') < panel.indexOf("requestActive = false;\n      partialState = null;\n      txLive = null;"),
+    true);
+  if (worker) {
+    const bg = stripComments(worker);
+    check("the worker answers the probe", /msg\.type === "probeCache"\) handleProbe/.test(bg), true);
+    check("any failure is a miss, never an error",
+      /catch \(_\) \{[\s\S]{0,40}\} finally[\s\S]{0,80}safePost\(port, \{ type: "probe", hit: false \}\)/.test(bg),
+      true);
+  }
+}
+
 if (failures.length) {
   console.log("FAILURES:\n" + failures.join("\n"));
   process.exit(1);

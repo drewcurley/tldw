@@ -809,6 +809,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/preview":
             self._guarded(self._run_preview)
             return
+        if path == "/summarize/cached":
+            self._guarded(self._run_cached)
+            return
         if path == "/ask/stream":
             self._guarded(self._run_ask, max_bytes=MAX_ASK_BYTES)
             return
@@ -1063,6 +1066,44 @@ class _Handler(BaseHTTPRequestHandler):
         if vid:
             txcache.put_summary(_summary_key(vid, ratio, source), payload)
         emit({"type": "result", **payload, "stats": usage.stats()})
+
+    def _run_cached(self, body) -> None:
+        """A summary we've already written for this video, or {"type": "miss"}.
+
+        The panel asks this *before* reading the page's transcript, which costs
+        0.5-13s and a request to YouTube -- and which it used to do even for a
+        summary already sitting in the cache. Read-only: on a miss it fetches
+        nothing and starts nothing, so the panel's normal flow runs unchanged.
+
+        Same key as the real request (_summary_key with _effective_source), and run
+        under the request's model by _guarded: the key includes the backend
+        fingerprint, so outside that scope every lookup would quietly miss.
+        A separate endpoint rather than a flag on /summarize/stream, so an older
+        server answers 404 -- which the panel treats as a miss -- instead of
+        running a summarize without the page's transcript.
+        """
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "expected a JSON object"})
+            return
+        try:
+            vid = canonical_video_id(str(body.get("url") or ""))
+        except TldrError:
+            self._send_json(400, {"error": "bad video url"})
+            return
+        ratio = body.get("ratio")
+        ratio = ratio if isinstance(ratio, (int, float)) and not isinstance(
+            ratio, bool) and 0 < ratio <= 1 else None
+        hit = txcache.get_summary(_summary_key(vid, ratio, _effective_source(vid)))
+        if not hit:
+            self._send_json(200, {"type": "miss"})
+            return
+        # What today's cached-summary path does: have key moments ready.
+        tx = _cache_get(vid, touch=True)
+        if tx:
+            _start_seg_prefetch(tx[0], tx[1], claude_client.current_model(),
+                                _segment_ratio(body), _cache_source(vid))
+        self._send_json(200, {"type": "result", **hit, "cached": True,
+                              "stats": usage.stats()})
 
     def _transcribe_fallback(self, meta, body, policy, emit, progress):
         """Offer, or carry out, transcription of a video that has no captions.

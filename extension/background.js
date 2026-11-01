@@ -72,6 +72,7 @@ api.runtime.onConnect.addListener((port) => {
   port.onMessage.addListener((msg) => {
     if (!msg) return;
     if (msg.type === "summarize") handleSummarize(port, msg);
+    else if (msg.type === "probeCache") handleProbe(port, msg);
     else if (msg.type === "speak") handleSpeak(port, msg);
     else if (msg.type === "getSegments") handleSegments(port, msg);
     else if (msg.type === "preview") handlePreview(port, msg);
@@ -80,6 +81,50 @@ api.runtime.onConnect.addListener((port) => {
     // "ping" is ignored; receiving it just keeps the worker alive
   });
 });
+
+const PROBE_TIMEOUT_MS = 5000;
+
+// Is there already a summary for this video? Answered from this worker's own
+// cache, then the server's -- without reading the page, which is the slow part.
+// Every failure is a miss: the panel then does exactly what it always did. An
+// older server answers 404, which is a miss too, so a new extension can never
+// skip the page's transcript against a server that would then go to YouTube.
+async function handleProbe(port, msg) {
+  const { url, videoId } = msg;
+  if (videoId && cache.has(videoId)) {
+    safePost(port, { type: "probe", hit: true, payload: cache.get(videoId) });
+    return;
+  }
+  const { serverUrl, token, model, segmentRatio } = await getSettings();
+  if (!token) {
+    // Said now, rather than after reading the page for a request that can't run.
+    safePost(port, { type: "error",
+      error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
+    return;
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+  try {
+    const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/summarize/cached", {
+      method: "POST", signal: ctrl.signal,
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({ url, model, segment_ratio: segmentRatio }),
+    });
+    if (resp.ok) {
+      const ev = await resp.json();
+      if (ev && ev.type === "result") {
+        if (videoId) cache.set(videoId, ev);
+        safePost(port, { type: "probe", hit: true, payload: ev });
+        return;
+      }
+    }
+  } catch (_) {
+    // Unreachable, timed out, not JSON: all of them just mean "read the page".
+  } finally {
+    clearTimeout(timer);
+  }
+  safePost(port, { type: "probe", hit: false });
+}
 
 async function handleSummarize(port, msg) {
   const { url, videoId, refresh, page, transcribe } = msg;
