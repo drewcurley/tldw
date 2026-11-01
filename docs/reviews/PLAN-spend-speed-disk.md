@@ -1,6 +1,6 @@
 # PLAN — spend less, wait less, keep less
 
-**Status: PLAN — reviewed; both reviewers' blockers cleared. Building.**
+**Status: PASS WITH ITEMS** — built, two build-review rounds, all blockers fixed.
 
 Brief: "do whatever you think is best to improve speed, reduce token spend, and
 reduce disk clutter." Scope is those three things. Correctness findings from the
@@ -328,3 +328,94 @@ folded in above:
   prefetch on a hit.
 - Watchdog precedence: a `result` ends the loop.
 - The voice grace period is restored.
+
+## Build review
+
+### Backend / Data / Architect — BLOCK → fixed
+
+- **Blocker, a regression this branch introduced.** "A complete result wins"
+  treated every `result` event as success. But the CLI also reports failures
+  that way (`is_error`): not logged in, usage limit, API overloaded part-way
+  through. Consequences:
+  - A truncated summary would have been cached as complete for 14 days.
+  - A cut-short selection would have been persisted to disk.
+  - "Not logged in" would have been served as a Q&A answer.
+
+  An error result now raises the CLI's own message, whatever the exit code.
+  Tested through the real streaming parser with partial output before the
+  error, and mutation-checked.
+- **Warnings, all fixed and tested:**
+  - stdout is drained after the answer instead of closed under a CLI still
+    flushing a Q&A session.
+  - Q&A clears every `DISABLE_PROMPT_CACHING*` switch.
+  - An unwritable `~/.cache` falls back rather than breaking every call.
+  - A live selection registers as in flight, so a prefetch behind it can't
+    duplicate it.
+  - A failing startup cleanup can't stop the server.
+  - A remembered captionless answer isn't renewed by use.
+  - `/summarize/cached` validates `ratio` exactly as the real request does.
+  - `tldw usage` counts selection calls as calls.
+  - One source for the temp-dir prefix.
+
+### SDET / DevOps / Frontend — BLOCK → fixed
+
+- **Blocker: the suite wrote into the real home directory.** A prefetch thread
+  outlived its test and wrote a fixture selection into the real
+  `~/.cache/youtube-tldw/segments` after teardown had restored the path. It was
+  caused by this branch making selections durable. Teardown now waits for all
+  background work while the paths are still redirected, and fails the test if
+  that work won't finish. Demonstrated both ways against the real directory:
+  without the fix the fixture file reappears; with it, three full runs leave it
+  untouched. A write-blocking guard turned out to *hide* this leak rather than
+  catch it, because the late write's error is swallowed in its thread. That is
+  worth knowing about guards.
+- **Blocker: the client acceptance was regex-only.** Replaced with a harness
+  that runs the real `startSummarize` and `handleProbe` with only their
+  collaborators faked. All seven mutations are caught, including the
+  reviewer's four uncaught ones (an old server's 404 treated as an error, the
+  model not sent, a hit not cached, a cancelled run still posting).
+- **Bug found in passing (Frontend #1):** the page-read callback posted on the
+  module-level port, so a video's transcript could go out on a newer video's
+  request. It now posts only on its own run's port; tested and
+  mutation-checked.
+- **Warnings fixed:**
+  - Watchdog test (d) couldn't fail. It now fires inside `proc.wait()` on a
+    child with no result, and catches removal of the drained guard.
+  - Item 8(e) got a server-level test: 504, then the slot comes back.
+  - Four untested properties got tests that fail when they break: the
+    prefetch-waiter serve row, the probe matching the real request on an
+    audio-sourced summary, startup cleanup sparing live audio, and the
+    transcript source in the selection key.
+  - A `sleep(0.2)` was replaced by waiting on the real condition.
+  - A test that couldn't fail was rewritten.
+  - Two README sentences that had drifted were corrected.
+  - `HF_HOME`/`HF_HUB_CACHE` are now cleared for tests.
+
+### Items (non-blocking, noted for the PR)
+
+- **No way to redo a bad selection.** Selections now last 14 days and survive
+  restarts, and regenerate deliberately keeps them. Making ↻ refresh key
+  moments too is a scope call.
+- **The cache check's 5s budget sits inside the panel's 160s safety timer.**
+  Worst case 168s against 163s before.
+- **Pre-existing: navigating to another video mid-page-read** can still read the
+  wrong page. That belongs to the audit's navigation cluster.
+- **Rollback:** an older `tldw usage` counts `segments_served` rows as calls.
+- **Branch switches:** with an editable install, switching to a branch with a
+  shorter voice allowlist removes the voices it doesn't list. The cost is a
+  re-download, not data.
+- **The watchdog kills the `claude` process, not any grandchildren.** That's
+  moot with `--tools ""`, no MCP and no setting sources.
+
+### Sign-offs
+
+| Role | Status | |
+|---|---|---|
+| Analyst | ✅ | Scope held to spend, speed and disk; correctness fixes only where this branch caused them |
+| Architect | ✅ | Allowlists, auth on the new endpoint, base-checked deletions; Q&A sessions moved out of the user's project folder |
+| Data Engineer | ✅ | One full key across disk and memory; fingerprint covers listing and span constants; summary cache untouched |
+| Backend | ✅ | `is_error` regression fixed; watchdog precedence and drain correct |
+| Frontend | ✅ | Cache check fails closed; run-scoped port; real-code harness |
+| UX | ✅ | Cached revisits skip the page read; missing token reported immediately |
+| SDET | ✅ | Real-home leak fixed and demonstrated; every acceptance criterion pinned by a test that fails when it regresses |
+| DevOps | ✅ | Upgrade and rollback safe; summary fingerprints identical; cleanup can't stop the server |

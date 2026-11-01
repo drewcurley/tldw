@@ -827,7 +827,7 @@ def test_prefetch_publishes_progress_as_it_finds_clips(monkeypatch):
     assert done.wait(5)
     assert seen[0]["found"] == 1 and seen[0]["pos_ms"] == 60_000
     assert seen[0]["duration_ms"] == 600_000
-    time.sleep(0.2)
+    _wait_prefetch_idle()          # the real condition, not a guess at timing
     assert not any(k[0] == "progvid" for k in server._seg_progress)  # cleaned up
 
 
@@ -1917,9 +1917,12 @@ def _counting_select(monkeypatch, segments=None):
 
 
 def _wait_prefetch_idle(timeout=5):
+    """Wait for background selections to finish -- and fail if they don't, rather
+    than letting the test carry on and assert on work that never happened."""
     deadline = time.monotonic() + timeout
     while server._seg_prefetch_events and time.monotonic() < deadline:
         time.sleep(0.01)
+    assert not server._seg_prefetch_events, "a background selection never finished"
 
 
 def _meta_cues():
@@ -2266,12 +2269,13 @@ def test_the_remembered_answer_expires(srv, monkeypatch):
     assert len(asked) == 2
 
 
-def test_a_failure_is_never_remembered(srv, monkeypatch):
-    """Only an answer is kept. A 429 or a timeout must be retried, not cached."""
+def test_only_an_answer_about_the_video_is_remembered(srv, monkeypatch):
+    """A "no captions" that came without the video's metadata isn't an answer we
+    can reuse -- remembering it would serve a later request a half-formed one."""
     _, port = srv
-    from youtube_tldw import TldrError
-    monkeypatch.setattr(server.core, "summarize_url",
-                        lambda *a, **k: (_ for _ in ()).throw(TldrError("429")))
+    monkeypatch.setattr(server.core, "summarize_url", lambda *a, **k: (
+        _ for _ in ()).throw(NoTranscriptError("no captions, and no metadata")))
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
     _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
     assert server._captionless_meta == {}
 
@@ -2347,3 +2351,91 @@ def test_a_failing_startup_cleanup_never_stops_the_server(monkeypatch, capsys):
     monkeypatch.setattr(server, "startup_hygiene", broken)
     server.serve(token="t" * 20)                   # must not raise
     assert "skipped startup cleanup" in capsys.readouterr().out
+
+
+# --- properties the build review found untested ----------------------------------
+
+def test_a_selection_served_by_waiting_on_the_prefetch_is_counted(srv, monkeypatch):
+    """The third way a selection reaches the panel; only two were checked."""
+    _, port = srv
+    meta, cues = _meta_cues()
+    server._cache_put("dQw4w9WgXcQ", meta, cues)
+    gate, started = threading.Event(), threading.Event()
+
+    def slow(url, ratio, lang, *, timeout, _prefetched=None, max_length_ms=None,
+             on_progress=None, on_segment_ready=None):
+        started.set()
+        gate.wait(10)
+        return _prefetched[0], [{"start": 1.0, "end": 9.0, "label": "0:01"}]
+
+    monkeypatch.setattr(server.core, "select_segments", slow)
+    server._start_seg_prefetch(meta, cues, None, None, txcache.CAPTIONS)
+    assert started.wait(5)
+    threading.Timer(0.3, gate.set).start()
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth(),
+                          path="/segments/stream")
+    assert events[-1]["type"] == "segments"
+    served = [r["how"] for r in _usage_rows() if r.get("kind") == "segments_served"]
+    assert served == ["prefetch"]
+
+
+def test_the_probe_finds_a_summary_written_from_an_audio_transcript(srv, monkeypatch):
+    """Same key as the real request, including the transcript source."""
+    _, port = srv
+    monkeypatch.setattr(server.whisper_transcribe, "resolve_model", lambda: "small")
+    meta, cues = _meta_cues()
+    server._cache_put("dQw4w9WgXcQ", meta, cues, "audio:small")
+    with server.claude_client.use_model("opus"):
+        key = server._summary_key("dQw4w9WgXcQ", None, "audio:small")
+    txcache.put_summary(key, {"title": "From audio", "summary_md": "s"})
+    got = _post_json(port, "/summarize/cached",
+                     {"url": "https://youtu.be/dQw4w9WgXcQ", "model": "opus"}, _auth())
+    assert got["type"] == "result" and got["title"] == "From audio"
+
+
+def test_a_selection_from_one_transcript_is_not_served_for_another():
+    """An audio transcript and a caption track of the same video are different
+    inputs; a selection's cue indices only mean something against its own."""
+    meta, _ = _meta_cues()
+    from_audio = server._seg_key("dQw4w9WgXcQ", None, "audio:small")
+    from_captions = server._seg_key("dQw4w9WgXcQ", None, txcache.CAPTIONS)
+    assert from_audio != from_captions
+    server._seg_cache_put(from_audio, meta, [{"start": 1.0, "end": 2.0}])
+    assert server._seg_cache_get(from_captions) is None
+
+
+def test_startup_cleanup_never_touches_a_live_transcriptions_audio():
+    """A second `tldw serve` on another port must not delete a download that the
+    first is still transcribing. Only directories older than any run survive."""
+    import os
+    import tempfile
+    from pathlib import Path
+    from youtube_tldw import hygiene
+    root = Path(tempfile.gettempdir())
+    live = root / (hygiene.AUDIO_TMP_PREFIX + "live")
+    live.mkdir()
+    stale = root / (hygiene.AUDIO_TMP_PREFIX + "stale")
+    stale.mkdir()
+    old = time.time() - server._stale_audio_age() - 60
+    os.utime(stale, (old, old))
+    server.startup_hygiene()
+    assert live.exists() and not stale.exists()
+
+
+def test_a_silent_claude_gives_a_504_and_its_slot_back(srv, monkeypatch):
+    """Item 8(e): the whole path, through the real streaming client. Before the
+    watchdog this hung forever holding one of the server's two slots, so the third
+    request here would have been refused."""
+    _, port = srv
+    import sys
+    monkeypatch.setattr(server.claude_client, "is_claude_cli", lambda: True)
+    monkeypatch.setattr(server.claude_client, "_claude_argv",
+                        lambda *a, **k: [sys.executable, "-c", "import time; time.sleep(30)"])
+    monkeypatch.setattr(server, "REQUEST_TIMEOUT", 0.5)
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    body = {"url": "https://youtu.be/dQw4w9WgXcQ", "refresh": True,
+            "page": {"cues": [{"start_ms": 0, "text": "hello"}], "title": "T",
+                     "channel": "C", "duration_ms": 60_000}}
+    for _ in range(server.MAX_CONCURRENCY + 1):
+        events = _read_ndjson(port, body, _auth())
+        assert events[-1].get("status") == 504, events[-1]

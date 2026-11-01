@@ -469,10 +469,15 @@ def test_a_cli_that_lingers_after_answering_still_succeeds(monkeypatch):
     assert time.monotonic() - t0 < 5             # nowhere near the 30s deadline
 
 
-def test_the_watchdog_firing_after_eof_does_not_kill_or_fail(monkeypatch):
-    """(d) The race fixed in bc22a4f, made deterministic: the timer fires after
-    the stream has drained. It must neither kill a process exiting 0 nor turn a
-    clean run into an error."""
+def test_the_watchdog_firing_while_the_process_exits_does_not_kill_or_fail(monkeypatch):
+    """(d) The race fixed in bc22a4f, made deterministic: the deadline lands while
+    we wait for a process that has finished streaming. It must not kill a process
+    exiting 0, nor turn the clean run into a timeout.
+
+    No `result` event (an older CLI shape), so the "a complete answer wins" rule
+    can't mask a bad kill -- the drained guard has to be what saves it. Fired from
+    inside proc.wait(), so the process is still alive when it fires.
+    """
     fired = []
 
     class HandTimer:
@@ -486,14 +491,24 @@ def test_the_watchdog_firing_after_eof_does_not_kill_or_fail(monkeypatch):
             pass
 
     monkeypatch.setattr(cc, "_Timer", HandTimer)
-    _fake_cli(monkeypatch, f"print({DELTA!r}); print({RESULT!r})")
-    procs = []
-    real = cc.subprocess.Popen
-    monkeypatch.setattr(cc.subprocess, "Popen",
-                        lambda *a, **k: procs.append(real(*a, **k)) or procs[-1])
+    _fake_cli(monkeypatch, f"import time; print({DELTA!r}); time.sleep(0.3)")
+    real_popen = cc.subprocess.Popen
+
+    def popen(*a, **k):
+        proc = real_popen(*a, **k)
+        real_wait = proc.wait
+
+        def wait(timeout=None):
+            if fired and not getattr(proc, "_fired", False):
+                proc._fired = True
+                fired[0].fn()                     # the deadline, mid-exit
+            return real_wait(timeout=timeout)
+
+        proc.wait = wait
+        return proc
+
+    monkeypatch.setattr(cc.subprocess, "Popen", popen)
     assert "".join(cc._stream_deltas("p", "x", timeout=30)) == "hello"
-    fired[0].fn()                                # the deadline, arriving too late
-    assert procs[0].returncode == 0              # exited cleanly, was not killed
 
 
 def test_a_failing_cli_reports_its_stderr(monkeypatch):

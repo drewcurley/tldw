@@ -17,6 +17,7 @@ import importlib
 import os
 import stat
 import tempfile
+import time
 
 import pytest
 
@@ -59,7 +60,12 @@ def _isolated_home(tmp_path, monkeypatch):
     # Configuration that changes behaviour, from the shell the suite runs in.
     for key in [k for k in os.environ if k.startswith("TLDW_")]:
         monkeypatch.delenv(key)
-    monkeypatch.delenv("DISABLE_PROMPT_CACHING", raising=False)
+    for key in [k for k in os.environ if k.startswith("DISABLE_PROMPT_CACHING")]:
+        monkeypatch.delenv(key)
+    # Where `tldw cache` looks for Hugging Face's models: a real cache exported in
+    # the shell would otherwise be scanned (read-only, but still not the test's).
+    for key in ("HF_HOME", "HF_HUB_CACHE"):
+        monkeypatch.delenv(key, raising=False)
 
     # A test that forgets to stub these must fail loudly, not spend real quota or
     # make a real request to YouTube. A test that installs its own fake prepends
@@ -75,11 +81,17 @@ def _isolated_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _fresh_server_state():
-    """Every in-process registry the server keeps, emptied around each test.
+def _fresh_server_state(_isolated_home):
+    """Every in-process registry the server keeps, emptied around each test --
+    and background work allowed to finish *before* the home redirect is undone.
 
-    One wedged entry here (a prefetch event never set, a transcription job never
-    popped) would otherwise poison every later test that touches the same video.
+    A prefetch or transcription thread that outlives its test writes to the cache
+    after teardown has put the paths back: into the real home directory. That
+    happened (a fixture selection in the real ~/.cache/youtube-tldw/segments), so
+    any test that leaves background work running now fails instead.
+
+    Depends on _isolated_home so it is torn down first, while paths still point
+    at the test's own directory.
     """
     from youtube_tldw import server
     registries = [getattr(server, name) for name in (
@@ -89,5 +101,12 @@ def _fresh_server_state():
     for reg in registries:
         reg.clear()
     yield
+    deadline = time.monotonic() + 10
+    while (server._seg_prefetch_events or server._tx_jobs) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    still_running = list(server._seg_prefetch_events) + list(server._tx_jobs)
     for reg in registries:
         reg.clear()
+    assert not still_running, (
+        f"background work outlived the test and would write to the real home "
+        f"directory after teardown: {still_running}")

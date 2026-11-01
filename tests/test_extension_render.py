@@ -48,3 +48,18 @@ def test_extension_scripts_parse(script):
     proc = subprocess.run(["node", "--check", str(ROOT / "extension" / script)],
                           capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
+
+
+PROBE_CHECKS_JS = Path(__file__).parent / "js" / "probe_checks.js"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_the_cache_check_before_reading_the_page():
+    """Runs the real startSummarize and handleProbe with only their collaborators
+    faked. It replaced regexes over the source, which four real regressions --
+    an old server's 404 treated as an error among them -- all passed."""
+    proc = subprocess.run(
+        ["node", str(PROBE_CHECKS_JS), str(CONTENT_JS), str(BACKGROUND_JS)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr

@@ -275,8 +275,8 @@ than among your own sessions.
 
 Key moments are selected automatically after every summary so they're ready when
 you click, and that selection is most of the spend. `tldw usage` reports how many
-of those prefetched selections were ever played — the number that says whether
-the prefetch is worth it. Selections are kept on disk, so a restart, a re-opened
+selection calls were prefetched against how many selections were actually played —
+the numbers that say whether the prefetch is worth it. Selections are kept on disk, so a restart, a re-opened
 summary, or a regenerate doesn't pay for one again.
 
 ## Disk use
@@ -393,8 +393,9 @@ While a transcription runs it downloads the audio to a temporary directory (up t
 300MB, removed when it finishes) and keeps a CPU busy. The very first run also
 downloads the model itself, which is several hundred MB and shows no progress while
 it happens — so the first captionless video you try will sit on "loading Whisper…"
-for a while. `tldw serve` clears any audio temp directories left behind by an
-interrupted run when it starts.
+for a while. `tldw serve` clears audio temp directories left by an interrupted run when it
+starts — once they're older than any transcription could still be using, so a
+second server can never delete a live one's download.
 
 ## Browser extension
 
