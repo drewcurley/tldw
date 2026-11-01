@@ -60,32 +60,7 @@ _seg_progress: dict = {}
 # - Two requests for the same video must produce one job, not two.
 _tx_jobs: dict = {}             # video_id -> job dict, while a transcription runs
 _tx_permit = threading.Semaphore(1)
-_AUDIO_TMP_PREFIX = "youtube-tldw-audio-"
-
-
-def sweep_stale_audio() -> int:
-    """Remove audio temp directories left behind by an earlier run.
-
-    The job cleans up after itself, but its thread is a daemon: Ctrl-C at the wrong
-    moment kills it at interpreter exit without unwinding, stranding up to 300MB per
-    interrupted run. Nothing else ever collects those, so `tldw serve` does it on
-    the way up.
-    """
-    import shutil
-    import tempfile
-    removed = 0
-    try:
-        root = Path(tempfile.gettempdir())
-        for stale in root.glob(_AUDIO_TMP_PREFIX + "*"):
-            if stale.is_dir():
-                shutil.rmtree(stale, ignore_errors=True)
-                removed += 1
-    except OSError:
-        pass
-    return removed
-
 WHISPER_POLICIES = ("off", "ask", "always")
-DEFAULT_WHISPER_POLICY = "ask"
 # A ceiling on what may be transcribed at all, checked before any audio is fetched.
 # At the measured 5.5x realtime, two hours of video is already ~22 minutes of
 # full-core CPU; beyond that the honest answer is no.
@@ -94,6 +69,45 @@ MAX_TRANSCRIBE_MS = 2 * 3600 * 1000
 # is normal and being infinite is not.
 TRANSCRIBE_SLACK = 3.0
 TRANSCRIBE_FLOOR_S = 300.0
+_AUDIO_TMP_PREFIX = "youtube-tldw-audio-"     # hygiene.AUDIO_TMP_PREFIX
+
+
+def _stale_audio_age() -> float:
+    """How old an audio temp directory must be before it can't be in use.
+
+    Generous on purpose: a directory's timestamp stops moving once its download
+    finishes, while transcription of that audio can run for its whole budget. Twice
+    the longest budget the configured ceiling allows, and never under six hours.
+    """
+    longest = whisper_transcribe.estimate_seconds(_max_transcribe_ms(),
+                                                  whisper_transcribe.resolve_model())
+    return max(6 * 3600.0, 2 * max(TRANSCRIBE_FLOOR_S, longest * TRANSCRIBE_SLACK))
+
+
+def startup_hygiene() -> list:
+    """The cleanup that's safe to run every time the server starts. Returns lines
+    worth printing.
+
+    Runs after the port is bound, and every rule is one that can't touch work in
+    progress: only audio directories older than any transcription could still be
+    using, and only voice files the allowlist can never select. Idle voices and
+    expired cache entries are left to `tldw cache clean`, which says what it does.
+    """
+    notes = []
+    swept = hygiene.sweep_stale_audio(_stale_audio_age())
+    if swept.removed:
+        notes.append(f"cleared {len(swept.removed)} leftover audio temp "
+                     f"director{'y' if len(swept.removed) == 1 else 'ies'} "
+                     f"({hygiene.human(swept.freed)})")
+    unlisted = hygiene.Removal()
+    allowed = [model for model, _label in audio.VOICES.values()]
+    for f in hygiene.unlisted_voice_files(audio.VOICE_DIR, allowed):
+        hygiene.remove_under(f, audio.VOICE_DIR, unlisted, dry_run=False)
+    if unlisted.removed:
+        notes.append(f"removed {len(unlisted.removed)} voice file(s) no longer "
+                     f"offered ({hygiene.human(unlisted.freed)})")
+    hygiene.ensure_voice_tracking(audio.VOICE_DIR)
+    return notes
 
 
 def _wait_budget(job) -> float:
@@ -486,7 +500,7 @@ from . import (
 from . import metadata as md
 from . import transcript
 from . import ask, audio, claude_client, config, core, textmode, txcache, usage
-from . import whisper_transcribe
+from . import hygiene, whisper_transcribe
 from . import summarize
 from .summarize import SINGLE_PASS_CHARS
 from .urls import canonical_video_id
@@ -1624,7 +1638,8 @@ class _Handler(BaseHTTPRequestHandler):
         start = time.monotonic()
         try:
             data = b"".join(audio.stream_speech(PREVIEW_TEXT, voice,
-                                                timeout=SPEAK_TIMEOUT))
+                                                timeout=SPEAK_TIMEOUT,
+                                                record_use=False))
         except (TldrTimeoutError, TldrError) as exc:
             status = 504 if isinstance(exc, TldrTimeoutError) else 502
             print(f"  preview failed ({status}): {exc}", flush=True)
@@ -1677,12 +1692,11 @@ def serve(host: str = "127.0.0.1", port: int = 8765,
             "API billing — see docs/reviews/PLAN-extension.md."
         )
     token, persisted = load_or_create_token(token)
-    stale = sweep_stale_audio()
     httpd = _Server((host, port), token, allow_origin)
     print(f"tldw serve listening on http://{host}:{port}", flush=True)
-    if stale:
-        print(f"  (cleared {stale} leftover audio temp director"
-              f"{'y' if stale == 1 else 'ies'} from an interrupted run)")
+    # After the bind, so a second server that can't start never cleans up at all.
+    for note in startup_hygiene():
+        print(f"  ({note})")
     print(f"  token: {token}")
     if persisted:
         print(f"  (saved to {TOKEN_FILE} — stable across restarts; configure the "
