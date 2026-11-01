@@ -35,12 +35,14 @@ _CACHE_TTL = 4 * 3600
 _CACHE_MAX_ENTRIES = 64
 _cache_lock = threading.Lock()
 _transcript_cache: dict = {}    # video_id -> (expires_at, meta, cues)
-_seg_cache: dict = {}           # video_id -> (expires_at, meta, segments)
-_seg_prefetch_events: dict = {} # video_id -> threading.Event (while prefetch is running)
+_seg_cache: dict = {}           # _seg_key(...) -> (expires_at, meta, segments)
+# _seg_key(...) -> threading.Event while a selection for that key is being made --
+# by the prefetch or by a live request -- so nothing starts a second one.
+_seg_prefetch_events: dict = {}
 # video_id -> (expires_at, session_id): the model-side conversation for this video.
 # Resuming it means a follow-up question doesn't re-send the transcript.
 _ask_sessions: dict = {}
-# video_id -> {"found": n, "pos_ms": how far into the video the model has read,
+# _seg_key(...) -> {"found": n, "pos_ms": how far into the video the model has read,
 # "duration_ms": total}. Published by a running selection so a waiter can show real
 # progress instead of a clock.
 _seg_progress: dict = {}
@@ -69,7 +71,6 @@ MAX_TRANSCRIBE_MS = 2 * 3600 * 1000
 # is normal and being infinite is not.
 TRANSCRIBE_SLACK = 3.0
 TRANSCRIBE_FLOOR_S = 300.0
-_AUDIO_TMP_PREFIX = "youtube-tldw-audio-"     # hygiene.AUDIO_TMP_PREFIX
 
 
 def _stale_audio_age() -> float:
@@ -231,7 +232,7 @@ def _start_transcription(meta, model: str):
     def _run():
         import shutil
         import tempfile
-        workdir = Path(tempfile.mkdtemp(prefix=_AUDIO_TMP_PREFIX))
+        workdir = Path(tempfile.mkdtemp(prefix=hygiene.AUDIO_TMP_PREFIX))
         try:
             # One transcription at a time, machine-wide. A second video waits here
             # rather than fighting the first one for cores.
@@ -1067,7 +1068,8 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 prefetched = _cached_transcript(url) or _page_transcript(body, url)
                 known = _captionless_get(vid) if vid and prefetched is None else None
-                if known is not None:
+                remembered = known is not None
+                if remembered:
                     # Asked YouTube about this very video minutes ago -- typically
                     # the offer whose acceptance this request is. Fetching its
                     # metadata again is ~4s and a request to a rate-limited host
@@ -1078,7 +1080,10 @@ class _Handler(BaseHTTPRequestHandler):
                 # No caption track anywhere. The audio is still there, and it comes
                 # from an endpoint YouTube does serve.
                 meta = getattr(exc, "meta", None)
-                if meta is not None and vid:
+                # Only a fresh answer starts the clock. Re-storing a remembered one
+                # would keep renewing it, and a video reopened every few minutes
+                # would never be checked for captions again.
+                if meta is not None and vid and not remembered:
                     _captionless_put(vid, exc)
                 if policy == "off" or meta is None:
                     raise
@@ -1134,14 +1139,17 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             self._send_json(400, {"error": "expected a JSON object"})
             return
+        # The same validation the real request runs, so a ratio means the same
+        # thing to both -- otherwise "0.5" could be served the "auto" summary.
+        parsed = self._validate(body)
+        if parsed is None:
+            return                                   # 400 already sent
+        url, ratio, _lang = parsed
         try:
-            vid = canonical_video_id(str(body.get("url") or ""))
+            vid = canonical_video_id(str(url))
         except TldrError:
             self._send_json(400, {"error": "bad video url"})
             return
-        ratio = body.get("ratio")
-        ratio = ratio if isinstance(ratio, (int, float)) and not isinstance(
-            ratio, bool) and 0 < ratio <= 1 else None
         hit = txcache.get_summary(_summary_key(vid, ratio, _effective_source(vid)))
         if not hit:
             self._send_json(200, {"type": "miss"})
@@ -1384,6 +1392,15 @@ class _Handler(BaseHTTPRequestHandler):
                  "duration_ms": direct_ms}, cue_label, 0)
             progress(msg, pct)
 
+        # Register as in flight, so a prefetch that starts while this runs -- a
+        # summary finishing first -- waits for this selection instead of paying for
+        # a second one.
+        live_evt = None
+        if key:
+            with _cache_lock:
+                if key not in _seg_prefetch_events:
+                    live_evt = threading.Event()
+                    _seg_prefetch_events[key] = live_evt
         try:
             with usage.interaction("segments", vid or "", trigger="request"):
                 meta, segments = core.select_segments(
@@ -1391,6 +1408,10 @@ class _Handler(BaseHTTPRequestHandler):
                     timeout=SEGMENTS_TIMEOUT, on_progress=progress,
                     on_segment_ready=_on_segment_ready,
                     _prefetched=prefetched)
+            # Cached before the event is released, so anything woken by it finds
+            # the selection instead of starting another.
+            if key:
+                _seg_cache_put(key, meta, segments)
         except TldrError as exc:
             status = next((s for cls, s in _STATUS.items() if isinstance(exc, cls)), 500)
             print(f"  segments failed ({status}) in {time.monotonic()-start:.1f}s: {exc}",
@@ -1401,8 +1422,12 @@ class _Handler(BaseHTTPRequestHandler):
             print(f"  unexpected error: {exc!r}", flush=True)
             emit({"type": "error", "status": 500, "error": "internal error"})
             return
-        if key:
-            _seg_cache_put(key, meta, segments)
+        finally:
+            if live_evt is not None:
+                with _cache_lock:
+                    if _seg_prefetch_events.get(key) is live_evt:
+                        _seg_prefetch_events.pop(key, None)
+                live_evt.set()
         if vid:
             usage.note_served(vid, "live")
         if streamed_segs:
@@ -1695,8 +1720,12 @@ def serve(host: str = "127.0.0.1", port: int = 8765,
     httpd = _Server((host, port), token, allow_origin)
     print(f"tldw serve listening on http://{host}:{port}", flush=True)
     # After the bind, so a second server that can't start never cleans up at all.
-    for note in startup_hygiene():
-        print(f"  ({note})")
+    # And contained: tidying up is never a reason not to serve.
+    try:
+        for note in startup_hygiene():
+            print(f"  ({note})")
+    except Exception as exc:
+        print(f"  (skipped startup cleanup: {exc!r})")
     print(f"  token: {token}")
     if persisted:
         print(f"  (saved to {TOKEN_FILE} — stable across restarts; configure the "

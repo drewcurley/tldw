@@ -546,3 +546,74 @@ def test_a_complete_answer_beats_a_deadline_that_fires_mid_stream(monkeypatch):
     assert next(gen) == "hello"
     fired[0].fn()                                # deadline fires now, mid-stream
     assert list(gen) == []                       # finishes cleanly, no timeout
+
+
+# --- an error the CLI reports is an error, not an answer ---------------------------
+#
+# The CLI reports failures -- not logged in, usage limit, API overloaded part-way
+# through -- as a `result` event with is_error. Treating every result as success
+# cached half-written summaries and served "Not logged in" as a Q&A reply.
+
+ERR = json.dumps({"type": "result", "is_error": True, "subtype": "error",
+                  "result": "API Error: overloaded", "usage": {}})
+
+
+@pytest.mark.parametrize("exit_code", [1, 0])
+def test_an_error_result_raises_even_after_partial_output(monkeypatch, exit_code):
+    _fake_cli(monkeypatch, f"import sys; print({DELTA!r}); print({ERR!r}); "
+                           f"sys.exit({exit_code})")
+    gen = cc._stream_deltas("p", "x", timeout=10)
+    assert next(gen) == "hello"                    # the partial text arrived...
+    with pytest.raises(ClaudeError, match="API Error: overloaded"):
+        list(gen)                                  # ...but it is not a success
+
+
+def test_a_not_logged_in_reply_is_never_returned_as_an_answer(monkeypatch):
+    err = json.dumps({"type": "result", "is_error": True,
+                      "result": "Not logged in · Please run /login", "usage": {}})
+    _fake_cli(monkeypatch, f"import sys; print({err!r}); sys.exit(1)")
+    with pytest.raises(ClaudeError, match="Not logged in"):
+        cc.stream_text("p", "x", on_delta=lambda _t: None, timeout=10)
+
+
+def test_a_partial_summary_is_never_mistaken_for_a_complete_one(monkeypatch):
+    """The streamed summary path, end to end through the real parser."""
+    from youtube_tldw import summarize
+    from youtube_tldw.transcript import Cue
+    line = lambda o: json.dumps({"type": "stream_event", "event": {
+        "type": "content_block_delta",
+        "delta": {"type": "text_delta", "text": json.dumps(o) + "\n"}}})
+    _fake_cli(monkeypatch, f"import sys; print({line({'key_point': 'A'})!r}); "
+                           f"print({line({'paragraph': 'half'})!r}); print({ERR!r}); "
+                           "sys.exit(1)")
+    with pytest.raises(ClaudeError):
+        summarize.summarize_text([Cue(0, 1000, "x")], "C", "T", None, timeout=10,
+                                 on_partial=lambda *_: None)
+
+
+def test_output_after_the_answer_is_drained_not_cut_off(monkeypatch, tmp_path):
+    """A persisted Q&A session is flushed as the CLI exits. Closing the pipe under
+    it could turn that write into a broken pipe and cost the session."""
+    marker = tmp_path / "flushed"
+    _fake_cli(monkeypatch,
+              f"import sys; print({DELTA!r}); print({RESULT!r}); sys.stdout.flush(); "
+              "sys.stdout.write('x' * 200000); sys.stdout.flush(); "
+              f"open({str(marker)!r}, 'w').write('ok')")
+    assert "".join(cc._stream_deltas("p", "x", timeout=10)) == "hello"
+    assert marker.exists(), "the CLI was cut off before it finished writing"
+
+
+def test_qa_clears_every_per_model_caching_switch(monkeypatch):
+    for name in ("DISABLE_PROMPT_CACHING_OPUS", "DISABLE_PROMPT_CACHING_SONNET"):
+        monkeypatch.setenv(name, "1")
+    env = cc._claude_process_opts(persist=True)["env"]
+    assert not any(k.startswith("DISABLE_PROMPT_CACHING") for k in env)
+
+
+def test_an_unwritable_cache_dir_doesnt_break_every_call(monkeypatch):
+    """A root-owned ~/.cache used to turn every summary into a 500."""
+    def refuse(*a, **k):
+        raise PermissionError("read-only")
+    monkeypatch.setattr(type(cc.CLAUDE_DIR), "mkdir", refuse)
+    opts = cc._claude_process_opts(persist=False)
+    assert "cwd" not in opts and opts["env"]["DISABLE_PROMPT_CACHING"] == "1"
