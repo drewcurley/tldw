@@ -83,8 +83,36 @@ def test_text_prompts_forbid_abbreviations():
 
 
 def test_format_cues_listing():
+    """`m:ss`: the model picks indices, never times, so milliseconds were pure
+    input tokens."""
     listing = format_cues_for_selection(_cues(2))
-    assert listing.splitlines()[0].startswith("[0] (00:00:00.000) word0")
+    assert listing.splitlines()[0].startswith("[0] 0:00 word0")
+
+
+def test_listing_switches_to_hours_past_an_hour():
+    from youtube_tldw.transcript import Cue
+    listing = format_cues_for_selection([Cue(3_723_000, 3_724_000, "late")])
+    assert listing == "[0] 1:02:03 late"
+
+
+def test_chunked_listing_keeps_global_indices_and_the_same_format():
+    """The chunked path used to build its own listing in the old format."""
+    from youtube_tldw.transcript import Cue
+    cues = [Cue(i * 1000, i * 1000 + 900, f"w{i}") for i in range(5)]
+    assert format_cues_for_selection(cues, [3, 4]) == "[3] 0:03 w3\n[4] 0:04 w4"
+
+
+def test_segment_prompts_no_longer_ask_for_an_unread_reason():
+    from youtube_tldw.summarize import _VIDEO_PROMPT, _VIDEO_PROMPT_STREAM
+    for p in (_VIDEO_PROMPT, _VIDEO_PROMPT_STREAM):
+        assert "reason" not in p
+
+
+def test_segment_prompt_no_longer_claims_the_transcript_is_unpunctuated():
+    """Page-panel and Whisper transcripts are punctuated and cased."""
+    from youtube_tldw.summarize import _VIDEO_PROMPT_BODY
+    assert "lowercase, no punctuation" not in _VIDEO_PROMPT_BODY
+    assert "Do NOT trust cue boundaries as sentence boundaries" in _VIDEO_PROMPT_BODY
 
 
 def test_summarize_text_single_pass(monkeypatch):

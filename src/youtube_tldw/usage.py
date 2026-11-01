@@ -56,6 +56,11 @@ class Usage:
 class Interaction:
     kind: str                      # summarize | segments | ask | video
     video_id: str = ""
+    # For segment selection: "prefetch" (started automatically after a summary) or
+    # "request" (the user pressed Play key moments). Prefetch is most of the spend,
+    # and whether it's worth it depends on how often a prefetched selection is
+    # actually played -- see note_served.
+    trigger: str = ""
     started: float = field(default_factory=time.monotonic)
     calls: list = field(default_factory=list)
 
@@ -99,12 +104,14 @@ def parse_usage(envelope: dict, step: str = "") -> Usage:
 class _Scope:
     """Context-manager form; safe to nest (an inner scope is a no-op)."""
 
-    def __init__(self, kind: str, video_id: str):
-        self.kind, self.video_id, self.owner = kind, video_id, False
+    def __init__(self, kind: str, video_id: str, trigger: str = ""):
+        self.kind, self.video_id, self.trigger = kind, video_id, trigger
+        self.owner = False
 
     def __enter__(self) -> "_Scope":
         if getattr(_local, "interaction", None) is None:
-            _local.interaction = Interaction(self.kind, self.video_id)
+            _local.interaction = Interaction(self.kind, self.video_id,
+                                             trigger=self.trigger)
             self.owner = True
         return self
 
@@ -114,8 +121,8 @@ class _Scope:
         return False
 
 
-def interaction(kind: str, video_id: str = "") -> _Scope:
-    return _Scope(kind, video_id)
+def interaction(kind: str, video_id: str = "", trigger: str = "") -> _Scope:
+    return _Scope(kind, video_id, trigger)
 
 
 def current():
@@ -139,8 +146,25 @@ def record(usage: Usage, *, on_log=None) -> None:
         row = {"ts": time.time(),
                "kind": inter.kind if inter else "",
                "video_id": inter.video_id if inter else ""}
+        if inter is not None and inter.trigger:
+            row["trigger"] = inter.trigger
         row.update(asdict(usage))
         _append(row)
+    except Exception as exc:                      # never break the real request
+        print(f"  (usage accounting failed: {exc!r})", flush=True)
+
+
+def note_served(video_id: str, how: str) -> None:
+    """A segment selection was handed to the panel to play.
+
+    Not a model call -- no tokens, no cost -- so `tldw usage` keeps these out of its
+    call counts. Paired with the `trigger` on selection rows, this answers whether
+    the automatic prefetch is worth what it costs: how many prefetched selections
+    were ever played.
+    """
+    try:
+        _append({"ts": time.time(), "kind": "segments_served",
+                 "video_id": video_id, "how": how})
     except Exception as exc:                      # never break the real request
         print(f"  (usage accounting failed: {exc!r})", flush=True)
 

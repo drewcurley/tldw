@@ -20,6 +20,9 @@ from .transcript import Cue
 
 CACHE_DIR = Path.home() / ".cache" / "youtube-tldw" / "transcripts"
 SUMMARY_DIR = Path.home() / ".cache" / "youtube-tldw" / "summaries"
+# Their own directory: summaries and selections are pruned separately, so a
+# burst of selections can never push summaries out of the cap.
+SEGMENT_DIR = Path.home() / ".cache" / "youtube-tldw" / "segments"
 TTL_SECONDS = 14 * 24 * 3600      # transcripts rarely change; a fortnight is ample
 MAX_ENTRIES = 500
 
@@ -45,10 +48,7 @@ def get(video_id: str):
         raw = json.loads(_path(video_id).read_text(encoding="utf-8"))
         if time.time() - float(raw["saved_at"]) > TTL_SECONDS:
             return None
-        m = raw["meta"]
-        meta = VideoMeta(m["video_id"], m["title"], m["channel"],
-                         int(m["duration_ms"]), m.get("subtitles") or {},
-                         m.get("auto_captions") or {})
+        meta = _meta_from(raw["meta"])
         source = raw.get("source") or CAPTIONS
         if not isinstance(source, str):
             source = CAPTIONS
@@ -58,15 +58,26 @@ def get(video_id: str):
         return None                       # missing, truncated, or from an older shape
 
 
+def _meta_dict(meta) -> dict:
+    return {"video_id": meta.video_id, "title": meta.title,
+            "channel": meta.channel, "duration_ms": meta.duration_ms}
+
+
+def _meta_from(m: dict) -> VideoMeta:
+    return VideoMeta(m["video_id"], m["title"], m["channel"], int(m["duration_ms"]),
+                     m.get("subtitles") or {}, m.get("auto_captions") or {})
+
+
 def put(video_id: str, meta, cues: list, source: str = CAPTIONS) -> None:
     """Best effort: a cache that can't be written must not fail the request."""
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "saved_at": time.time(),
-            "meta": {"video_id": meta.video_id, "title": meta.title,
-                     "channel": meta.channel, "duration_ms": meta.duration_ms,
-                     "subtitles": meta.subtitles, "auto_captions": meta.auto_captions},
+            # No caption-track maps: they're only used to pick a track on freshly
+            # fetched metadata, never on a cached one, and they were most of the
+            # file -- 579KB for the largest entry against a 32KB median.
+            "meta": _meta_dict(meta),
             "cues": [[c.start_ms, c.end_ms, c.text] for c in cues],
             "source": source,
         }
@@ -115,5 +126,39 @@ def put_summary(key: str, payload: dict) -> None:
                        encoding="utf-8")
         tmp.replace(SUMMARY_DIR / f"{key}.json")
         _prune(SUMMARY_DIR)
+    except Exception:
+        pass
+
+
+# --- segment selections -------------------------------------------------------
+#
+# A selection costs a model call, and it used to live only in memory -- so every
+# restart, and every re-open of a summary served from the summary cache, paid for
+# it again. The key arrives already built (see server._seg_key): it covers the
+# video, the trim ratio, the selection prompt, the backend and the transcript.
+
+def get_segments(name: str):
+    """(meta, segments) stored under this name, or None."""
+    try:
+        raw = json.loads((SEGMENT_DIR / f"{name}.json").read_text(encoding="utf-8"))
+        if time.time() - float(raw["saved_at"]) > TTL_SECONDS:
+            return None
+        segments = raw["segments"]
+        if not isinstance(segments, list):
+            return None
+        return _meta_from(raw["meta"]), segments
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def put_segments(name: str, meta, segments: list) -> None:
+    """Best effort, like everything here: never fail a finished request."""
+    try:
+        SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SEGMENT_DIR / f"{name}.tmp"
+        tmp.write_text(json.dumps({"saved_at": time.time(), "meta": _meta_dict(meta),
+                                   "segments": segments}), encoding="utf-8")
+        tmp.replace(SEGMENT_DIR / f"{name}.json")
+        _prune(SEGMENT_DIR)
     except Exception:
         pass

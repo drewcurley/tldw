@@ -813,7 +813,8 @@ def test_prefetch_publishes_progress_as_it_finds_clips(monkeypatch):
                     on_segment_ready=None):
         assert on_segment_ready is not None       # must take the streaming path
         on_segment_ready({"start": 10.0, "end": 60.0, "label": "0:10"})
-        seen.append(dict(server._seg_progress.get(("progvid", None)) or {}))
+        seen.append(next((dict(v) for k, v in server._seg_progress.items()
+                          if k[0] == "progvid"), {}))
         done.set()
         return _prefetched[0], []
 
@@ -824,7 +825,7 @@ def test_prefetch_publishes_progress_as_it_finds_clips(monkeypatch):
     assert seen[0]["found"] == 1 and seen[0]["pos_ms"] == 60_000
     assert seen[0]["duration_ms"] == 600_000
     time.sleep(0.2)
-    assert ("progvid", None) not in server._seg_progress   # cleaned up when done
+    assert not any(k[0] == "progvid" for k in server._seg_progress)  # cleaned up
 
 
 # --- trim strength ------------------------------------------------------------
@@ -832,11 +833,12 @@ def test_prefetch_publishes_progress_as_it_finds_clips(monkeypatch):
 def test_selections_are_cached_per_trim_strength(monkeypatch):
     """A tighter cut must not be served the looser selection prefetched earlier."""
     meta = VideoMeta("ratiovid", "T", "C", 600_000, {}, {})
-    server._seg_cache_put("ratiovid", meta, [{"start": 0, "end": 300}], None)
-    server._seg_cache_put("ratiovid", meta, [{"start": 0, "end": 100}], 0.25)
-    assert server._seg_cache_get("ratiovid", None)[1][0]["end"] == 300
-    assert server._seg_cache_get("ratiovid", 0.25)[1][0]["end"] == 100
-    assert server._seg_cache_get("ratiovid", 0.4) is None      # not yet selected
+    key = lambda r: server._seg_key("ratiovid", r)
+    server._seg_cache_put(key(None), meta, [{"start": 0, "end": 300}])
+    server._seg_cache_put(key(0.25), meta, [{"start": 0, "end": 100}])
+    assert server._seg_cache_get(key(None))[1][0]["end"] == 300
+    assert server._seg_cache_get(key(0.25))[1][0]["end"] == 100
+    assert server._seg_cache_get(key(0.4)) is None      # not yet selected
 
 
 def test_auto_and_an_explicit_ratio_are_different_keys():
@@ -865,7 +867,7 @@ def test_prefetch_uses_the_pages_trim_strength(srv, monkeypatch):
         # The prefetch only starts when there's a transcript to select from.
         return core.Summary(base.meta, base.result, base.cue_count, ["a cue"])
 
-    def fake_prefetch(meta, cues, model=None, ratio=None):
+    def fake_prefetch(meta, cues, model=None, ratio=None, source=None):
         seen["ratio"] = ratio
 
     monkeypatch.setattr(server.core, "summarize_url", fake)
@@ -885,7 +887,8 @@ def test_transcript_survives_a_restart(monkeypatch, tmp_path):
     from youtube_tldw import txcache
     monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path)
     from youtube_tldw.transcript import Cue
-    meta = VideoMeta("diskvid", "T", "C", 1000, {"en": []}, {})
+    meta = VideoMeta("diskvid", "T", "C", 1000,
+                     {"en": [{"url": "https://example/caption-track"}]}, {})
     cues = [Cue(0, 900, "hello"), Cue(900, 1800, "there")]
 
     server._cache_put("diskvid", meta, cues)
@@ -896,7 +899,9 @@ def test_transcript_survives_a_restart(monkeypatch, tmp_path):
     assert hit is not None, "re-fetched instead of reading the cache"
     got_meta, got_cues = hit
     assert got_meta.video_id == "diskvid" and got_meta.duration_ms == 1000
-    assert got_meta.subtitles == {"en": []}
+    # Caption-track URL maps are deliberately not kept: they're only ever used on
+    # freshly fetched metadata, and they were most of each file.
+    assert got_meta.subtitles == {} and got_meta.auto_captions == {}
     assert [(c.start_ms, c.end_ms, c.text) for c in got_cues] == \
         [(0, 900, "hello"), (900, 1800, "there")]
     with server._cache_lock:                      # and it's back in memory
@@ -1885,3 +1890,200 @@ def test_a_bad_body_to_the_stop_route_is_a_400(srv):
     with pytest.raises(urllib.error.HTTPError) as e:
         urllib.request.urlopen(req, timeout=5)
     assert e.value.code == 400
+
+
+# --- segment selections: made once, kept, never paid for twice -----------------
+#
+# Selection is the most expensive step tldw runs (54% of spend), and it used to
+# be recomputed on every restart, on every re-open of a cached summary for anyone
+# with a numeric segment ratio, and after every regenerate.
+
+def _counting_select(monkeypatch, segments=None):
+    calls = []
+
+    def fake(url, ratio, lang, *, timeout, _prefetched=None, max_length_ms=None,
+             on_progress=None, on_segment_ready=None):
+        calls.append({"ratio": ratio, "model": server.claude_client.current_model(),
+                      "max": max_length_ms})
+        meta = _prefetched[0] if _prefetched else VideoMeta(
+            "dQw4w9WgXcQ", "T", "C", 600_000, {}, {})
+        return meta, list(segments or [{"start": 1.0, "end": 9.0, "label": "0:01"}])
+
+    monkeypatch.setattr(server.core, "select_segments", fake)
+    return calls
+
+
+def _wait_prefetch_idle(timeout=5):
+    deadline = time.monotonic() + timeout
+    while server._seg_prefetch_events and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def _meta_cues():
+    from youtube_tldw.transcript import Cue
+    return (VideoMeta("dQw4w9WgXcQ", "T", "C", 600_000, {}, {}),
+            [Cue(0, 900, "a"), Cue(900, 1800, "b")])
+
+
+def test_a_selection_survives_a_restart(monkeypatch):
+    calls = _counting_select(monkeypatch)
+    meta, cues = _meta_cues()
+    server._start_seg_prefetch(meta, cues, "opus", 0.25)
+    _wait_prefetch_idle()
+    with server._cache_lock:
+        server._seg_cache.clear()                 # simulate a restart
+    server._start_seg_prefetch(meta, cues, "opus", 0.25)
+    _wait_prefetch_idle()
+    assert len(calls) == 1, "a restart threw away a selection already paid for"
+
+
+def test_prefetch_checks_its_own_cache_so_no_caller_can_pay_twice(monkeypatch):
+    """The check used to sit at one call site and not the other."""
+    calls = _counting_select(monkeypatch)
+    meta, cues = _meta_cues()
+    for _ in range(3):
+        server._start_seg_prefetch(meta, cues, "opus", None)
+        _wait_prefetch_idle()
+    assert len(calls) == 1
+
+
+def test_reopening_a_cached_summary_with_a_numeric_ratio_doesnt_reselect(srv,
+                                                                         monkeypatch):
+    """The old check used the summary ratio, which the extension never sends, so
+    anyone with a segment ratio paid for a fresh selection on every re-open."""
+    _, port = srv
+    calls = _counting_select(monkeypatch)
+    monkeypatch.setattr(server.core, "summarize_url",
+                        lambda *a, **k: core.Summary(_summary().meta, _summary().result,
+                                                     2, _meta_cues()[1]))
+    body = {"url": "https://youtu.be/dQw4w9WgXcQ", "model": "opus",
+            "segment_ratio": 0.25}
+    _read_ndjson(port, body, _auth())             # summarize + prefetch
+    _wait_prefetch_idle()
+    for _ in range(3):                            # re-open, served from summary cache
+        events = _read_ndjson(port, body, _auth())
+        assert events[-1].get("cached") is True
+        _wait_prefetch_idle()
+    assert len(calls) == 1
+
+
+def test_regenerate_redoes_the_summary_not_the_selection(srv, monkeypatch):
+    _, port = srv
+    calls = _counting_select(monkeypatch)
+    monkeypatch.setattr(server.core, "summarize_url",
+                        lambda *a, **k: core.Summary(_summary().meta, _summary().result,
+                                                     2, _meta_cues()[1]))
+    body = {"url": "https://youtu.be/dQw4w9WgXcQ", "model": "opus"}
+    _read_ndjson(port, body, _auth())
+    _wait_prefetch_idle()
+    _read_ndjson(port, {**body, "refresh": True}, _auth())
+    _wait_prefetch_idle()
+    assert len(calls) == 1
+
+
+def test_a_selection_by_one_model_is_not_served_to_another(monkeypatch):
+    calls = _counting_select(monkeypatch)
+    meta, cues = _meta_cues()
+    server._start_seg_prefetch(meta, cues, "sonnet", None)
+    _wait_prefetch_idle()
+    server._start_seg_prefetch(meta, cues, "opus", None)
+    _wait_prefetch_idle()
+    assert [c["model"] for c in calls] == ["sonnet", "opus"]
+
+
+def test_a_request_does_not_wait_on_another_models_prefetch(srv, monkeypatch):
+    """A prefetch under model A is not something model B's request can use, so
+    waiting for it would only add its whole runtime before paying anyway."""
+    _, port = srv
+    meta, cues = _meta_cues()
+    server._cache_put("dQw4w9WgXcQ", meta, cues)
+    gate, calls = threading.Event(), []
+
+    def fake(url, ratio, lang, *, timeout, _prefetched=None, max_length_ms=None,
+             on_progress=None, on_segment_ready=None):
+        model = server.claude_client.current_model()
+        calls.append(model)
+        if model == "sonnet":
+            gate.wait(10)                         # the other model's slow prefetch
+        return _prefetched[0], [{"start": 1.0, "end": 9.0, "label": "0:01"}]
+
+    monkeypatch.setattr(server.core, "select_segments", fake)
+    server._start_seg_prefetch(meta, cues, "sonnet", None)
+    try:
+        t0 = time.monotonic()
+        events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
+                                     "model": "opus"}, _auth(), path="/segments/stream")
+        assert time.monotonic() - t0 < 4, "waited on a prefetch it couldn't use"
+        assert events[-1]["type"] in ("segments", "segments_done")
+        assert "opus" in calls
+    finally:
+        gate.set()
+        _wait_prefetch_idle()
+
+
+def test_a_capped_request_neither_reads_nor_overwrites_the_shared_selection(
+        srv, monkeypatch):
+    _, port = srv
+    meta, cues = _meta_cues()
+    server._cache_put("dQw4w9WgXcQ", meta, cues)
+    shared = [{"start": 1.0, "end": 200.0, "label": "0:01"}]
+    server._seg_cache_put(server._seg_key("dQw4w9WgXcQ", None), meta, shared)
+    calls = _counting_select(monkeypatch, [{"start": 1.0, "end": 9.0, "label": "0:01"}])
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ", "max_length": "30s"},
+                 _auth(), path="/segments/stream")
+    assert len(calls) == 1                        # didn't read the uncapped one
+    assert server._seg_cache_get(server._seg_key("dQw4w9WgXcQ", None))[1] == shared
+
+
+def test_the_segment_fingerprint_moves_with_the_listing_format(monkeypatch):
+    from youtube_tldw import summarize
+    before = core._segment_fingerprint()
+    monkeypatch.setattr(summarize, "LISTING_FORMAT", "v3: something else")
+    assert core._segment_fingerprint() != before
+
+
+def test_the_segment_fingerprint_moves_with_the_span_constants(monkeypatch):
+    before = core._segment_fingerprint()
+    monkeypatch.setattr(core, "BOUNDARY_PAD_MS", core.BOUNDARY_PAD_MS + 1)
+    assert core._segment_fingerprint() != before
+
+
+# --- is key-moments prefetch worth what it costs? ------------------------------
+
+def _usage_rows():
+    from youtube_tldw import usage
+    return usage.read_rows()
+
+
+def test_selection_rows_say_whether_they_were_prefetched_or_requested(srv,
+                                                                       monkeypatch):
+    _, port = srv
+    from youtube_tldw import usage
+    rec = lambda step: usage.record(usage.Usage(step=step, cost_usd=0.01))
+
+    def fake(url, ratio, lang, *, timeout, _prefetched=None, max_length_ms=None,
+             on_progress=None, on_segment_ready=None):
+        rec("segments")
+        meta = _prefetched[0] if _prefetched else _meta_cues()[0]
+        return meta, [{"start": 1.0, "end": 9.0, "label": "0:01"}]
+
+    monkeypatch.setattr(server.core, "select_segments", fake)
+    meta, cues = _meta_cues()
+    server._start_seg_prefetch(meta, cues, "opus", 0.25)
+    _wait_prefetch_idle()
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ", "ratio": 0.4},
+                 _auth(), path="/segments/stream")
+    triggers = [r.get("trigger") for r in _usage_rows() if r.get("step") == "segments"]
+    assert triggers == ["prefetch", "request"]
+
+
+def test_every_way_a_selection_reaches_the_panel_is_counted(srv, monkeypatch):
+    _, port = srv
+    _counting_select(monkeypatch)
+    meta, cues = _meta_cues()
+    server._cache_put("dQw4w9WgXcQ", meta, cues)
+    url = "https://youtu.be/dQw4w9WgXcQ"
+    _read_ndjson(port, {"url": url}, _auth(), path="/segments/stream")    # live
+    _read_ndjson(port, {"url": url}, _auth(), path="/segments/stream")    # cache
+    served = [r["how"] for r in _usage_rows() if r.get("kind") == "segments_served"]
+    assert served == ["live", "cache"]

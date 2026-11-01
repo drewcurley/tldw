@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from . import TldrError
 from .claude_client import ask_json, is_claude_cli, stream_ndjson, stream_ndjson_segments
-from .timing import format_length, to_ffmpeg_ts
+from .timing import format_clock, format_length
 from .transcript import Cue
 
 # Defensive single-pass cap (chars). Opus has a 1M-token window, so this is
@@ -86,7 +86,7 @@ Return ONLY a JSON object with this schema:
 _VIDEO_PROMPT_BODY = (
     "You are selecting the segments of a video to KEEP for a TL;DW "
     "recut. Input (on stdin): metadata then the transcript as numbered cues, one per "
-    "line, formatted `[index] (timestamp) text`.\n\n"
+    "line, formatted `[index] m:ss text`.\n\n"
     "Pick the cue ranges that together preserve every key point as a much shorter cut.\n"
     "Select whole ranges of consecutive cues. Keep them in chronological order. Prefer\n"
     "fewer, longer ranges over many tiny ones.\n\n"
@@ -98,8 +98,8 @@ _VIDEO_PROMPT_BODY = (
     "- Set last_cue to the cue containing the FINAL word of the closing sentence.\n"
     "- If a key point spans several sentences, include ALL of them so the thought is\n"
     "  complete and self-contained.\n"
-    "- The transcript may be auto-generated: lowercase, no punctuation, and cues split\n"
-    "  mid-phrase. Do NOT trust cue boundaries as sentence boundaries — use meaning,\n"
+    "- Cues are often split mid-phrase, and some transcripts are auto-generated with no\n"
+    "  punctuation. Do NOT trust cue boundaries as sentence boundaries — use meaning,\n"
     "  grammar, and natural pauses to find where sentences actually begin and end.\n"
     "- When in doubt, extend the range to include the whole thought. A slightly longer\n"
     "  but coherent segment is REQUIRED; a shorter but choppy/mid-thought cut is WRONG.\n\n"
@@ -112,7 +112,7 @@ _VIDEO_PROMPT = _VIDEO_PROMPT_BODY + (
     "\n\nReturn ONLY a JSON object, no prose, with this schema:\n"
     "{{\n"
     '  "segments": [\n'
-    '    {{"first_cue": 0, "last_cue": 12, "reason": "why this matters"}}\n'
+    '    {{"first_cue": 0, "last_cue": 12}}\n'
     "  ],\n"
     '  "chosen_ratio": 0.0,\n'
     '  "rationale": "one sentence on the overall length you chose"\n'
@@ -124,7 +124,7 @@ _VIDEO_PROMPT = _VIDEO_PROMPT_BODY + (
 _VIDEO_PROMPT_STREAM = _VIDEO_PROMPT_BODY + (
     "\n\nOutput each selected segment on its own line as JSON the moment you identify it"
     " — do NOT wait until the end:\n"
-    '{{"first_cue": 0, "last_cue": 12, "reason": "why this matters"}}\n\n'
+    '{{"first_cue": 0, "last_cue": 12}}\n\n'
     "After all segments, one final summary line:\n"
     '{{"chosen_ratio": 0.0, "rationale": "one sentence on the overall length you chose"}}\n\n'
     "Output ONLY these JSON lines. No prose, no markdown, no other text."
@@ -242,10 +242,23 @@ def _metadata_header(channel: str, title: str) -> str:
     return f"TITLE: {title}\nCHANNEL: {channel}\n\n"
 
 
-def format_cues_for_selection(cues: list[Cue]) -> str:
-    return "\n".join(
-        f"[{i}] ({to_ffmpeg_ts(c.start_ms)}) {c.text}" for i, c in enumerate(cues)
-    )
+# Bumped whenever the listing's shape changes, so a selection made from the old
+# format is never served for the new one (see core.SEGMENT_FINGERPRINT).
+LISTING_FORMAT = "v2: [index] m:ss text"
+
+
+def format_cues_for_selection(cues: list[Cue], indices=None) -> str:
+    """The numbered cue listing segment selection reads. Every path builds it here.
+
+    `m:ss` (or `h:mm:ss` past an hour) rather than `HH:MM:SS.mmm`: the model picks
+    cue indices, never times, so the milliseconds were pure input tokens -- 8% of
+    the listing on a measured 32-minute video.
+
+    `indices` selects a subset while keeping GLOBAL indices, for the chunked path.
+    """
+    order = range(len(cues)) if indices is None else indices
+    return "\n".join(f"[{i}] {format_clock(cues[i].start_ms)} {cues[i].text}"
+                     for i in order)
 
 
 def _chunk(seq: list, size: int) -> list[list]:
@@ -416,9 +429,7 @@ def select_video_segments(
     batch_ranges: list[tuple[int, int]] = []
     ratios: list[float] = []
     for group in _chunk(list(range(len(cues))), approx_per):
-        sub_listing = "\n".join(
-            f"[{i}] ({to_ffmpeg_ts(cues[i].start_ms)}) {cues[i].text}" for i in group
-        )
+        sub_listing = format_cues_for_selection(cues, group)
         sel = ask_json(
             prompt, header + sub_listing,
             validate=_make_video_validator(len(cues), lo=group[0], hi=group[-1]),

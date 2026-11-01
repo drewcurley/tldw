@@ -395,7 +395,11 @@ def _run_usage(argv: list[str]) -> int:
         return (int(r.get("input_tokens") or 0) + int(r.get("cache_creation_tokens") or 0)
                 + int(r.get("cache_read_tokens") or 0))
 
-    calls = [r for r in rows if r.get("kind") != "video"]
+    # Only rows that are model calls. "video" rows note a finished summary and
+    # "segments_served" rows note a selection reaching the panel -- neither costs
+    # anything, and counting them inflated the call totals and per-step averages.
+    calls = [r for r in rows if r.get("kind") not in ("video", "segments_served")]
+    served = [r for r in rows if r.get("kind") == "segments_served"]
     total_cost = sum(float(r.get("cost_usd") or 0) for r in calls)
     st = usage_mod.stats(path)
     if st["videos"]:
@@ -463,6 +467,19 @@ def _run_usage(argv: list[str]) -> int:
         print()
         print(f"per video: median ${mid:.4f} · mean "
               f"${sum(costs)/len(costs):.4f} · p95 ${p95:.4f} · max ${costs[-1]:.4f}")
+    # Key moments are prefetched after every summary whether or not anyone plays
+    # them, and that prefetch is most of the spend. This is the number that says
+    # whether it's worth it.
+    selections = [r for r in rows if r.get("step") == "segments"]
+    if selections or served:
+        prefetched = [r for r in selections if r.get("trigger") == "prefetch"]
+        requested = [r for r in selections if r.get("trigger") == "request"]
+        untagged = len(selections) - len(prefetched) - len(requested)
+        print()
+        print(f"key moments: {len(prefetched)} prefetched "
+              f"(${sum(float(r.get('cost_usd') or 0) for r in prefetched):.2f}), "
+              f"{len(requested)} on request, {len(served)} played"
+              + (f" · {untagged} recorded before tracking began" if untagged else ""))
     print(f"\n(from {path or usage_mod.USAGE_FILE})")
     return 0
 

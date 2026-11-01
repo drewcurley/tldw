@@ -23,6 +23,28 @@ MIN_CLIP_MS = 1200
 BOUNDARY_PAD_MS = 600
 
 
+def _segment_fingerprint() -> str:
+    """Changes whenever anything that shapes a cached selection changes.
+
+    A cached selection is padded, merged, length-capped spans in seconds, so it
+    depends on more than the prompt: the listing the model reads, the wording of
+    the trim clauses, and the span constants above. Leaving any of them out would
+    serve a selection the current code wouldn't produce.
+    """
+    import hashlib
+    blob = "|".join((
+        summarize._VIDEO_PROMPT_BODY, summarize._VIDEO_PROMPT,
+        summarize._VIDEO_PROMPT_STREAM, summarize.LISTING_FORMAT,
+        summarize._ratio_clause(None), summarize._ratio_clause(0.5),
+        summarize._maxlen_clause(None), summarize._maxlen_clause(60_000),
+        str(MIN_CLIP_MS), str(BOUNDARY_PAD_MS),
+    ))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
+SEGMENT_FINGERPRINT = _segment_fingerprint()
+
+
 @dataclass
 class Summary:
     meta: md.VideoMeta
