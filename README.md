@@ -119,6 +119,7 @@ tldw "https://youtu.be/VIDEO_ID" --mode video --ratio 0.2 --keep-source
 | `tldw URL [options]` | Summarize one video to text or a recut video. |
 | `tldw serve` | Loopback HTTP API for the browser extension. |
 | `tldw usage` | Tokens, cost, and hours saved — see [Token usage and cost](#token-usage-and-cost). |
+| `tldw cache` | What tldw keeps on disk; `tldw cache clean` tidies it — see [Disk use](#disk-use). |
 | `tldw config` | Persistent settings (default output dir, model backend). |
 
 ### Options
@@ -261,6 +262,44 @@ personal Claude Code instructions were sent along with every transcript. One-sho
 calls also leave no session files behind in `~/.claude/projects`. Follow-up
 questions resume the video's existing model session, so only the new question is
 sent rather than the whole transcript again.
+
+Summaries and key-moment selections run with prompt caching **off**. Nothing ever
+resumes them, so the cache entry each one wrote was never read — and the CLI bills
+that write at twice the input rate. Measured on a real selection: $0.122 → $0.070
+per call, with identical output. Questions keep caching on, because their
+follow-ups do read it.
+
+`claude` runs in tldw's own directory (`~/.cache/youtube-tldw/claude`), so the
+sessions follow-up questions create live in their own Claude Code project rather
+than among your own sessions.
+
+Key moments are selected automatically after every summary so they're ready when
+you click, and that selection is most of the spend. `tldw usage` reports how many
+of those prefetched selections were ever played — the number that says whether
+the prefetch is worth it. Selections are kept on disk, so a restart, a re-opened
+summary, or a regenerate doesn't pay for one again.
+
+## Disk use
+
+```bash
+tldw cache            # what tldw keeps, area by area
+tldw cache clean      # remove what it no longer needs (--dry-run to see first)
+```
+
+`clean` removes cache entries past their TTL (which can never be served anyway),
+transcription audio left by an interrupted run, voice files the extension can no
+longer select, and voices you haven't *listened* with in 30 days — usually ones you
+only previewed. It never removes the default voice or the one you used most
+recently, prunes no voices at all until it has been tracking use for 30 days, and
+never touches the Whisper models. `tldw serve` does the part with no possible
+downside — leftover audio and unselectable voices — each time it starts.
+
+faster-whisper models in Hugging Face's own cache (`~/.cache/huggingface/hub`) aren't
+tldw's: it keeps its own copy. `tldw cache` lists any it finds, with the command to
+remove each, and leaves the decision to you.
+
+**Upgrading:** key-moment selections made by earlier versions are re-made once per
+video, because the selection prompt changed. Cached summaries are unaffected.
 
 ## Output
 
