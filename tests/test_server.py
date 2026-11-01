@@ -26,26 +26,17 @@ TOKEN = "test-token-123"
 EXT_ORIGIN = "chrome-extension://abcdefghijklmnop"
 
 
-@pytest.fixture(autouse=True)
-def _clear_caches(tmp_path, monkeypatch):
-    # The disk cache too: without this the tests write transcripts into the real
-    # ~/.cache and leak state into each other.
-    from youtube_tldw import txcache
-    monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path / "txcache")
-    monkeypatch.setattr(txcache, "SUMMARY_DIR", tmp_path / "summaries")
-    caches = (server._transcript_cache, server._seg_cache, server._ask_sessions,
-              server._tx_jobs)
-    for cache in caches:
-        cache.clear()
-    yield
-    for cache in caches:
-        cache.clear()
+# Home-directory isolation and the server's registries are reset for every test
+# by tests/conftest.py.
 
 
 @pytest.fixture
 def srv():
     s = server._Server(("127.0.0.1", 0), token=TOKEN, allow_origin=None)
-    threading.Thread(target=s.serve_forever, daemon=True).start()
+    # The default 0.5s poll is pure waiting in shutdown(): 75 tests x 0.5s was
+    # most of the suite's runtime.
+    threading.Thread(target=s.serve_forever, kwargs={"poll_interval": 0.05},
+                     daemon=True).start()
     yield s, s.server_address[1]
     s.shutdown()
     s.server_close()
