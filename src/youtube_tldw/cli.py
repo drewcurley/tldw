@@ -367,6 +367,93 @@ def _run_config(args: list[str]) -> int:
     return 1
 
 
+def _short(path: Path) -> str:
+    home = str(Path.home())
+    s = str(path)
+    return "~" + s[len(home):] if s.startswith(home) else s
+
+
+def _run_cache(argv: list[str]) -> int:
+    """`tldw cache` — what tldw keeps on disk; `tldw cache clean` tidies it."""
+    from . import audio, hygiene, server, txcache
+    from . import whisper_transcribe as wt
+    p = argparse.ArgumentParser(
+        prog="tldw cache",
+        description="Show what tldw keeps on disk, or clean up what it no longer needs.")
+    p.add_argument("action", nargs="?", choices=["clean"],
+                   help="remove expired entries, leftover transcription audio, and "
+                        "voices not listened with in 30 days")
+    p.add_argument("--dry-run", action="store_true",
+                   help="with clean: say what would be removed, remove nothing")
+    args = p.parse_args(argv)
+
+    areas = [("transcripts", txcache.CACHE_DIR), ("summaries", txcache.SUMMARY_DIR),
+             ("key moments", txcache.SEGMENT_DIR), ("voices", audio.VOICE_DIR),
+             ("whisper models", wt._CACHE_DIR)]
+
+    if args.action == "clean":
+        out = hygiene.Removal()
+        for _name, d in areas[:3]:
+            for f in hygiene.expired_entries(d, txcache.TTL_SECONDS):
+                hygiene.remove_under(f, d, out, dry_run=args.dry_run)
+        swept = hygiene.sweep_stale_audio(server._stale_audio_age(),
+                                          dry_run=args.dry_run)
+        out.removed += swept.removed
+        out.freed += swept.freed
+        allowed = [model for model, _label in audio.VOICES.values()]
+        keep = audio.VOICES[audio.DEFAULT_VOICE][0]
+        for f in (hygiene.unlisted_voice_files(audio.VOICE_DIR, allowed)
+                  + hygiene.idle_voice_files(audio.VOICE_DIR, allowed, keep)):
+            hygiene.remove_under(f, audio.VOICE_DIR, out, dry_run=args.dry_run)
+        verb = "would remove" if args.dry_run else "removed"
+        if not out.removed:
+            print("Nothing to clean up.")
+        else:
+            for f in out.removed:
+                print(f"  {verb} {_short(f)}")
+            print(f"{verb.capitalize()} {len(out.removed)} item(s), "
+                  f"{hygiene.human(out.freed)}.")
+        _report_not_ours(hygiene)
+        return 0
+
+    total = 0
+    rows = []
+    for name, d in areas:
+        size = hygiene._size(d) if d.exists() else 0
+        total += size
+        if name == "voices":
+            n = len(list(d.glob("*.onnx"))) if d.exists() else 0
+            what = f"{n} voice(s)"
+        elif name == "whisper models":
+            what = f"model: {wt.resolve_model()}"
+        else:
+            n = len(list(d.glob("*.json"))) if d.exists() else 0
+            what = f"{n} entr{'y' if n == 1 else 'ies'}"
+        rows.append((name, size, what))
+    print(f"tldw keeps {hygiene.human(total)} on disk")
+    for name, size, what in rows:
+        print(f"  {name:<15} {hygiene.human(size):>9}   {what}")
+    _report_not_ours(hygiene)
+    print("\n`tldw cache clean` removes expired entries, leftover transcription audio, "
+          "and voices\nyou haven't listened with in 30 days. It never removes Whisper "
+          "models.")
+    return 0
+
+
+def _report_not_ours(hygiene) -> None:
+    """Report -- never delete -- faster-whisper models in Hugging Face's cache."""
+    models = hygiene.huggingface_whisper_models()
+    if not models:
+        return
+    size = sum(hygiene._size(m) for m in models)
+    print(f"\nNot managed by tldw, never deleted by it: {len(models)} faster-whisper "
+          f"model(s) in Hugging Face's cache, {hygiene.human(size)}.")
+    print("tldw keeps its own models elsewhere. If nothing else on this machine uses "
+          "these:")
+    for m in models:
+        print(f"  rm -rf {_short(m)}")
+
+
 def _run_usage(argv: list[str]) -> int:
     """`tldw usage` — what the model calls have actually cost."""
     from . import usage as usage_mod
@@ -502,6 +589,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_config(argv[1:])
     if argv and argv[0] == "usage":
         return _run_usage(argv[1:])
+    if argv and argv[0] == "cache":
+        return _run_cache(argv[1:])
     if argv and argv[0] == "serve":
         from . import server
         sargs = _serve_parser().parse_args(argv[1:])

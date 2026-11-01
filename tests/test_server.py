@@ -400,7 +400,10 @@ def test_preview_returns_mp3_and_caches(srv, monkeypatch):
     monkeypatch.setattr(server.audio, "require_piper", lambda: None)
     calls = []
 
-    def counting(text, voice, *, timeout=None, on_progress=None):
+    def counting(text, voice, *, timeout=None, on_progress=None, record_use=True):
+        # A preview must not count as using the voice, or a voice that was only
+        # ever previewed would never become eligible for cleanup.
+        assert record_use is False
         calls.append(voice)
         yield b"PREVIEW-MP3"
 

@@ -4,6 +4,7 @@ TL;DW to natural speech with Piper (local neural TTS, no API keys).
 
 from __future__ import annotations
 
+import collections
 import importlib.util
 import platform
 import re
@@ -12,11 +13,15 @@ import threading
 import time
 from pathlib import Path
 
-from . import TldrError
+from . import TldrError, hygiene
 from .proc import run, stream_filter
 
-_voice_cache = {}            # model path -> loaded PiperVoice (load is ~1-2s)
+# model path -> loaded PiperVoice, most recently used last. Loading takes 1-2s, so
+# a voice in use stays loaded -- but each one holds its whole model in memory for
+# the life of the server, and previewing every voice used to keep all thirteen.
+_voice_cache: "collections.OrderedDict" = collections.OrderedDict()
 _voice_lock = threading.Lock()
+_MAX_LOADED_VOICES = 2
 _SENT = re.compile(r"[.!?]+(?:\s|$)")
 
 
@@ -28,6 +33,9 @@ def _load_voice(model_path: Path):
             from piper import PiperVoice  # lazy: avoid onnxruntime import until needed
             voice = PiperVoice.load(key)
             _voice_cache[key] = voice
+        _voice_cache.move_to_end(key)
+        while len(_voice_cache) > _MAX_LOADED_VOICES:
+            _voice_cache.popitem(last=False)
         return voice
 
 # Curated natural Piper voices (all verified in piper's voices.json), downloaded on
@@ -272,6 +280,7 @@ def _mp3_argv(sample_rate: int) -> list[str]:
 
 def stream_speech(
     text: str, voice_id: str, *, timeout: float = 600, on_progress=None,
+    record_use: bool = True,
 ):
     """Yield mp3 blocks as Piper synthesizes `text` — first audio in well under a
     second instead of after the whole script.
@@ -288,6 +297,10 @@ def stream_speech(
     model = ensure_voice(voice_id, on_progress=lambda m: log(m, None))
     log("loading voice…", None)
     voice = _load_voice(VOICE_DIR / f"{model}.onnx")
+    if record_use:
+        # A voice spoken with is kept; one that was only ever previewed is what
+        # `tldw cache clean` eventually removes. Previews pass record_use=False.
+        hygiene.mark_voice_spoken(VOICE_DIR / f"{model}.onnx")
 
     n = max(1, len([s for s in _SENT.split(text) if s.strip()]))  # sentence count
     log("synthesizing speech…", 0)
