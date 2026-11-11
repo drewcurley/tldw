@@ -70,7 +70,7 @@ billing — nothing is hard-wired to one provider.
 
 | You have | Configure |
 |---|---|
-| A Claude subscription (Pro/Max/Team) | Nothing — install the `claude` CLI and log in once. This is the default. |
+| A Claude subscription (Pro/Max/Team) | Nothing — install the `claude` CLI and log in once. This is the default. If the server keeps logging you out, run `claude setup-token` and set the token it prints as `CLAUDE_CODE_OAUTH_TOKEN` where `tldw serve` runs: several calls at once on a stored login can race ([anthropics/claude-code#76905](https://github.com/anthropics/claude-code/issues/76905)). |
 | An Anthropic API key | Same CLI, with `ANTHROPIC_API_KEY` set in the environment `tldw serve` runs in. |
 | Claude via Bedrock / Vertex / Foundry | Same CLI — those platforms use their own credentials; see Claude Code's own docs for the environment it expects. |
 | OpenAI, Gemini, Mistral, … | The [`llm`](https://llm.datasette.io) CLI: `tldw config llm_cmd "llm -m gpt-4o"` |
@@ -417,6 +417,10 @@ Powered by a small local server:
 ```bash
 tldw serve            # prints a bearer token (saved + reused); binds 127.0.0.1:8765
 ```
+
+It works on several videos at once: up to 6 model calls (summaries, key moments,
+questions — background prefetch never takes the last 2) and 2 read-alouds. Past
+that a request is told which limit it hit; startup prints both.
 
 Then load `extension/` unpacked and paste the token into the extension options — full
 steps in [`extension/README.md`](extension/README.md).

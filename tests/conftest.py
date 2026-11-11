@@ -62,6 +62,10 @@ def _isolated_home(tmp_path, monkeypatch):
         monkeypatch.delenv(key)
     for key in [k for k in os.environ if k.startswith("DISABLE_PROMPT_CACHING")]:
         monkeypatch.delenv(key)
+    # Credentials the server reports at startup (names only). Tests that check
+    # that report set exactly the ones they mean to.
+    for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
     # Where `tldw cache` looks for Hugging Face's models: a real cache exported in
     # the shell would otherwise be scanned (read-only, but still not the test's).
     for key in ("HF_HOME", "HF_HUB_CACHE"):
@@ -81,7 +85,7 @@ def _isolated_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _fresh_server_state(_isolated_home):
+def _fresh_server_state(_isolated_home, monkeypatch):
     """Every in-process registry the server keeps, emptied around each test --
     and background work allowed to finish *before* the home redirect is undone.
 
@@ -92,17 +96,30 @@ def _fresh_server_state(_isolated_home):
 
     Depends on _isolated_home so it is torn down first, while paths still point
     at the test's own directory.
+
+    Each test also gets fresh concurrency pools, so one leaked slot fails the test
+    that leaked it instead of turning the rest of the suite into 429s -- and a
+    leak, or a slot given back twice, fails the test outright. Given back twice
+    has to be counted rather than caught: it raises inside a handler's `finally`,
+    after the response has gone, where socketserver prints it and carries on.
     """
     from youtube_tldw import server
     registries = [getattr(server, name) for name in (
         "_transcript_cache", "_seg_cache", "_ask_sessions", "_tx_jobs",
         "_seg_prefetch_events", "_seg_progress", "_captionless_meta",
+        "_preview_cache",
     ) if hasattr(server, name)]
     for reg in registries:
         reg.clear()
+    pools = server._make_pools()
+    monkeypatch.setattr(server, "_claude_slots", pools[0])
+    monkeypatch.setattr(server, "_speech_slots", pools[1])
     yield
+    # Polled, not checked once: a handler can still be in its `finally` after its
+    # client has read the whole response.
     deadline = time.monotonic() + 10
-    while (server._seg_prefetch_events or server._tx_jobs) and time.monotonic() < deadline:
+    while ((server._seg_prefetch_events or server._tx_jobs
+            or any(p.in_use for p in pools)) and time.monotonic() < deadline):
         time.sleep(0.02)
     still_running = list(server._seg_prefetch_events) + list(server._tx_jobs)
     for reg in registries:
@@ -110,3 +127,8 @@ def _fresh_server_state(_isolated_home):
     assert not still_running, (
         f"background work outlived the test and would write to the real home "
         f"directory after teardown: {still_running}")
+    for p in pools:
+        assert p.in_use == 0, f"a {p.name} slot was never given back ({p.status()})"
+        assert p.over_released == 0, (
+            f"a {p.name} slot was given back {p.over_released} time(s) without "
+            f"being taken")

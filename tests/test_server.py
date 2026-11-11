@@ -1,5 +1,6 @@
 import json
 import os
+from contextlib import contextmanager
 import socket
 import threading
 import time
@@ -66,6 +67,24 @@ def _auth(extra=None):
          "Origin": EXT_ORIGIN}
     h.update(extra or {})
     return h
+
+
+@contextmanager
+def _filled(pool, n):
+    """Take `n` slots from `pool` in the test's own thread, and give them back.
+
+    From the test thread, so a request that gives back a slot it never took shows
+    up as a raise here, not as a quiet theft of one of these.
+    """
+    taken = 0
+    try:
+        for _ in range(n):
+            assert pool.try_take(), f"couldn't fill {pool.status()}"
+            taken += 1
+        yield
+    finally:
+        for _ in range(taken):
+            pool.give_back()
 
 
 def test_health_no_auth(srv):
@@ -155,16 +174,13 @@ def test_summarize_accepts_a_transcript_sized_body_but_not_an_endless_one(srv):
 
 
 def test_busy_returns_429(srv, monkeypatch):
-    s, port = srv
+    _, port = srv
     monkeypatch.setattr(server.core, "summarize_url", lambda *a, **k: _summary())
-    s.sem.acquire()
-    s.sem.acquire()  # saturate
-    try:
-        status, _, _ = _req(port, body={"url": "x"}, headers=_auth())
-        assert status == 429
-    finally:
-        s.sem.release()
-        s.sem.release()
+    pool = server._claude_slots
+    with _filled(pool, server.CLAUDE_LIMIT):
+        status, payload, _ = _req(port, body={"url": "x"}, headers=_auth())
+    assert status == 429
+    assert payload["error"] == pool.busy_message
 
 
 def test_preflight_allows_extension_origin(srv):
@@ -870,7 +886,7 @@ def test_prefetch_uses_the_pages_trim_strength(srv, monkeypatch):
         # The prefetch only starts when there's a transcript to select from.
         return core.Summary(base.meta, base.result, base.cue_count, ["a cue"])
 
-    def fake_prefetch(meta, cues, model=None, ratio=None, source=None):
+    def fake_prefetch(meta, cues, model=None, ratio=None, source=None, **k):
         seen["ratio"] = ratio
 
     monkeypatch.setattr(server.core, "summarize_url", fake)
@@ -1619,10 +1635,9 @@ def test_stopping_works_while_the_server_is_at_its_limit(srv, monkeypatch):
     server._start_transcription(meta, "small")
     assert started.wait(5)
 
-    # Take every ordinary concurrency slot, as two long requests would.
-    held = [s.sem.acquire(blocking=False) for _ in range(server.MAX_CONCURRENCY)]
-    try:
-        assert all(held)
+    # Take every ordinary slot, of both kinds, as long requests would.
+    with _filled(server._claude_slots, server.CLAUDE_LIMIT), \
+            _filled(server._speech_slots, server.SPEECH_LIMIT):
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/transcribe/stop",
             data=json.dumps({"url": "https://youtu.be/dQw4w9WgXcQ"}).encode(),
@@ -1631,9 +1646,6 @@ def test_stopping_works_while_the_server_is_at_its_limit(srv, monkeypatch):
             req.add_header(k, v)
         with urllib.request.urlopen(req, timeout=5) as r:
             assert json.loads(r.read())["stopped"] is True
-    finally:
-        for _ in held:
-            s.sem.release()
     assert stopped.wait(5)
 
 
@@ -1735,13 +1747,18 @@ def test_a_transcription_survives_the_client_hanging_up(srv, monkeypatch):
 
 
 def test_other_requests_are_served_while_a_transcription_runs(srv, monkeypatch):
-    """Waiting is not work. Holding a MAX_CONCURRENCY slot for the length of a
+    """Waiting is not work. Holding a claude slot for the length of a
     transcription would 429 every captioned summarize, question and stop -- the
-    starvation that putting the job outside the request was meant to prevent."""
+    starvation that putting the job outside the request was meant to prevent.
+
+    Every slot but one is taken first: with six of them, a transcription that kept
+    its slot would leave five free and this would pass regardless. And once the
+    transcript is in, the summary that follows is work again, made holding one."""
     _, port = srv
     from youtube_tldw.transcript import Cue
     release = threading.Event()
     joined = []
+    in_use_for_summary = []
 
     meta = VideoMeta("dQw4w9WgXcQ", "No Captions", "Chan", 600_000, {}, {})
 
@@ -1750,6 +1767,7 @@ def test_other_requests_are_served_while_a_transcription_runs(srv, monkeypatch):
         if "oHg5SJYRHA0" in url:                 # a different, captioned video
             return _summary()
         if _prefetched:
+            in_use_for_summary.append(server._claude_slots.in_use)
             return _summary()
         exc = NoTranscriptError("no captions")
         exc.meta = meta
@@ -1774,11 +1792,14 @@ def test_other_requests_are_served_while_a_transcription_runs(srv, monkeypatch):
             time.sleep(0.02)
         assert joined, "the transcription never started"
         # A completely unrelated, fully-captioned video must still be served.
-        events = _read_ndjson(port, {"url": "https://youtu.be/oHg5SJYRHA0"}, _auth())
+        with _filled(server._claude_slots, server.CLAUDE_LIMIT - 1):
+            events = _read_ndjson(port, {"url": "https://youtu.be/oHg5SJYRHA0"},
+                                  _auth())
         assert events[-1]["type"] == "result"
     finally:
         release.set()
         blocked.join(timeout=20)
+    assert in_use_for_summary == [1], "the summary after a transcription ran without a slot"
 
 
 def test_changing_the_whisper_model_retranscribes(srv, monkeypatch):
@@ -1916,13 +1937,17 @@ def _counting_select(monkeypatch, segments=None):
     return calls
 
 
-def _wait_prefetch_idle(timeout=5):
-    """Wait for background selections to finish -- and fail if they don't, rather
-    than letting the test carry on and assert on work that never happened."""
+def _wait_prefetch_idle(timeout=5, held=0):
+    """Wait for background selections to finish, slots given back included -- and
+    fail if they don't, rather than letting the test carry on and assert on work
+    that never happened. `held`: slots the test itself is holding."""
     deadline = time.monotonic() + timeout
-    while server._seg_prefetch_events and time.monotonic() < deadline:
+    pool = server._claude_slots
+    while ((server._seg_prefetch_events or pool.in_use > held)
+           and time.monotonic() < deadline):
         time.sleep(0.01)
     assert not server._seg_prefetch_events, "a background selection never finished"
+    assert pool.in_use == held, f"a background selection kept its slot ({pool.status()})"
 
 
 def _meta_cues():
@@ -2178,12 +2203,14 @@ def test_a_hit_still_gets_key_moments_ready(srv, monkeypatch):
     server._cache_put("dQw4w9WgXcQ", meta, cues)
     seen = []
     monkeypatch.setattr(server, "_start_seg_prefetch",
-                        lambda m, c, model=None, ratio=None, source=None:
-                        seen.append((model, ratio)))
+                        lambda m, c, model=None, ratio=None, source=None,
+                        caller_holds_slot=False:
+                        seen.append((model, ratio, caller_holds_slot)))
     _post_json(port, "/summarize/cached", {"url": "https://youtu.be/dQw4w9WgXcQ",
                                            "model": "opus", "segment_ratio": 0.25},
                _auth())
-    assert seen == [("opus", 0.25)]
+    # The cache check takes no slot, so it has none to hand over.
+    assert seen == [("opus", 0.25, False)]
 
 
 def test_the_probe_needs_a_token(srv):
@@ -2424,8 +2451,8 @@ def test_startup_cleanup_never_touches_a_live_transcriptions_audio():
 
 def test_a_silent_claude_gives_a_504_and_its_slot_back(srv, monkeypatch):
     """Item 8(e): the whole path, through the real streaming client. Before the
-    watchdog this hung forever holding one of the server's two slots, so the third
-    request here would have been refused."""
+    watchdog this hung forever holding its slot. Every other slot is taken, so a
+    slot that isn't given back makes the second request a 429, not a 504."""
     _, port = srv
     import sys
     monkeypatch.setattr(server.claude_client, "is_claude_cli", lambda: True)
@@ -2436,6 +2463,669 @@ def test_a_silent_claude_gives_a_504_and_its_slot_back(srv, monkeypatch):
     body = {"url": "https://youtu.be/dQw4w9WgXcQ", "refresh": True,
             "page": {"cues": [{"start_ms": 0, "text": "hello"}], "title": "T",
                      "channel": "C", "duration_ms": 60_000}}
-    for _ in range(server.MAX_CONCURRENCY + 1):
-        events = _read_ndjson(port, body, _auth())
-        assert events[-1].get("status") == 504, events[-1]
+    with _filled(server._claude_slots, server.CLAUDE_LIMIT - 1):
+        for _ in range(2):
+            events = _read_ndjson(port, body, _auth())
+            assert events[-1].get("status") == 504, events[-1]
+
+
+# --- limits that match what the work costs ---------------------------------------
+#
+# There used to be one limit of 2 for everything: a summary and its spoken version
+# filled the server, a free disk read got "busy", and the background prefetch --
+# the one thing nobody waits for -- had no limit at all.
+
+def _status(port, path, body):
+    """Status code and raw body of one POST, whatever the route streams back."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("POST", path, body=json.dumps(body), headers=_auth())
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, data
+
+
+def _stub_everything(monkeypatch):
+    """Cheap stand-ins for every route's work, so a request that is let through
+    finishes at once and only the limits are being tested."""
+    monkeypatch.setattr(server.core, "summarize_url", lambda *a, **k: _summary())
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    _counting_select(monkeypatch)
+    monkeypatch.setattr(server.audio, "require_piper", lambda: None)
+
+    def speech(text, voice, **k):           # speak and preview both
+        yield b"MP3"
+
+    monkeypatch.setattr(server.audio, "stream_speech", speech)
+
+
+REAL_START_SEG_PREFETCH = server._start_seg_prefetch
+VID_URL = "https://youtu.be/dQw4w9WgXcQ"
+SPEAK_BODY = {"title": "T", "channel": "C", "key_points": ["k"], "summary": "hi",
+              "voice": "amy"}
+
+# route, body, the pool it must count against (None: neither), its status once let in
+ROUTES = [
+    ("/summarize", {"url": VID_URL}, "claude", 200),
+    ("/summarize/stream", {"url": VID_URL}, "claude", 200),
+    ("/segments/stream", {"url": VID_URL}, "claude", 200),
+    ("/ask/stream", {"url": VID_URL, "question": ""}, "claude", 400),  # empty question
+    ("/speak", SPEAK_BODY, "speech", 200),
+    ("/speak/stream", SPEAK_BODY, "speech", 200),
+    ("/preview", {"voice": "cori"}, "speech", 200),                 # not yet made
+    ("/summarize/cached", {"url": VID_URL}, None, 200),
+]
+
+
+@pytest.mark.parametrize("path,body,pool_name,served", ROUTES,
+                         ids=[r[0] for r in ROUTES])
+@pytest.mark.parametrize("full", ["claude", "speech"])
+def test_each_route_counts_against_its_own_limit(srv, monkeypatch, path, body,
+                                                  pool_name, served, full):
+    """Every route against each pool filled: refused by its own, never by the
+    other's. A route mapped to the wrong pool fails one cell or the other."""
+    _, port = srv
+    _stub_everything(monkeypatch)
+    pool = {"claude": server._claude_slots, "speech": server._speech_slots}[full]
+    with _filled(pool, pool.limit):
+        status, data = _status(port, path, body)
+    if pool_name == full:
+        assert status == 429, (path, status, data[:200])
+        assert json.loads(data)["error"] == pool.busy_message
+        assert str(pool.limit) in pool.busy_message
+    else:
+        # The exact status, so a stub that broke can't pass for "let through".
+        assert status == served, (path, status, data[:200])
+
+
+def test_the_two_limits_say_different_things(monkeypatch):
+    claude, speech = server._make_pools()
+    assert claude.busy_message != speech.busy_message
+    assert claude.limit == server.CLAUDE_LIMIT and speech.limit == server.SPEECH_LIMIT
+
+
+def test_a_refusal_is_logged_with_how_full_the_pool_was(srv, monkeypatch, capsys):
+    _, port = srv
+    _stub_everything(monkeypatch)
+    with _filled(server._claude_slots, server.CLAUDE_LIMIT):
+        status, _ = _status(port, "/summarize/stream", {"url": VID_URL})
+    assert status == 429
+    deadline = time.monotonic() + 5
+    out = ""
+    while f"busy: claude {server.CLAUDE_LIMIT}/{server.CLAUDE_LIMIT}" not in out \
+            and time.monotonic() < deadline:
+        out += capsys.readouterr().out
+        time.sleep(0.01)
+    assert f"busy: claude {server.CLAUDE_LIMIT}/{server.CLAUDE_LIMIT}" in out
+
+
+def test_a_preview_already_made_needs_no_slot(srv, monkeypatch):
+    _, port = srv
+    _stub_everything(monkeypatch)
+    model = server.audio.resolve_voice("cori")
+    monkeypatch.setattr(server, "_preview_cache", {model: b"MADE"})
+    with _filled(server._speech_slots, server.SPEECH_LIMIT), \
+            _filled(server._claude_slots, server.CLAUDE_LIMIT):
+        status, data = _status(port, "/preview", {"voice": "cori"})
+    assert (status, data) == (200, b"MADE")
+
+
+def test_a_preview_that_fails_gives_its_slot_back(srv, monkeypatch):
+    _, port = srv
+    monkeypatch.setattr(server, "_preview_cache", {})
+    monkeypatch.setattr(server.audio, "require_piper", lambda: None)
+
+    def broken(*a, **k):
+        raise server.TldrError("piper fell over")
+        yield b""                                    # (a generator, like the real one)
+
+    monkeypatch.setattr(server.audio, "stream_speech", broken)
+    status, _ = _status(port, "/preview", {"voice": "cori"})
+    assert status == 502
+    # The pool is checked by conftest's teardown; this says why it would fail.
+    deadline = time.monotonic() + 5
+    while server._speech_slots.in_use and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server._speech_slots.in_use == 0
+
+
+# _Slots and _Hold on their own -----------------------------------------------------
+
+def test_slots_enforce_the_limit_and_a_refusal_takes_nothing():
+    s = server._Slots("t", 3, "busy")
+    assert [s.try_take() for _ in range(4)] == [True, True, True, False]
+    assert s.in_use == 3
+
+
+def test_slots_keep_free_is_honoured_on_both_sides_of_the_boundary():
+    s = server._Slots("t", 6, "busy")
+    assert all(s.try_take() for _ in range(3))
+    assert s.try_take(keep_free=2)          # 4 in use, 2 left free
+    assert not s.try_take(keep_free=2)      # would leave 1
+    assert s.in_use == 4
+    assert s.try_take()                     # a person can still have one
+
+
+def test_giving_back_more_than_was_taken_raises_and_is_counted():
+    s = server._Slots("t", 2, "busy")
+    with pytest.raises(RuntimeError):
+        s.give_back()
+    assert (s.in_use, s.over_released) == (0, 1)
+
+
+def test_take_waits_for_a_slot_and_gives_up_when_none_frees():
+    s = server._Slots("t", 1, "busy")
+    assert s.try_take()
+    assert s.take(timeout=0.05) is False
+    got = []
+    t = threading.Thread(target=lambda: got.append(s.take(timeout=5)))
+    t.start()
+    t.join(0.1)
+    assert t.is_alive(), "take() returned while the pool was full"
+    s.give_back()
+    t.join(0.5)                 # woken by the give-back, not by its own timeout
+    assert not t.is_alive() and got == [True] and s.in_use == 1
+
+
+def test_a_hold_gives_back_only_what_it_holds():
+    s = server._Slots("t", 2, "busy")
+    assert s.try_take()
+    h = server._Hold(s)
+    h.release()
+    h.close()                               # already released: nothing to give back
+    assert (s.in_use, s.over_released) == (0, 0)
+    assert h.retake(timeout=1) and s.in_use == 1
+    assert h.retake(timeout=1) and s.in_use == 1      # already held: no second slot
+    h.close()
+    assert (s.in_use, s.over_released) == (0, 0)
+
+
+# the prefetch ----------------------------------------------------------------------
+
+def _blocking_select(monkeypatch, *, fail=False):
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def fake(url, ratio, lang, *, timeout, _prefetched=None, **k):
+        calls.append(server._claude_slots.in_use)
+        entered.set()
+        release.wait(10)
+        if fail:
+            raise server.TldrError("selection failed")
+        return _prefetched[0], [{"start": 1.0, "end": 9.0, "label": "0:01"}]
+
+    monkeypatch.setattr(server.core, "select_segments", fake)
+    return entered, release, calls
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["succeeds", "fails"])
+def test_a_prefetch_holds_one_slot_and_gives_it_back(monkeypatch, fail):
+    entered, release, _ = _blocking_select(monkeypatch, fail=fail)
+    meta, cues = _meta_cues()
+    server._start_seg_prefetch(meta, cues, None, 0.25)
+    assert entered.wait(5)
+    assert server._claude_slots.in_use == 1
+    release.set()
+    _wait_prefetch_idle()
+
+
+def test_starting_the_same_prefetch_twice_takes_one_slot(monkeypatch):
+    entered, release, calls = _blocking_select(monkeypatch)
+    meta, cues = _meta_cues()
+    server._start_seg_prefetch(meta, cues, None, 0.25)
+    assert entered.wait(5)
+    server._start_seg_prefetch(meta, cues, None, 0.25)
+    assert server._claude_slots.in_use == 1
+    release.set()
+    _wait_prefetch_idle()
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("caller_holds", [False, True])
+def test_a_prefetch_never_takes_the_last_reserved_slots(monkeypatch, capsys,
+                                                         caller_holds):
+    """Both sides of the boundary. A caller that is about to give its own slot back
+    isn't counted against the reserve -- or opening a handful of videos at once
+    would skip prefetches that ran before there was a limit at all."""
+    calls = _counting_select(monkeypatch)
+    meta, cues = _meta_cues()
+    pool = server._claude_slots
+    room = server.CLAUDE_LIMIT - server.PREFETCH_RESERVE + (1 if caller_holds else 0)
+
+    with _filled(pool, room):                       # one too many: skipped
+        server._start_seg_prefetch(meta, cues, None, 0.25,
+                                   caller_holds_slot=caller_holds)
+        assert not server._seg_prefetch_events
+        assert pool.in_use == room
+    assert calls == []
+    assert f"prefetch skipped for dQw4w9WgXcQ: claude {room}/" in capsys.readouterr().out
+
+    with _filled(pool, room - 1):                   # exactly enough: runs
+        server._start_seg_prefetch(meta, cues, None, 0.25,
+                                   caller_holds_slot=caller_holds)
+        _wait_prefetch_idle(held=room - 1)
+    assert len(calls) == 1
+
+
+def test_a_skipped_prefetch_is_made_live_when_asked_for(srv, monkeypatch):
+    _, port = srv
+    calls = _counting_select(monkeypatch)
+    meta, cues = _meta_cues()
+    server._cache_put(meta.video_id, meta, cues)
+    with _filled(server._claude_slots, server.CLAUDE_LIMIT - server.PREFETCH_RESERVE):
+        server._start_seg_prefetch(meta, cues, None, None)
+    assert calls == []
+    events = _read_ndjson(port, {"url": VID_URL}, _auth(), path="/segments/stream")
+    assert events[-1]["type"] in ("segments", "segments_done")
+    assert len(calls) == 1
+
+
+# a request waiting on someone else's selection --------------------------------------
+
+def _waiting_on(monkeypatch):
+    """A selection in flight for the key the next key-moments request will use --
+    a prefetch, or another request's live call: the waiter's code is the same."""
+    monkeypatch.setattr(server, "_seg_key", lambda *a, **k: "K")
+    evt = threading.Event()
+    with server._cache_lock:
+        server._seg_prefetch_events["K"] = evt
+    return evt
+
+
+def _open_segments(port):
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("POST", "/segments/stream", body=json.dumps({"url": VID_URL}),
+                 headers=_auth())
+    resp = conn.getresponse()
+    first = json.loads(resp.readline())
+    return conn, resp, first
+
+
+def _rest(resp):
+    return [json.loads(ln) for ln in resp.read().decode().splitlines() if ln.strip()]
+
+
+def test_a_request_waiting_on_a_selection_holds_no_slot(srv, monkeypatch):
+    _, port = srv
+    _stub_everything(monkeypatch)
+    evt = _waiting_on(monkeypatch)
+    conn, resp, first = _open_segments(port)
+    try:
+        assert first["type"] == "progress"          # it is waiting now
+        # Everything but one slot taken: only free if the waiter gave its back.
+        with _filled(server._claude_slots, server.CLAUDE_LIMIT - 1):
+            status, data = _status(port, "/summarize/stream", {"url": VID_URL})
+        assert status == 200, data[:200]
+        meta, _cues = _meta_cues()
+        server._seg_cache_put("K", meta, [{"start": 1.0, "end": 9.0, "label": "0:01"}])
+        with server._cache_lock:
+            server._seg_prefetch_events.pop("K", None)
+        evt.set()
+        events = _rest(resp)
+    finally:
+        conn.close()
+    assert events[-1]["type"] == "segments"         # served what it waited for
+
+
+@pytest.mark.parametrize("how", ["failed", "timed out"])
+def test_a_waiter_that_falls_through_makes_the_call_holding_a_slot(
+        srv, monkeypatch, how):
+    """The selection it waited on failed, or ran past the budget: it makes the call
+    itself, as it always has -- and that is work, so it needs its slot back."""
+    _, port = srv
+    _stub_everything(monkeypatch)
+    in_use = []
+
+    def live(url, ratio, lang, *, timeout, _prefetched=None, **k):
+        in_use.append(server._claude_slots.in_use)
+        return VideoMeta("dQw4w9WgXcQ", "T", "C", 600_000, {}, {}), [
+            {"start": 1.0, "end": 9.0, "label": "0:01"}]
+
+    monkeypatch.setattr(server.core, "select_segments", live)
+    evt = _waiting_on(monkeypatch)
+    if how == "timed out":
+        monkeypatch.setattr(server, "SEGMENTS_TIMEOUT", 0.2)
+    conn, resp, _first = _open_segments(port)
+    try:
+        if how == "failed":
+            with server._cache_lock:
+                server._seg_prefetch_events.pop("K", None)
+            evt.set()
+        events = _rest(resp)
+    finally:
+        conn.close()
+        evt.set()
+        with server._cache_lock:
+            server._seg_prefetch_events.pop("K", None)
+    assert events[-1]["type"] in ("segments", "segments_done"), events[-1]
+    assert in_use == [1], "the live call ran without a slot"
+
+
+def test_a_waiter_that_cant_get_its_slot_back_says_so(srv, monkeypatch):
+    _, port = srv
+    _stub_everything(monkeypatch)
+    monkeypatch.setattr(server, "RETAKE_BUDGET", 0.3)
+    evt = _waiting_on(monkeypatch)
+    pool = server._claude_slots
+    conn, resp, _first = _open_segments(port)
+    try:
+        with _filled(pool, pool.limit):
+            with server._cache_lock:
+                server._seg_prefetch_events.pop("K", None)
+            t0 = time.monotonic()
+            evt.set()                                # failed: no selection to serve
+            events = _rest(resp)
+            took = time.monotonic() - t0
+    finally:
+        conn.close()
+    assert events[-1] == {"type": "error", "status": 429, "error": pool.busy_message}
+    assert took < 1.5, f"a {server.RETAKE_BUDGET}s budget took {took:.1f}s"
+    assert any(e.get("type") == "progress"
+               and e["message"].startswith("Waiting for a free slot") for e in events)
+
+
+def test_a_transcription_whose_client_left_doesnt_take_a_slot_back(srv, monkeypatch):
+    """Nothing is left to do for a client that hung up. Taking a slot back anyway
+    would block, with every slot in use, for nobody."""
+    _, port = srv
+    _captionless(monkeypatch)
+    from youtube_tldw.transcript import Cue
+    release, running = threading.Event(), threading.Event()
+    retakes, finished = [], threading.Event()
+
+    def slow(vid, wd, *, on_progress=None, **k):
+        if on_progress:
+            on_progress("transcribing...", 20.0)    # gives the wait loop something to write
+        running.set()
+        release.wait(15)
+        return [Cue(0, 900, "words")]
+
+    real_retake = server._Handler._retake
+    real_fallback = server._Handler._transcribe_fallback
+    real_tx_progress = server._tx_progress
+    progress_reads = []
+
+    def counting_tx_progress(vid):
+        progress_reads.append(time.monotonic())
+        return real_tx_progress(vid)
+
+    monkeypatch.setattr(server, "_tx_progress", counting_tx_progress)
+
+    def counting_retake(self, *a, **k):
+        retakes.append(1)
+        return real_retake(self, *a, **k)
+
+    def watched_fallback(self, *a, **k):
+        try:
+            return real_fallback(self, *a, **k)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(server._Handler, "_retake", counting_retake)
+    monkeypatch.setattr(server._Handler, "_transcribe_fallback", watched_fallback)
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video", slow)
+
+    payload = json.dumps({"url": VID_URL, "whisper": "always"}).encode()
+    request = (b"POST /summarize/stream HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+               b"Authorization: Bearer " + TOKEN.encode() + b"\r\n"
+               b"Origin: " + EXT_ORIGIN.encode() + b"\r\n"
+               b"Content-Type: application/json\r\n"
+               b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.sendall(request)
+    assert sock.recv(4096)
+    assert running.wait(5)
+    sock.close()
+    # Only a write notices a hang-up. Once it has, the wait loop stops reading the
+    # job's progress, so wait for those reads to stop -- not for a guessed time.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if progress_reads and time.monotonic() - progress_reads[-1] > 1.5:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("the handler never noticed the client had gone")
+    release.set()
+    assert finished.wait(15)
+    assert retakes == [], "a request nobody is waiting for took a slot back"
+
+
+# what startup says --------------------------------------------------------------
+
+@pytest.mark.parametrize("env,expect,absent", [
+    ({}, ["no CLAUDE_CODE_OAUTH_TOKEN"], ["ANTHROPIC_API_KEY"]),
+    ({"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-SECRET1"},
+     ["CLAUDE_CODE_OAUTH_TOKEN is set"], ["ANTHROPIC_API_KEY", "no CLAUDE"]),
+    ({"ANTHROPIC_API_KEY": "sk-ant-api-SECRET2"},
+     ["ANTHROPIC_API_KEY is set", "no CLAUDE_CODE_OAUTH_TOKEN"], []),
+    ({"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-SECRET1",
+      "ANTHROPIC_API_KEY": "sk-ant-api-SECRET2"},
+     ["CLAUDE_CODE_OAUTH_TOKEN is set", "ANTHROPIC_API_KEY is set"], ["no CLAUDE"]),
+], ids=["neither", "token", "api key", "both"])
+def test_startup_names_the_credentials_in_the_environment_never_their_values(
+        env, expect, absent):
+    text = "\n".join(server._login_lines(env))
+    for e in expect:
+        assert e in text
+    for a in absent:
+        assert a not in text
+    assert "SECRET" not in text
+
+
+def test_startup_reads_the_real_environment(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-SECRET3")
+    text = "\n".join(server._login_lines())
+    assert "CLAUDE_CODE_OAUTH_TOKEN is set" in text and "SECRET" not in text
+
+
+def test_startup_states_the_limits():
+    line = server._limits_line()
+    assert f"{server.CLAUDE_LIMIT} claude calls" in line
+    assert f"last {server.PREFETCH_RESERVE}" in line
+    assert f"{server.SPEECH_LIMIT} reading aloud" in line
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["fresh summary", "cached summary"])
+def test_a_summary_hands_its_slot_to_its_prefetch(srv, monkeypatch, cached):
+    """Both places a summary starts key moments do it as its own call ends, so its
+    slot isn't counted against the reserve. With the room left exactly that tight,
+    the prefetch runs only if the flag is passed."""
+    _, port = srv
+    calls = _counting_select(monkeypatch)
+    meta, cues = _meta_cues()
+    if cached:
+        _summarize_once(port, monkeypatch, None)       # writes the summary cache
+        server._cache_put(meta.video_id, meta, cues)
+        monkeypatch.setattr(server.core, "summarize_url",
+                            lambda *a, **k: pytest.fail("summarized again"))
+    else:
+        monkeypatch.setattr(server.core, "summarize_url",
+                            lambda *a, **k: core.Summary(meta, _summary().result,
+                                                         2, cues))
+    monkeypatch.setattr(server, "_start_seg_prefetch", REAL_START_SEG_PREFETCH)
+    held = server.CLAUDE_LIMIT - server.PREFETCH_RESERVE - 1
+    with _filled(server._claude_slots, held):
+        events = _read_ndjson(port, {"url": VID_URL}, _auth())
+        assert events[-1]["type"] == "result"
+        _wait_prefetch_idle(held=held)
+    assert len(calls) == 1, "the summary's prefetch was skipped"
+
+
+def test_a_prefetch_whose_thread_cant_start_undoes_everything(monkeypatch):
+    _counting_select(monkeypatch)
+    meta, cues = _meta_cues()
+
+    class NoThreads(threading.Thread):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    # Only the server module's view of threading: patching Thread.start itself
+    # would break any other thread that happened to start meanwhile.
+    import types
+    fake = types.SimpleNamespace(**vars(threading))
+    fake.Thread = NoThreads
+    monkeypatch.setattr(server, "threading", fake)
+    server._start_seg_prefetch(meta, cues, None, 0.25)
+    assert server._claude_slots.in_use == 0
+    assert not server._seg_prefetch_events
+
+
+def test_a_transcription_that_cant_get_its_slot_back_says_so(srv, monkeypatch):
+    """Once the transcript is in, the summary is work and needs a slot -- and a
+    full server says so rather than summarizing without one."""
+    _, port = srv
+    _captionless(monkeypatch)
+    from youtube_tldw.transcript import Cue
+    release, running = threading.Event(), threading.Event()
+    summarized = []
+
+    def slow(vid, wd, **k):
+        running.set()
+        release.wait(15)
+        return [Cue(0, 900, "words")]
+
+    real = server.core.summarize_url
+
+    def watching(url, *a, _prefetched=None, **k):
+        if _prefetched:
+            summarized.append(1)
+        return real(url, *a, _prefetched=_prefetched, **k)
+
+    monkeypatch.setattr(server.core, "summarize_url", watching)
+    monkeypatch.setattr(server, "RETAKE_BUDGET", 0.3)
+    monkeypatch.setattr(server.whisper_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(server.whisper_transcribe, "transcribe_video", slow)
+    out = []
+    t = threading.Thread(target=lambda: out.extend(_read_ndjson(
+        port, {"url": VID_URL, "whisper": "always"}, _auth())))
+    t.start()
+    pool = server._claude_slots
+    try:
+        assert running.wait(5)
+        deadline = time.monotonic() + 5
+        while pool.in_use and time.monotonic() < deadline:   # it let its slot go
+            time.sleep(0.01)
+        with _filled(pool, pool.limit):
+            release.set()
+            t.join(15)
+    finally:
+        release.set()
+        t.join(15)
+    assert out[-1] == {"type": "error", "status": 429, "error": pool.busy_message}
+    assert summarized == [], "summarized without a slot"
+
+
+@pytest.mark.parametrize("claude_cli", [True, False])
+def test_startup_prints_the_limits_and_for_claude_the_login(monkeypatch, capsys,
+                                                             claude_cli):
+    class FakeServer:
+        def __init__(self, *a, **k):
+            pass
+
+        def serve_forever(self, *a, **k):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    monkeypatch.setattr(server, "_Server", FakeServer)
+    monkeypatch.setattr(server, "startup_hygiene", lambda: [])
+    monkeypatch.setattr(server.claude_client, "is_claude_cli", lambda: claude_cli)
+    server.serve(token="t" * 20)
+    out = capsys.readouterr().out
+    assert server._limits_line() in out
+    assert ("CLAUDE_CODE_OAUTH_TOKEN" in out) is claude_cli
+
+
+def test_a_broken_model_command_doesnt_stop_startup(monkeypatch, capsys):
+    class FakeServer:
+        def __init__(self, *a, **k):
+            pass
+
+        def serve_forever(self, *a, **k):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    def broken():
+        raise ValueError("No closing quotation")
+
+    monkeypatch.setattr(server, "_Server", FakeServer)
+    monkeypatch.setattr(server, "startup_hygiene", lambda: [])
+    monkeypatch.setattr(server.claude_client, "is_claude_cli", broken)
+    server.serve(token="t" * 20)                   # must not raise
+    assert "couldn't check the model command" in capsys.readouterr().out
+
+
+def test_a_prefetch_whose_slot_accounting_breaks_still_lets_its_waiters_go(monkeypatch):
+    """If giving the slot back ever raised, the in-flight marker must still go:
+    left behind, it keeps every key-moments request for the video waiting on a
+    selection that will never come."""
+    _counting_select(monkeypatch)
+    pool = server._claude_slots
+    real = pool.give_back
+
+    def gives_back_then_raises():
+        real()
+        raise RuntimeError("an accounting bug")
+
+    monkeypatch.setattr(pool, "give_back", gives_back_then_raises)
+    raised = []
+    monkeypatch.setattr(threading, "excepthook", lambda a: raised.append(a.exc_value))
+    meta, cues = _meta_cues()
+    server._start_seg_prefetch(meta, cues, None, 0.25)
+    deadline = time.monotonic() + 5
+    while not raised and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert [str(e) for e in raised] == ["an accounting bug"]    # the path really ran
+    assert not server._seg_prefetch_events
+
+
+
+def test_a_client_that_leaves_while_waiting_for_a_slot_is_let_go_quietly(
+        srv, monkeypatch, capsys):
+    """Nobody is left to tell: no traceback, nothing given back twice, and the
+    handler finishes rather than writing to a socket that has gone."""
+    import socket as _socket
+    _, port = srv
+    _stub_everything(monkeypatch)
+    monkeypatch.setattr(server, "RETAKE_BUDGET", 0.3)
+    evt = _waiting_on(monkeypatch)
+    done = threading.Event()
+    real = server._Handler._run_segments
+
+    def watched(self, *a, **k):
+        try:
+            return real(self, *a, **k)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(server._Handler, "_run_segments", watched)
+    payload = json.dumps({"url": VID_URL}).encode()
+    request = (b"POST /segments/stream HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+               b"Authorization: Bearer " + TOKEN.encode() + b"\r\n"
+               b"Origin: " + EXT_ORIGIN.encode() + b"\r\n"
+               b"Content-Type: application/json\r\n"
+               b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload)
+    sock = _socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.sendall(request)
+    assert sock.recv(4096)                       # the response has started
+    pool = server._claude_slots
+    # The headers go out before the wait begins: wait for the slot to come back,
+    # not for the first bytes.
+    deadline = time.monotonic() + 5
+    while pool.in_use and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pool.in_use == 0, "the waiter kept its slot"
+    with _filled(pool, pool.limit):
+        sock.close()
+        with server._cache_lock:
+            server._seg_prefetch_events.pop("K", None)
+        evt.set()                                # failed: it now needs a slot back
+        assert done.wait(10), "the handler never finished"
+    err = capsys.readouterr().err
+    assert "Traceback" not in err and "Exception occurred" not in err, err

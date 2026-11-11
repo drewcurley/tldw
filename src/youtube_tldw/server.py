@@ -4,7 +4,8 @@ Stdlib only. Security posture (see docs/reviews/PLAN-extension.md):
 - loopback bind only; bearer token (hmac.compare_digest); CORS fails closed
   (chrome-extension origins or a pinned origin, never web/null/`*`);
 - url goes through the youtube allowlist before any subprocess;
-- bounded concurrency (non-blocking semaphore -> 429); small body cap;
+- bounded concurrency, per kind of work (claude calls / speech; busy -> 429);
+  small body cap;
 - single-pass transcripts only (map-reduce-sized -> 413) so a click never hangs.
 """
 
@@ -56,8 +57,8 @@ _seg_progress: dict = {}
 # - It cannot live inside the request. _run_stream's `emit` has no OSError guard,
 #   so a closed socket would throw away the whole run; and a finished transcript is
 #   far too expensive to discard because someone shut a laptop lid.
-# - It gets its own single permit rather than a slot from MAX_CONCURRENCY, which
-#   was sized for 30-120s model calls. Two transcriptions holding both slots would
+# - It gets its own single permit rather than a claude slot, which is sized for
+#   30-120s model calls. Two transcriptions holding both slots would
 #   429 every other request -- including the one asking to stop them.
 # - Two requests for the same video must produce one job, not two.
 _tx_jobs: dict = {}             # video_id -> job dict, while a transcription runs
@@ -431,7 +432,8 @@ def _session_put(video_id: str, session_id: str) -> None:
 
 
 def _start_seg_prefetch(meta, cues: list, model: str | None = None, ratio=None,
-                        source: str | None = None) -> None:
+                        source: str | None = None, *,
+                        caller_holds_slot: bool = False) -> None:
     """Start background segment selection, unless it's already cached or running.
 
     Both checks live here, under one lock, rather than at each call site: a
@@ -439,18 +441,47 @@ def _start_seg_prefetch(meta, cues: list, model: str | None = None, ratio=None,
     twice. The key is built here, in the caller's thread, under the model this
     selection will run with -- see _seg_key. `source` is that of the cues being
     handed over, not whatever the transcript cache happens to say.
+
+    It takes a claude slot like any other call, but never one of the last
+    PREFETCH_RESERVE: background work must not be why a click gets "busy". When
+    there's no room it is skipped, which costs nothing -- the key-moments request
+    makes the same call live. `caller_holds_slot`: the caller is a request that has
+    finished its own call and is about to give its slot back, so this is in effect
+    taking that slot over, and the caller's isn't counted against the reserve.
     """
     vid = meta.video_id
     with claude_client.use_model(model):
         key = _seg_key(vid, ratio, source)
     if _seg_cache_get(key):
         return                  # already made: on disk from a previous run, or here
+    slots = _claude_slots
     with _cache_lock:
         entry = _seg_cache.get(key)
         if key in _seg_prefetch_events or (entry and entry[0] > time.monotonic()):
             return              # running, or finished between the check and here
-        evt = threading.Event()
-        _seg_prefetch_events[key] = evt
+        # After the dedupe, before the event: a slot taken for a selection that is
+        # already running would leak, and an event registered for one that never
+        # starts would keep a key-moments request waiting for it.
+        keep_free = PREFETCH_RESERVE - (1 if caller_holds_slot else 0)
+        took = slots.try_take(keep_free=keep_free)
+        if took:
+            evt = threading.Event()
+            _seg_prefetch_events[key] = evt
+    if not took:
+        print(f"  prefetch skipped for {vid}: {slots.status()} busy", flush=True)
+        return
+
+    def _finish():
+        # The slot first, so whoever the event wakes finds it free -- but the event
+        # whatever happens: a key left registered would keep every key-moments
+        # request for this video waiting on a selection that will never come.
+        try:
+            slots.give_back()
+        finally:
+            with _cache_lock:
+                _seg_prefetch_events.pop(key, None)
+                _seg_progress.pop(key, None)
+            evt.set()  # wake any waiter (even on failure, so it doesn't block forever)
 
     def _run():
         from . import metadata as _md
@@ -482,12 +513,13 @@ def _start_seg_prefetch(meta, cues: list, model: str | None = None, ratio=None,
         except Exception as exc:
             print(f"  segment prefetch failed for {vid}: {exc}", flush=True)
         finally:
-            with _cache_lock:
-                _seg_prefetch_events.pop(key, None)
-                _seg_progress.pop(key, None)
-            evt.set()  # wake any waiter (even on failure, so it doesn't block forever)
+            _finish()
 
-    threading.Thread(target=_run, daemon=True).start()
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except RuntimeError as exc:          # can't start a thread: undo, don't leak
+        print(f"  segment prefetch failed for {vid}: {exc}", flush=True)
+        _finish()
 
 from . import (
     BadUrlError,
@@ -522,7 +554,131 @@ class _Cancelled(TldrError):
     """A stop the user asked for, as distinct from something going wrong."""
 
 
-MAX_CONCURRENCY = 2
+# What each kind of work costs, not one number for all of it. A `claude` call is a
+# ~200 MB process that spends its time waiting on the network; reading aloud is
+# Piper, and Piper is the CPU. Transcription has its own single permit (above).
+CLAUDE_LIMIT = 6          # summaries, key moments, questions -- and prefetch
+SPEECH_LIMIT = 2          # reading aloud, and synthesizing a voice preview
+PREFETCH_RESERVE = 2      # claude slots background work may never take
+RETAKE_BUDGET = 30.0      # how long a request that let its slot go waits to get one back
+
+
+class _Slots:
+    """A counted pool of permits that can say how full it is.
+
+    Not a Semaphore: prefetch has to ask "is there room, *and* would taking it
+    still leave some for a person?", which a semaphore can't answer without reading
+    its private counter. And a semaphore released one time too many says nothing
+    and raises its limit for good -- here that raises, and is counted, because a
+    raise inside a handler's `finally` is printed by socketserver and otherwise lost.
+    """
+
+    def __init__(self, name: str, limit: int, busy_message: str):
+        self.name = name
+        self.limit = limit
+        self.busy_message = busy_message
+        self.in_use = 0
+        self.over_released = 0
+        self._cond = threading.Condition()
+
+    def try_take(self, *, keep_free: int = 0) -> bool:
+        with self._cond:
+            if self.in_use + 1 + keep_free > self.limit:
+                return False
+            self.in_use += 1
+            return True
+
+    def take(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self.in_use >= self.limit:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+            self.in_use += 1
+            return True
+
+    def give_back(self) -> None:
+        with self._cond:
+            if self.in_use <= 0:
+                self.over_released += 1
+                raise RuntimeError(f"a {self.name} slot was given back without being taken")
+            self.in_use -= 1
+            self._cond.notify()
+
+    def status(self) -> str:
+        return f"{self.name} {self.in_use}/{self.limit}"
+
+
+class _Hold:
+    """One request's slot. Closing it gives back only what is actually held, so a
+    request that let its slot go while it waited can return from anywhere -- a
+    cache hit, a timeout, a client that hung up -- without giving back twice.
+
+    It keeps the pool it was taken from rather than re-reading the module's: a
+    handler outliving its test must not touch the next test's pool.
+    """
+
+    def __init__(self, slots: _Slots):
+        self.slots = slots
+        self.held = True
+
+    def release(self) -> None:
+        if self.held:
+            self.held = False
+            self.slots.give_back()
+
+    def retake(self, timeout: float) -> bool:
+        if not self.held and self.slots.take(timeout):
+            self.held = True
+        return self.held
+
+    close = release
+
+
+def _make_pools() -> tuple[_Slots, _Slots]:
+    return (
+        _Slots("claude", CLAUDE_LIMIT,
+               f"Already working on {CLAUDE_LIMIT} summaries, key moments or "
+               "questions. Try again in a moment."),
+        _Slots("speech", SPEECH_LIMIT,
+               f"Already reading {SPEECH_LIMIT} summaries aloud. Try again when "
+               "one finishes."),
+    )
+
+
+_claude_slots, _speech_slots = _make_pools()
+
+
+def _limits_line() -> str:
+    return (f"limits: {CLAUDE_LIMIT} claude calls (prefetch never takes the last "
+            f"{PREFETCH_RESERVE}), {SPEECH_LIMIT} reading aloud, 1 transcription")
+
+
+def _login_lines(env=None) -> list[str]:
+    """Which credentials the environment hands `claude`. Names only, never values.
+
+    Worded as what is in the environment, not as which login the CLI will use:
+    there are ways to log in that two variables can't see.
+    """
+    env = os.environ if env is None else env
+    token = bool(env.get("CLAUDE_CODE_OAUTH_TOKEN"))
+    api_key = bool(env.get("ANTHROPIC_API_KEY"))
+    lines = []
+    if token:
+        lines.append("claude login: CLAUDE_CODE_OAUTH_TOKEN is set in the environment")
+    if api_key:
+        lines.append("ANTHROPIC_API_KEY is set in the environment: calls may be "
+                     "billed to the API rather than your Claude plan")
+    if not token:
+        lines.append("no CLAUDE_CODE_OAUTH_TOKEN in the environment: several "
+                     "claude calls at once on a stored login can log you out "
+                     "(anthropics/claude-code#76905); `claude setup-token` makes a "
+                     "token that avoids it")
+    return lines
+
+
 REQUEST_TIMEOUT = 120.0   # text summarize budget
 SEGMENTS_TIMEOUT = 300.0  # segment selection needs structured JSON — allow more time
 # Whole-synthesis budget, not a per-clip one: a 13-minute spoken summary takes
@@ -848,13 +1004,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"stopped": _stop_transcription(vid)})
             return
         if path == "/preview":
-            self._guarded(self._run_preview)
+            # No slot for a preview that's already made; _run_preview takes a
+            # speech slot itself, around the synthesis.
+            self._guarded(self._run_preview, slots=None)
             return
         if path == "/summarize/cached":
-            self._guarded(self._run_cached)
+            self._guarded(self._run_cached, slots=None)      # one disk read
             return
         if path == "/ask/stream":
-            self._guarded(self._run_ask, max_bytes=MAX_ASK_BYTES)
+            self._guarded(self._run_ask, slots=_claude_slots, max_bytes=MAX_ASK_BYTES)
             return
         if path not in ("/summarize", "/summarize/stream", "/segments/stream") and not speak:
             self._send_json(404, {"error": "not found"})
@@ -872,8 +1030,8 @@ class _Handler(BaseHTTPRequestHandler):
         model = self._model(body)
         if model is False:
             return  # 400 already sent
-        if not self.server.sem.acquire(blocking=False):
-            self._send_json(429, {"error": "busy, try again shortly"})
+        hold = self._take(_speech_slots if speak else _claude_slots)
+        if hold is None:
             return
         try:
             with claude_client.use_model(model):
@@ -888,7 +1046,46 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     self._run_buffered(*parsed)
         finally:
-            self.server.sem.release()
+            hold.close()
+
+    def _take(self, slots: _Slots) -> "_Hold | None":
+        """A slot from `slots` for this request, or None after a 429 saying which
+        limit it hit. The hold is kept on the handler so a wait deep inside a route
+        can let it go and get it back."""
+        if not slots.try_take():
+            self._refuse_busy(slots)
+            return None
+        self._hold = _Hold(slots)
+        return self._hold
+
+    def _refuse_busy(self, slots: _Slots) -> None:
+        print(f"  busy: {slots.status()}", flush=True)
+        self._send_json(429, {"error": slots.busy_message})
+
+    def _retake(self, progress, emit) -> bool:
+        """Get this request's slot back after waiting on something else.
+
+        Says so while it waits rather than going quiet, and gives up after
+        RETAKE_BUDGET with a busy error, never a stall with no end. A client that
+        has hung up is simply let go: there is nobody left to tell.
+        """
+        hold = self._hold
+        if hold.retake(timeout=0):
+            return True                 # the usual case: one is free right now
+        deadline = time.monotonic() + RETAKE_BUDGET
+        try:
+            progress(f"Waiting for a free slot ({hold.slots.status()})…")
+            while True:
+                left = deadline - time.monotonic()
+                if hold.retake(timeout=max(0.0, min(2.0, left))):
+                    return True
+                if time.monotonic() >= deadline:
+                    print(f"  busy: {hold.slots.status()}", flush=True)
+                    emit({"type": "error", "status": 429,
+                          "error": hold.slots.busy_message})
+                    return False
+        except OSError:
+            return False
 
     def _model(self, body):
         """The requested model, None for the CLI default, or False after a 400.
@@ -902,8 +1099,10 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(400, {"error": "unknown model"})
         return False
 
-    def _guarded(self, handler, *, max_bytes: int = MAX_BODY_BYTES) -> None:
-        """auth -> bounded body -> concurrency slot, then run `handler(body)`."""
+    def _guarded(self, handler, *, slots: "_Slots | None",
+                 max_bytes: int = MAX_BODY_BYTES) -> None:
+        """auth -> bounded body -> a slot from `slots` (None: work that costs
+        nothing takes none), then run `handler(body)`."""
         if not self._authorized():
             self._send_json(401, {"error": "missing or invalid token"})
             return
@@ -913,14 +1112,19 @@ class _Handler(BaseHTTPRequestHandler):
         model = self._model(body)
         if model is False:
             return
-        if not self.server.sem.acquire(blocking=False):
-            self._send_json(429, {"error": "busy, try again shortly"})
+        if slots is None:
+            self._hold = None
+            with claude_client.use_model(model):
+                handler(body)
+            return
+        hold = self._take(slots)
+        if hold is None:
             return
         try:
             with claude_client.use_model(model):
                 handler(body)
         finally:
-            self.server.sem.release()
+            hold.close()
 
     def _read_body(self, max_bytes: int = MAX_BODY_BYTES) -> dict | None:
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
@@ -1035,7 +1239,8 @@ class _Handler(BaseHTTPRequestHandler):
                     # used to check under the summary ratio, which the extension
                     # never sends, and so re-ran the selection on every re-open.
                     _start_seg_prefetch(tx[0], tx[1], claude_client.current_model(),
-                                        _segment_ratio(body), _cache_source(vid))
+                                        _segment_ratio(body), _cache_source(vid),
+                                        caller_holds_slot=True)
                 return
 
         page = body.get("page") if isinstance(body, dict) else None
@@ -1115,7 +1320,8 @@ class _Handler(BaseHTTPRequestHandler):
             # looser one cached under a different key would never be used.
             _start_seg_prefetch(summary.meta, summary.cues,
                                 claude_client.current_model(),
-                                _segment_ratio(body), source)
+                                _segment_ratio(body), source,
+                                caller_holds_slot=True)
         payload = _to_payload(summary, source)
         if vid:
             txcache.put_summary(_summary_key(vid, ratio, source), payload)
@@ -1215,32 +1421,28 @@ class _Handler(BaseHTTPRequestHandler):
         # a transcription would 429 every captioned summarize, every question and
         # every stop -- which is the starvation that putting the job outside the
         # request was meant to avoid in the first place.
-        self.server.sem.release()
+        self._hold.release()
         gone = False
-        try:
-            deadline = time.monotonic() + _wait_budget(job)
-            while not job["event"].wait(0.5):
-                if time.monotonic() > deadline:
-                    emit({"type": "error", "status": 504, "error":
-                          "Transcribing this video is taking longer than expected. "
-                          "It may still finish; try again in a few minutes."})
-                    return None
-                if gone:
-                    continue        # the job runs on; we just stop narrating it
-                published = _tx_progress(meta.video_id)
-                if not published:
-                    continue
-                try:
-                    progress(published["message"],
-                             round(10 + published["percent"] * 0.6, 1))
-                except OSError:
-                    # The client hung up. That is not a failure of the job, which
-                    # keeps running and still caches what it produces -- and it is
-                    # not something to spray a traceback over the server log for.
-                    gone = True
-        finally:
-            # Re-taken before anything else happens: do_POST's finally releases it.
-            self.server.sem.acquire()
+        deadline = time.monotonic() + _wait_budget(job)
+        while not job["event"].wait(0.5):
+            if time.monotonic() > deadline:
+                emit({"type": "error", "status": 504, "error":
+                      "Transcribing this video is taking longer than expected. "
+                      "It may still finish; try again in a few minutes."})
+                return None
+            if gone:
+                continue        # the job runs on; we just stop narrating it
+            published = _tx_progress(meta.video_id)
+            if not published:
+                continue
+            try:
+                progress(published["message"],
+                         round(10 + published["percent"] * 0.6, 1))
+            except OSError:
+                # The client hung up. That is not a failure of the job, which
+                # keeps running and still caches what it produces -- and it is
+                # not something to spray a traceback over the server log for.
+                gone = True
         if gone:
             return None
         if job["error"]:
@@ -1250,6 +1452,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not job["cues"]:
             emit({"type": "error", "status": 500,
                   "error": "Transcription produced nothing usable."})
+            return None
+        # A summary is still to be made, and that is work: it needs its slot back.
+        # Not before now -- a client that hung up, or a job that failed, has
+        # nothing left to do with one.
+        if not self._retake(progress, emit):
             return None
         return (meta, job["cues"]), f"audio:{model}"
 
@@ -1369,13 +1576,20 @@ class _Handler(BaseHTTPRequestHandler):
                 prefetch_evt = _seg_prefetch_events.get(key)
             if prefetch_evt:
                 print(f"  waiting for prefetch for {vid}", flush=True)
+                # Waiting is not work: the selection being waited on holds its own
+                # slot, and holding a second one for the same call would halve how
+                # many videos can have key moments made at once.
+                self._hold.release()
                 _wait_with_heartbeat(prefetch_evt, cue_label)
                 seg_hit = _seg_cache_get(key)
                 if seg_hit:
                     usage.note_served(vid, "prefetch")
                     _emit_segments(*seg_hit)
                     return
-                # prefetch failed — fall through to direct call
+                # It failed or ran past its budget. Falling through to a live call,
+                # which is work again, and needs the slot back.
+                if not self._retake(progress, emit):
+                    return
 
         # 3. Direct call — emit segment_added for each span as Claude finds it so the
         #    client can start playback immediately without waiting for the full list.
@@ -1660,6 +1874,12 @@ class _Handler(BaseHTTPRequestHandler):
         if cached:
             self._send_bytes(200, "audio/mpeg", cached)
             return
+        # Making one is Piper (and, the first time, a voice download), so it counts
+        # against reading aloud. The whole join: the download happens inside it.
+        slots = _speech_slots
+        if not slots.try_take():
+            self._refuse_busy(slots)
+            return
         start = time.monotonic()
         try:
             data = b"".join(audio.stream_speech(PREVIEW_TEXT, voice,
@@ -1672,6 +1892,8 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             print(f"  unexpected preview error: {exc!r}", flush=True)
             self._send_json(500, {"error": "internal error"}); return
+        finally:
+            slots.give_back()
         with _preview_lock:
             _preview_cache[model] = data
         print(f"  preview {model} ({len(data)//1024}KB) in "
@@ -1706,7 +1928,6 @@ class _Server(ThreadingHTTPServer):
         super().__init__(addr, _Handler)
         self.token = token
         self.allow_origin = allow_origin
-        self.sem = threading.Semaphore(MAX_CONCURRENCY)
 
 
 def serve(host: str = "127.0.0.1", port: int = 8765,
@@ -1719,6 +1940,15 @@ def serve(host: str = "127.0.0.1", port: int = 8765,
     token, persisted = load_or_create_token(token)
     httpd = _Server((host, port), token, allow_origin)
     print(f"tldw serve listening on http://{host}:{port}", flush=True)
+    print(f"  {_limits_line()}", flush=True)
+    # Contained like the cleanup below: a malformed custom model command is a
+    # reason for its requests to fail, not for the server not to start.
+    try:
+        if claude_client.is_claude_cli():
+            for line in _login_lines():
+                print(f"  {line}", flush=True)
+    except Exception as exc:
+        print(f"  (couldn't check the model command: {exc})", flush=True)
     # After the bind, so a second server that can't start never cleans up at all.
     # And contained: tidying up is never a reason not to serve.
     try:
