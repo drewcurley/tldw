@@ -439,7 +439,7 @@ async function handleAsk(port, msg) {
 
 function askError(status, detail) {
   if (status === 401) return "Token mismatch. Re-check the token in the extension's Options.";
-  if (status === 429) return "Server busy, try again in a moment.";
+  if (status === 429) return detail || "Server busy, try again in a moment.";
   if (status === 413) return "That question is too long.";
   if (status === 422) return detail || "This video has no transcript to answer from.";
   if (status === 504) return "That question took too long. Try again.";
@@ -490,7 +490,7 @@ async function handlePreview(port, msg) {
 
 function speakError(status, detail) {
   if (status === 401) return "Token mismatch. Re-check the token in the extension's Options.";
-  if (status === 429) return "Server busy, try again in a moment.";
+  if (status === 429) return detail || "Server busy, try again in a moment.";
   if (status === 503) return detail || "Audio isn't available — Piper TTS isn't installed on the server.";
   if (status === 504) return "Audio generation timed out. Try again.";
   return detail || ("Audio failed (server error " + status + ").");
@@ -572,7 +572,9 @@ function httpError(status, detail) {
   if (status === 401) return "Token mismatch. Re-check the token in the extension's Options.";
   if (status === 413) return detail || "This transcript is too long for the browser; use the tldw CLI.";
   if (status === 422) return detail || "This video has no captions/transcript to summarize.";
-  if (status === 429) return "Server is busy with another summary. Try again in a moment.";
+  // The server says which of its limits was hit (summaries/questions, or reading
+  // aloud); an older server's detail ("busy, try again shortly") reads fine too.
+  if (status === 429) return detail || "Server busy, try again in a moment.";
   if (status === 502) return "The model call failed. If you're on the Claude CLI, make sure `claude` is logged in; otherwise check your configured model command.";
   if (status === 504) return "Summarizing timed out on the server. Try again, or use the CLI for long videos.";
   return detail || ("Server error (" + status + ").");

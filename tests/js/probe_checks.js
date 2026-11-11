@@ -186,6 +186,22 @@ const okJson = (body) => () => ({ ok: true, json: async () => body });
   check("no token is reported straight away", w.posted[0].type, "error");
   check("...without a request", w.fetches.length, 0);
 
+  // ------------------------------------------------- which limit was hit ----
+  // The server has one limit for claude calls and one for reading aloud, and its
+  // 429 says which. All three of the worker's message functions used to replace
+  // that with their own fixed text -- one of them blaming "another summary" even
+  // when what was busy was the speech.
+  for (const name of ["httpError", "speakError", "askError"]) {
+    const ctx = {};
+    vm.createContext(ctx);
+    vm.runInContext(between(worker, `function ${name}(status, detail)`, "\n}\n") + "\n}\n" +
+                    `this.fn = ${name};`, ctx);
+    const said = "Already reading 2 summaries aloud. Try again when one finishes.";
+    check(`${name}: a 429 shows the server's reason`, ctx.fn(429, said), said);
+    check(`${name}: ...and still says something without one`, ctx.fn(429, ""),
+          (m) => typeof m === "string" && m.length > 0);
+  }
+
   if (failures.length) {
     console.log("FAILURES:\n" + failures.join("\n"));
     process.exit(1);
