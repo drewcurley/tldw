@@ -73,14 +73,14 @@ billing — nothing is hard-wired to one provider.
 | A Claude subscription (Pro/Max/Team) | Nothing — install the `claude` CLI and log in once. This is the default. If the server keeps logging you out, run `claude setup-token` and set the token it prints as `CLAUDE_CODE_OAUTH_TOKEN` where `tldw serve` runs: several calls at once on a stored login can race ([anthropics/claude-code#76905](https://github.com/anthropics/claude-code/issues/76905)). |
 | An Anthropic API key | Same CLI, with `ANTHROPIC_API_KEY` set in the environment `tldw serve` runs in. |
 | Claude via Bedrock / Vertex / Foundry | Same CLI — those platforms use their own credentials; see Claude Code's own docs for the environment it expects. |
-| OpenAI, Gemini, Mistral, … | The [`llm`](https://llm.datasette.io) CLI: `tldw config llm_cmd "llm -m gpt-4o"` |
-| A local model, fully offline | `tldw config llm_cmd "ollama run llama3"` |
+| OpenAI, Gemini, Mistral, … | The [`llm`](https://llm.datasette.io) CLI: `tldw config set llm_cmd "llm -m gpt-4o"` |
+| A local model, fully offline | `tldw config set llm_cmd "ollama run llama3"` |
 | Anything else | Any command that takes the prompt on stdin and prints text. |
 
 ```bash
-tldw config llm_cmd "llm -m gpt-4o"    # persist it
-TLDW_LLM_CMD="ollama run llama3" tldw serve   # or set it per run
-tldw config unset llm_cmd              # back to the claude CLI
+tldw config set llm_cmd "llm -m gpt-4o"        # persist it
+TLDW_LLM_CMD="ollama run llama3" tldw serve    # or set it per run
+tldw config unset llm_cmd                      # back to the claude CLI
 ```
 
 The command is **operator config** — it comes from your config file, your
@@ -222,7 +222,7 @@ from the URL the metadata already contains, instead of a second full extraction 
 and if it does get throttled you can lend it your browser session:
 
 ```bash
-tldw config ytdlp_cookies chrome     # chromium, brave, edge, firefox, safari, opera, vivaldi
+tldw config set ytdlp_cookies chrome     # chromium, brave, edge, firefox, safari, opera, vivaldi
 ```
 
 That reads your browser's cookie store so yt-dlp looks like you rather than like a

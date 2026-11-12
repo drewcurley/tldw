@@ -312,7 +312,7 @@ def _serve_parser() -> argparse.ArgumentParser:
 
 
 def _run_config(args: list[str]) -> int:
-    """`tldw config get` | `tldw config set output-dir <path>` | `tldw config unset <key>`."""
+    """`tldw config get` | `tldw config set <key> <value>` | `tldw config unset <key>`."""
     # A value the server will ignore is worse than a rejected one: the pin reads
     # as set and does nothing.
     def _check(flag: str, value: str) -> str | None:
@@ -362,8 +362,9 @@ def _run_config(args: list[str]) -> int:
         key = keymap.get(args[1], args[1].replace("-", "_"))
         print("removed" if config.unset(key) else f"{args[1]} was not set")
         return 0
-    print("usage: tldw config get | tldw config set output-dir <path> | "
-          "tldw config unset output-dir", file=sys.stderr)
+    print("usage: tldw config get | tldw config set <key> <value> | "
+          "tldw config unset <key>   (e.g. tldw config set output-dir ~/Media/tldw)",
+          file=sys.stderr)
     return 1
 
 

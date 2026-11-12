@@ -60,7 +60,7 @@ async function load() {
         note.textContent =
           " Your server is configured to use a custom model command, so this "
           + "setting doesn't apply. Change the model where that command is "
-          + "configured (tldw config llm_cmd ... or TLDW_LLM_CMD).";
+          + "configured (tldw config set llm_cmd ... or TLDW_LLM_CMD).";
       }
     }
   } catch (_) {}
