@@ -346,3 +346,77 @@ def test_valid_settings_are_written(args, monkeypatch):
                         lambda k, v: written.append((k, v)))
     assert cli._run_config(args) == 0
     assert len(written) == 1
+
+
+# --- every `tldw config …` the docs show is a command that works ---------------
+# The README and the options page once said `tldw config llm_cmd "…"`, which
+# `_run_config` answers with its usage line and exit 1: the documented way to pick
+# another model backend didn't work. Each documented form is run through the real
+# parser here, with writes stubbed, so the docs can't drift from it again.
+
+_DOC_ROOT = Path(__file__).resolve().parent.parent
+_CONFIG_DOCS = ("README.md", "extension/README.md", "extension/options.js")
+# Today's count of documented `tldw config` commands, so an extractor that
+# breaks and finds nothing fails instead of passing vacuously. Raise it when
+# docs gain examples.
+_MIN_CONFIG_EXAMPLES = 14
+
+
+def _documented_config_commands():
+    """(where, argv after `tldw config`) for every documented `tldw config` use.
+
+    Each source has its own end rule, so a quoted value survives:
+    a backtick span ends at its closing backtick, a fenced code-block line runs to
+    the end of the line (shell-split, `#` comments dropped), and a JS string ends
+    at its closing quote or at " or ". A `...` standing in for a value becomes a
+    dummy."""
+    import re
+    import shlex
+    found = []
+    for rel in _CONFIG_DOCS:
+        path = _DOC_ROOT / rel
+        if not path.exists():
+            continue
+        in_fence = False
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            where = f"{rel}:{n}"
+            if rel.endswith(".md") and line.lstrip().startswith("```"):
+                in_fence = not in_fence
+                continue
+            if rel.endswith(".js"):
+                spans = [m.group(1) for m in re.finditer(r"tldw config([^\"]*?)(?: or |\"|$)", line)]
+            elif in_fence:
+                spans = []
+                if re.match(r"\s*(?:[A-Z_]+=\S+\s+)*tldw config\b", line):
+                    words = shlex.split(line, comments=True)
+                    i = words.index("tldw")
+                    spans = [shlex.join(words[i + 2:])]
+            else:
+                spans = [m.group(1) for m in re.finditer(r"`tldw config([^`]*)`", line)]
+            for span in spans:
+                argv = shlex.split(span.replace("...", "dummy-value"))
+                found.append((where, argv))
+    return found
+
+
+def test_the_docs_config_examples_are_found():
+    found = _documented_config_commands()
+    assert len(found) >= _MIN_CONFIG_EXAMPLES, (
+        f"only {len(found)} `tldw config` examples found (floor {_MIN_CONFIG_EXAMPLES}); "
+        f"the extractor may be broken: {found}")
+
+
+@pytest.mark.parametrize("where,argv", _documented_config_commands(),
+                         ids=lambda v: v if isinstance(v, str) else " ".join(v))
+def test_every_documented_config_command_works(where, argv, monkeypatch, capsys):
+    """Exit 1 is `_run_config`'s usage exit: a documented form it doesn't accept."""
+    from youtube_tldw import cli
+    written, removed = [], []
+    monkeypatch.setattr(cli.config, "load", lambda: {})
+    monkeypatch.setattr(cli.config, "set_value", lambda k, v: written.append((k, v)))
+    monkeypatch.setattr(cli.config, "unset", lambda k: removed.append(k) or True)
+    rc = cli._run_config(argv)
+    assert rc != 1, (f"{where}: `tldw config {' '.join(argv)}` isn't a command tldw "
+                     f"accepts (it printed usage): {capsys.readouterr().err.strip()}")
+    if argv[:1] == ["set"]:
+        assert written, f"{where}: `tldw config {' '.join(argv)}` wrote nothing"
