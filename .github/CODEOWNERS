@@ -1,0 +1,56 @@
+# CODEOWNERS — required reviewers per area
+#
+# Syntax: <path-pattern>  @user-or-team  [@another-user]
+# More-specific patterns override less-specific ones (last match wins per GitHub).
+# Keep this file in sync with /docs/ownership.md.
+#
+# This fork is a solo repo (T-003): every area is owned by @drewcurley, required
+# approvals are 0 (GitHub forbids self-approval) and code-owner review is off, so
+# this file routes review requests but blocks nothing (ADOPTING.md § 5). When a
+# second maintainer joins, give the gate files a second owner and turn it on.
+
+# Repo-wide default — at least one human approver required on every PR
+*                               @drewcurley
+
+# Project conventions and process
+/AGENTS.md                      @drewcurley
+/CLAUDE.md                      @drewcurley
+/.claude/                       @drewcurley
+/.github/                       @drewcurley
+
+# Gate files (starter T-014). A PR build runs the PR's own pipeline YAML, so these files
+# define the check the PR is judged by: changing them needs the people who own the
+# gates. In this solo fork that's one owner; once there are two, every gate line must
+# name both (last match wins, so no line may drop one).
+# `*` above already requires a default reviewer; this routes gate changes further.
+/azure-pipelines.yml            @drewcurley
+/scripts/ci-*.sh                @drewcurley
+/scripts/requirements-ci.*      @drewcurley
+/.githooks/                     @drewcurley
+/.placeholder-allow             @drewcurley
+/.gitattributes                 @drewcurley
+/.github/CODEOWNERS             @drewcurley
+
+# Tasks ledger — DRI sets stay loose, but require any DRI to approve
+/tasks/                         @drewcurley
+
+# Living docs — unanimous-consensus rule applies; CODEOWNERS adds a human review gate on top
+/docs/                          @drewcurley
+/docs/architecture.md           @drewcurley
+/docs/stack.md                  @drewcurley
+/docs/data-model.md             @drewcurley
+/docs/api.md                    @drewcurley
+/docs/ux.md                     @drewcurley
+/docs/testing.md                @drewcurley
+/docs/deployment.md             @drewcurley
+/docs/runbooks/                 @drewcurley
+/docs/decisions/                @drewcurley
+/docs/ownership.md              @drewcurley
+/docs/onboarding.md             @drewcurley
+
+# Code areas (examples — replace with the real layout of your repo)
+# /apps/api/                    @drewcurley
+# /apps/web/                    @drewcurley
+# /packages/db/                 @drewcurley
+# /infra/                       @drewcurley
+# /.github/workflows/           @drewcurley

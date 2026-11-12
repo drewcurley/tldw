@@ -1,0 +1,36 @@
+# Files allowed to contain `[insert … here]` placeholders.
+#
+# WHY this exists: the placeholder gate (pre-commit + CI) blocks unreplaced
+# `[insert … here]` markers so a team never ships them into real code/config.
+# But some files legitimately contain those markers forever:
+#   - meta files that DOCUMENT the placeholder convention (e.g. AGENTS.md § 10);
+#   - template files filled in per-project (manifest, integration map, task template).
+#
+# One shell glob per line (matched against the repo-relative path). Lines starting
+# with # are comments. Keep this list TIGHT — every entry is a file the gate no
+# longer protects. When you adopt the starter and replace placeholders, you can
+# remove entries you no longer need (the templates you've filled in).
+
+# Convention documentation (these describe the placeholders, so they keep them):
+AGENTS.md
+ADOPTING.md
+CLAUDE.md
+.githooks/README.md
+
+# The enforcement machinery itself references the literal pattern it scans for:
+.githooks/pre-commit
+scripts/ci-checks.sh
+scripts/test/test-ci-checks.sh
+.github/workflows/checks.yml
+.github/workflows-disabled/checks.yml
+.placeholder-allow
+
+# Per-project templates (filled in during adoption; may carry placeholders meanwhile):
+tasks/_TEMPLATE.md
+
+# Specialist role briefs reference stack placeholders teams replace on adoption:
+.claude/agents/*.md
+
+# Seeded bootstrap/adoption tasks reference placeholders by name:
+tasks/T-001*.md
+tasks/T-002.md

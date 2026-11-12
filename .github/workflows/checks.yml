@@ -1,0 +1,272 @@
+name: procedure-checks
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Server-side mirror of .githooks/ on GitHub Actions: the default CI (ADOPTING.md
+# § 4a). It runs on every PR and push to main with nothing to set up, but enforces
+# nothing until its three checks are required on main (ADOPTING.md § 5).
+# azure-pipelines.yml runs the same checks on Azure DevOps (§ 4b); both call
+# scripts/ci-checks.sh, so they can't drift. To use only Azure, park this file:
+#   git mv .github/workflows/checks.yml .github/workflows-disabled/checks.yml
+#
+# Least privilege (starter T-022): no token permissions by default, contents: read
+# per job, no saved git credentials, actions pinned by commit SHA (bumped by hand,
+# like the shellcheck pin), and no ${{ }} expressions inside run: scripts (values go
+# through env:).
+# Keep the `pull_request` trigger: never `pull_request_target`, which would run a
+# fork's PR with this repo's secrets and a write token.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# --no-verify on the client doesn't bypass these.
+
+on:
+  pull_request:
+  push:
+    # hackathon/demo is this fork's integration branch (T-003).
+    branches: [main, master, hackathon/demo]
+
+permissions: {}
+
+jobs:
+  scripts:
+    name: shell scripts (lint + test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      # The same pinned, checksummed shellcheck as azure-pipelines.yml, so both CI
+      # systems flag the same things (starter T-021). test-ci-wiring.sh checks they match.
+      SHELLCHECK_VERSION: v0.10.0
+      SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: shellcheck hooks and scripts
+        run: |
+          set -e
+          # A checksum mismatch fails the job; only a failed download falls back to the
+          # runner's preinstalled shellcheck, with a warning.
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          tarball="$RUNNER_TEMP/shellcheck.tar.xz"
+          if curl -sSfL -o "$tarball" "$url"; then
+            echo "${SHELLCHECK_SHA256}  $tarball" | sha256sum -c - \
+              || { echo "::error::shellcheck ${SHELLCHECK_VERSION} doesn't match its pinned checksum; not running it."; exit 1; }
+            tar -xJf "$tarball" -C "$RUNNER_TEMP"
+            sc="$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          else
+            echo "::warning::Could not fetch pinned shellcheck; using the runner's preinstalled one (version may differ)."
+            sc=shellcheck
+          fi
+          "$sc" --version
+          "$sc" .githooks/pre-commit .githooks/commit-msg .githooks/pre-push \
+                scripts/*.sh scripts/test/*.sh
+
+      - name: setup-workspace.sh fixture tests
+        run: sh scripts/test/test-setup-workspace.sh
+
+      - name: ci-checks.sh fixture tests
+        run: sh scripts/test/test-ci-checks.sh
+
+      - name: pre-commit hook fixture tests
+        run: sh scripts/test/test-pre-commit.sh
+
+      - name: commit-msg hook fixture tests
+        run: sh scripts/test/test-commit-msg.sh
+
+      - name: ci-base.sh fixture tests
+        run: sh scripts/test/test-ci-base.sh
+
+      - name: ci-pr-checks.sh fixture tests
+        run: sh scripts/test/test-ci-pr-checks.sh
+
+      - name: task ledger invariants
+        run: sh scripts/test/test-task-ledgers.sh
+
+      - name: every fixture suite runs in CI
+        run: sh scripts/test/test-ci-wiring.sh
+
+      - name: setup-hooks.sh fixture tests
+        run: sh scripts/test/test-setup-hooks.sh
+
+      - name: aggregate-docs.sh fixture tests
+        run: sh scripts/test/test-aggregate-docs.sh
+
+      - name: Claude Code push-rule tests
+        run: sh scripts/test/test-claude-settings.sh
+
+      - name: PR-body check fixture tests
+        run: sh scripts/test/test-pr-body-check.sh
+
+      - name: ci-deck-needed.sh fixture tests
+        run: sh scripts/test/test-ci-deck-needed.sh
+
+      - name: pre-push hook fixture tests
+        run: sh scripts/test/test-pre-push.sh
+
+      - name: ci-tldw-tests.sh report-check fixture tests
+        run: sh scripts/test/test-ci-tldw-tests.sh
+
+  # tldw's own tests (T-003). Like the deck job: third-party packages, so no
+  # credentials, no secrets, no caches, no artifacts, and no job waits on this one.
+  # Everything installed is hash-locked in scripts/requirements-ci.txt; the script
+  # fails on any skip, failure or error, or fewer tests than its floor.
+  tldw:
+    name: tldw tests (pytest + extension)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: tldw tests (hash-locked install, pytest, full-pass check)
+        run: sh scripts/ci-tldw-tests.sh run "$RUNNER_TEMP/tldw"
+
+  # Third-party Python packages run here and in the tldw job only (starter T-016; T-003): no credentials,
+  # no secrets, no artifacts, and no job waits on this one. scripts/test/test-deck.sh checks that.
+  deck:
+    name: overview deck (build + compare)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      # PR builds that change nothing the deck suite reads skip the build (starter T-022).
+      - name: install deck build dependencies
+        run: |
+          set -e
+          t="$RUNNER_TEMP"
+          # BEGIN deck-gate (starter T-022). Keep identical in azure-pipelines.yml and
+          # .github/workflows/checks.yml; scripts/test/test-ci-deck-needed.sh runs it.
+          # Asks the TARGET branch's scripts/ci-deck-needed.sh whether this build needs
+          # the deck, so a PR can't skip it by editing that script. Only an explicit
+          # verdict (exit 1 with a "skip:" line) skips; anything else builds.
+          rm -f "$t/deck-skip"
+          if git show 'HEAD^1:scripts/ci-deck-needed.sh' > "$t/deck-needed.sh" 2>/dev/null; then
+            rc=0
+            sh "$t/deck-needed.sh" > "$t/deck-needed.out" 2>&1 || rc=$?
+            cat "$t/deck-needed.out"
+            if [ "$rc" -eq 1 ] && grep -q '^skip:' "$t/deck-needed.out"; then
+              : > "$t/deck-skip"
+            fi
+          else
+            echo "run: the target branch has no scripts/ci-deck-needed.sh"
+          fi
+          # END deck-gate
+          if [ -e "$t/deck-skip" ]; then
+            echo "::notice::Deck build skipped: this PR changes no file the deck suite reads."
+            exit 0
+          fi
+          if [ ! -f scripts/build_deck.py ]; then
+            echo "SKIP: scripts/build_deck.py is gone; not installing deck dependencies."
+            exit 0
+          fi
+          python3 --version
+          python3 -m venv "$RUNNER_TEMP/deck-venv"
+          "$RUNNER_TEMP/deck-venv/bin/python" -m pip install \
+            --disable-pip-version-check --no-input --require-hashes --only-binary :all: \
+            -r scripts/requirements-deck.txt
+          "$RUNNER_TEMP/deck-venv/bin/python" -m pip freeze
+
+      - name: overview deck fixture tests
+        env:
+          DECK_BUILD_REQUIRED: '1'
+          DECK_PYTHON: ${{ runner.temp }}/deck-venv/bin/python
+          DECK_SKIP_FILE: ${{ runner.temp }}/deck-skip
+        run: sh scripts/test/test-deck.sh
+
+  procedure:
+    name: procedure checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine diff range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "base=$PR_BASE" >> "$GITHUB_OUTPUT"
+            echo "head=$PR_HEAD" >> "$GITHUB_OUTPUT"
+          else
+            # A branch's first push has before=0000…; ci-base.sh maps that to HEAD~1,
+            # or the empty tree for a root commit (ci-checks.sh would rightly fail
+            # closed on the zeros — starter T-013).
+            base=$(sh scripts/ci-base.sh "$BEFORE")
+            echo "base=$base" >> "$GITHUB_OUTPUT"
+            echo "head=$PUSH_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Procedure checks (mirror of .githooks/)
+        env:
+          EVENT: ${{ github.event_name }}
+          TARGET_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE: ${{ steps.range.outputs.base }}
+          HEAD_SHA: ${{ steps.range.outputs.head }}
+        run: |
+          head=$HEAD_SHA
+          if [ "$EVENT" = "pull_request" ]; then
+            # PR build: run the TARGET branch's gate (starter T-014).
+            # The base SHA recorded when the PR event fired (main may have moved since).
+            target_sha=$(git rev-parse --verify "$TARGET_SHA^{commit}")
+            echo "PR build: target $target_sha, head $head"
+            # BEGIN trusted-gate (starter T-014). Keep identical in azure-pipelines.yml and
+            # .github/workflows/checks.yml; scripts/test/test-ci-pr-checks.sh runs it.
+            # Takes ci-pr-checks.sh from the TARGET branch, so a PR can't swap the gate out by
+            # editing it; the PR's own copy runs only while the target has none (bootstrap).
+            warn='WARNING:'
+            [ -z "${TF_BUILD:-}" ] || warn='##[warning]'
+            [ -z "${GITHUB_ACTIONS:-}" ] || warn='::warning::'
+            runner=$(mktemp)
+            trap 'rm -f "$runner"' EXIT
+            runner_entry=$(git ls-tree --full-tree "$target_sha" -- scripts/ci-pr-checks.sh)
+            case "$runner_entry" in
+              '100644 blob '*|'100755 blob '*)
+                echo "Gate runner: the target's scripts/ci-pr-checks.sh ($runner_entry)"
+                git cat-file blob "$target_sha:scripts/ci-pr-checks.sh" > "$runner" ;;
+              '')
+                echo "$warn the target branch has no scripts/ci-pr-checks.sh; running this PR's copy (bootstrap only)."
+                cp scripts/ci-pr-checks.sh "$runner" ;;
+              *)
+                echo "$warn the target's scripts/ci-pr-checks.sh is not a regular file. Failing closed."
+                exit 1 ;;
+            esac
+            sh "$runner" "$target_sha" "$head"
+            # END trusted-gate
+          else
+            echo "Diff range: $BASE...$head"
+            sh scripts/ci-checks.sh "$BASE" "$head"
+          fi
+
+      - name: pull request body must use the project template
+        if: github.event_name == 'pull_request'
+        run: |
+          body=$(jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH")
+          missing=0
+          for section in '## Task' '## Summary' '## Agent sign-offs' '## Human review' '## Risk' '## Redlines'; do
+            if ! printf '%s' "$body" | grep -qF "$section"; then
+              echo "::error::pull request body is missing section: $section (use .github/pull_request_template.md)"
+              missing=1
+            fi
+          done
+          [ "$missing" = "1" ] && exit 1 || true

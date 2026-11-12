@@ -1,0 +1,30 @@
+#!/usr/bin/env sh
+# pre-push hook — block force-push to protected branches.
+# stdin: lines of "<local ref> <local sha> <remote ref> <remote sha>"
+
+set -e
+
+red()  { printf "\033[0;31m%s\033[0m\n" "$*" >&2; }
+fail() { red "pre-push BLOCK: $*"; exit 1; }
+
+protected='main master production release trunk hackathon/demo'
+zero='0000000000000000000000000000000000000000'
+
+# git feeds four positional fields per ref; we only use the remote ref + both shas.
+# shellcheck disable=SC2034  # local_ref is a required positional placeholder
+while read -r local_ref local_sha remote_ref remote_sha; do
+  remote_branch=${remote_ref#refs/heads/}
+  for p in $protected; do
+    if [ "$remote_branch" = "$p" ]; then
+      # If remote_sha is not the zero hash and is not an ancestor of local_sha,
+      # this push is rewriting history on a protected branch.
+      if [ "$remote_sha" != "$zero" ]; then
+        if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+          fail "Force-push to '$p' is not allowed. Open a PR; if history rewrite is genuinely required, get DRI + leadership approval first."
+        fi
+      fi
+    fi
+  done
+done
+
+exit 0

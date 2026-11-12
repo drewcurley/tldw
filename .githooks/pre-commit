@@ -1,0 +1,126 @@
+#!/usr/bin/env sh
+# Pre-commit hook for agentic_starter projects.
+# Enforces the procedure in AGENTS.md at commit time.
+# Install: scripts/setup-hooks.sh (sets core.hooksPath to .githooks/).
+# CI mirrors these checks server-side via scripts/ci-checks.sh (GitHub Actions
+# .github/workflows/checks.yml, or Azure DevOps azure-pipelines.yml) — so
+# --no-verify is not a viable bypass.
+
+set -e
+# Bytes, not characters: BSD sed/grep stop on invalid UTF-8, which binary content
+# in a --text diff is (starter T-014).
+LC_ALL=C; export LC_ALL
+
+red()  { printf "\033[0;31m%s\033[0m\n" "$*" >&2; }
+yel()  { printf "\033[0;33m%s\033[0m\n" "$*" >&2; }
+fail() { red "pre-commit BLOCK: $*"; exit 1; }
+warn() { yel "pre-commit warn:  $*"; }
+
+# 1) Block direct commit to protected branches
+branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+case "$branch" in
+  main|master|production|release|trunk|hackathon/demo)
+    fail "Direct commit to '$branch' is not allowed. Create a feature branch (feat/<name>, fix/<name>, chore/<name>, refactor/<name>)."
+    ;;
+esac
+
+# Fail closed on git errors (starter T-013): each git call is captured on its own and its
+# status checked. In `git diff | grep ... || true` the status is grep's, so a git
+# error used to read as an empty diff and pass every gate. The filter is sed, which
+# exits 0 on no match, so no `|| true` is needed.
+added_only() { sed -n '/^+++/d;/^+/p'; }
+unchecked="Refusing to commit content that was not checked."
+
+# Names unquoted (core.quotePath=false) and renames as delete + add, so moved
+# content is scanned (starter T-014).
+staged_files=$(git -c core.quotePath=false diff --cached --no-renames --name-only --diff-filter=ACMR) \
+  || fail "git diff --cached --name-only failed. $unchecked"
+[ -z "$staged_files" ] && exit 0
+
+# --text --no-textconv --no-ext-diff: .gitattributes (-diff, binary, textconv), an
+# external diff, or a NUL byte must not hide staged content from the scans (starter T-014).
+staged_diff=$(git diff --cached --text --no-textconv --no-ext-diff --no-renames --diff-filter=ACMR -U0) || fail "git diff --cached failed. $unchecked"
+added_lines=$(printf '%s\n' "$staged_diff" | added_only) || fail "Filtering the staged diff failed. $unchecked"
+
+# Is a path allowlisted for placeholders? (meta/template files — see .placeholder-allow)
+allow_file=".placeholder-allow"
+placeholder_allowed() {
+  [ -f "$allow_file" ] || return 1
+  while IFS= read -r pat; do
+    case "$pat" in ''|\#*) continue ;; esac
+    # shellcheck disable=SC2254  # glob match intended
+    case "$1" in $pat) return 0 ;; esac
+  done < "$allow_file"
+  return 1
+}
+
+# 2) Unreplaced [insert ... here] placeholders — per file, skipping allowlisted paths.
+#    Split names on newlines only, never glob-expand them, and read each back as a
+#    literal path: else `a b.md`, `AGENT[S].md` or `:(top)x` is checked as some
+#    other path, or none (starter T-014). Names git still quotes can't be read back: block.
+placeholder_hit=0
+old_ifs=$IFS
+IFS='
+'
+set -f
+for f in $staged_files; do
+  case "$f" in \"*) fail "Unusual filename $f: git quotes it, so its placeholders can't be checked. Rename it." ;; esac
+  placeholder_allowed "$f" && continue
+  f_diff=$(git --literal-pathspecs diff --cached --text --no-textconv --no-ext-diff --no-renames --diff-filter=ACMR -U0 -- "$f") || fail "git diff --cached -- '$f' failed. $unchecked"
+  added=$(printf '%s\n' "$f_diff" | added_only) || fail "Filtering the staged diff of '$f' failed. $unchecked"
+  rc=0
+  printf '%s\n' "$added" | grep -qE '\[insert [^]]+ here\]' || rc=$?
+  case "$rc" in
+    0)
+      # Never put $f inside a sed script: a filename like `x#;e cmd;#` would run
+      # cmd under GNU sed (starter T-014). printf treats it as data.
+      printf '%s\n' "$added" | grep -nE '\[insert [^]]+ here\]' \
+        | while IFS= read -r hit; do printf '%s: %s\n' "$f" "$hit"; done >&2
+      placeholder_hit=1
+      ;;
+    1) ;;
+    *) fail "Placeholder scanner error (grep exit $rc) on '$f'. $unchecked" ;;
+  esac
+done
+set +f
+IFS=$old_ifs
+[ "$placeholder_hit" = "1" ] && fail "Unreplaced [insert ... here] placeholder in staged content (not in an allowlisted template; see .placeholder-allow)."
+
+# 3) Basic secret scan on staged content
+#    `--` stops a pattern that starts with '-' (the private-key one) being parsed
+#    as a grep option. grep exit >=2 is a scanner error, not "no match" — fail
+#    closed so a broken scan can never silently pass a commit.
+scan() {
+  pattern="$1"
+  label="$2"
+  rc=0
+  printf '%s\n' "$added_lines" | grep -qE -- "$pattern" || rc=$?
+  case "$rc" in
+    0)
+      printf '%s\n' "$added_lines" | grep -nE -- "$pattern" >&2
+      fail "Possible secret in staged content: $label. If false positive, sanitize the diff before committing."
+      ;;
+    1) ;;
+    *) fail "Secret scanner error (grep exit $rc) on pattern: $label. Refusing to commit unscanned content." ;;
+  esac
+}
+scan 'AKIA[0-9A-Z]{16}'                                'AWS access key ID'
+scan '-----BEGIN [A-Z ]*PRIVATE KEY-----'              'Private key block'
+scan 'gh[ps]_[A-Za-z0-9]{36,}'                         'GitHub token'
+scan 'xox[abprs]-[A-Za-z0-9-]+'                        'Slack token'
+scan 'sk-[A-Za-z0-9]{20,}'                             'OpenAI-style API key'
+scan 'sk-ant-[A-Za-z0-9_-]{20,}'                       'Anthropic API key'
+
+# 4) /docs/* changes — heads-up that commit-msg will require the assertion
+if printf '%s\n' "$staged_files" | grep -qE '^docs/'; then
+  warn "/docs/* change staged. commit-msg hook will require 'unanimous-consensus: T-NNN' in the message (per AGENTS.md hard gates)."
+fi
+
+# 5) A ledger's tasks/INDEX.md is a derived view — discourage hand-edits. Any
+#    <dir>/tasks/INDEX.md counts (the project's, and an upstream history ledger's).
+index_hits=$(printf '%s\n' "$staged_files" | sed -n -e '/^tasks\/INDEX\.md$/p' -e '/\/tasks\/INDEX\.md$/p')
+if [ -n "$index_hits" ]; then
+  warn "$(printf '%s' "$index_hits" | tr '\n' ',' | sed 's/,/, /g') is regenerated from per-task frontmatter. Prefer regenerating rather than hand-editing."
+fi
+
+exit 0

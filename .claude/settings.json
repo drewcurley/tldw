@@ -1,3 +1,41 @@
 {
-  "disabledPlugins": ["vercel-plugin@vercel-vercel-plugin"]
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "disabledPlugins": ["vercel-plugin@vercel-vercel-plugin"],
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)"
+    ],
+    "ask": [
+      "Bash(git push *main*)",
+      "Bash(git push *master*)",
+      "Bash(git push *production*)",
+      "Bash(git push *release*)",
+      "Bash(git push *trunk*)",
+      "Bash(git push *hackathon/demo*)",
+      "Bash(git push *--force*)",
+      "Bash(git push * -f*)",
+      "Bash(git reset:*)",
+      "Bash(rm:*)",
+      "Bash(pip install:*)",
+      "Bash(.venv/bin/pip install:*)"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(rm -rf /*)"
+    ]
+  }
 }
