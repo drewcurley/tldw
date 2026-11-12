@@ -42,7 +42,7 @@
 
 | ID | Title | Owner | Tier | Branch | PR | Review |
 |----|-------|-------|------|--------|----|--------|
-| [T-003](./T-003.md) | Adopt the agentic starter (bb9406f) as this repo's playbook | review-coordinator | — | chore/adopt-playbook | — | [artifact](./T-003.md#review-artifact) |
+| [T-003](./T-003.md) | Adopt the agentic starter (bb9406f) as this repo's playbook | review-coordinator | — | chore/adopt-playbook | [#11](https://github.com/drewcurley/tldw/pull/11) | [artifact](./T-003.md#review-artifact) |
 
 ## Cancelled / Superseded
 
