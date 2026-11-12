@@ -7,3 +7,25 @@ build/
 dist/
 .DS_Store
 extension/dist-firefox/
+
+# From the agentic starter (T-003)
+# Engineer-local Claude Code overrides; project defaults live in .claude/settings.json.
+.claude/settings.local.json
+# Local env files — never commit secrets
+.env
+.env.local
+.env.*.local
+# OS / editor cruft
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+# Tooling output
+node_modules/
+coverage/
+*.log
+.venv-*/
+venv/
+# Office temp/lock files
+~$*

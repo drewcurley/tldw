@@ -1,0 +1,41 @@
+#!/usr/bin/env sh
+# commit-msg hook — enforce task-ID + /docs/* unanimous-consensus assertion.
+# Argument $1: path to the commit-message file.
+
+set -e
+
+msg_file="$1"
+msg=$(cat "$msg_file")
+
+red()  { printf "\033[0;31m%s\033[0m\n" "$*" >&2; }
+fail() { red "commit-msg BLOCK: $*"; exit 1; }
+
+# Skip merge / revert / fixup / squash commits
+first_line=$(printf '%s' "$msg" | head -n1)
+case "$first_line" in
+  Merge*|Revert*|fixup!*|squash!*|amend!*) exit 0 ;;
+esac
+
+# 1) Require a Task ID reference (T-NNN or T-NNN.M)
+if ! printf '%s' "$msg" | grep -qE '\bT-[0-9]+(\.[0-9]+)?\b'; then
+  fail "Commit message must reference a Task ID (e.g. T-042 or T-042.3). Open or update a task at tasks/T-NNN.md first."
+fi
+
+# 2) If commit touches AUTHORED /docs/*, require unanimous-consensus assertion.
+#    docs/repos/** is a generated mirror (scripts/aggregate-docs.sh) already gated
+#    in its source repo — exempt it, else every rollup refresh needs an assertion.
+#    A git error fails closed (starter T-013): captured on its own and checked, since in
+#    `git diff | grep ... || true` it used to read as "no /docs change".
+staged_files=$(git -c core.quotePath=false diff --cached --no-renames --name-only --diff-filter=ACMR) \
+  || fail "git diff --cached --name-only failed, so the /docs consensus check could not run. Refusing to commit."
+#    Unquoted names, plus any git still quotes ("docs/a\tb.md"), so quoting can't
+#    dodge the gate (starter T-014).
+docs_touched=$(printf '%s\n' "$staged_files" | sed -n '/^"\{0,1\}docs\/repos\//d;/^"\{0,1\}docs\//p') \
+  || fail "Filtering the staged file list failed, so the /docs consensus check could not run. Refusing to commit."
+if [ -n "$docs_touched" ]; then
+  if ! printf '%s' "$msg" | grep -qiE 'unanimous-consensus:[[:space:]]*T-[0-9]+(\.[0-9]+)?'; then
+    fail "Authored /docs/* change requires 'unanimous-consensus: T-NNN' in the commit message certifying all 9 agents signed off (AGENTS.md hard gate)."
+  fi
+fi
+
+exit 0

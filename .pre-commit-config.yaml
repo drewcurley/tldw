@@ -1,0 +1,97 @@
+# Optional: pre-commit framework configuration (https://pre-commit.com).
+# This is a TEMPLATE — most stanzas are commented out. Uncomment what your stack uses.
+# tldw (T-003): not installed or used; tldw's checks run in CI via scripts/ci-tldw-tests.sh.
+#
+# This file is COMPLEMENTARY to .githooks/ (which is stack-neutral and always-on).
+# .githooks/ enforces procedure (branch names, placeholders, secrets, Task IDs, consensus assertion).
+# .pre-commit-config.yaml adds stack-specific quality (formatters, linters, type checkers).
+#
+# Install pre-commit:
+#   pip install pre-commit            # or: brew install pre-commit
+# Then enable it:
+#   pre-commit install
+#
+# Revisions below are illustrative — bump to the latest releases when you adopt.
+
+repos:
+  # Always-on cross-stack basics
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=512']
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-case-conflict
+      - id: detect-private-key
+
+  # Strong secret scanning (replaces the basic regex in .githooks/pre-commit)
+  # - repo: https://github.com/gitleaks/gitleaks
+  #   rev: v8.18.0
+  #   hooks:
+  #     - id: gitleaks
+
+  # Markdown lint
+  # - repo: https://github.com/igorshubovych/markdownlint-cli
+  #   rev: v0.41.0
+  #   hooks:
+  #     - id: markdownlint
+  #       args: ['--config=.markdownlint.yaml']
+
+  # ─── Stack-specific — uncomment what you use ───
+
+  # # Python — ruff (format + lint) and mypy
+  # - repo: https://github.com/astral-sh/ruff-pre-commit
+  #   rev: v0.5.0
+  #   hooks:
+  #     - id: ruff
+  #     - id: ruff-format
+  # - repo: https://github.com/pre-commit/mirrors-mypy
+  #   rev: v1.10.0
+  #   hooks:
+  #     - id: mypy
+
+  # # TypeScript / JavaScript — prettier + eslint (via local node_modules)
+  # - repo: local
+  #   hooks:
+  #     - id: prettier
+  #       name: prettier
+  #       entry: npx --no-install prettier --write
+  #       language: system
+  #       types_or: [javascript, jsx, ts, tsx, json, css, html, markdown]
+  #     - id: eslint
+  #       name: eslint
+  #       entry: npx --no-install eslint
+  #       language: system
+  #       types_or: [javascript, jsx, ts, tsx]
+
+  # # Go — gofmt + go vet
+  # - repo: https://github.com/dnephin/pre-commit-golang
+  #   rev: v0.5.1
+  #   hooks:
+  #     - id: go-fmt
+  #     - id: go-vet
+  #     - id: go-mod-tidy
+
+  # # Rust — rustfmt + clippy
+  # - repo: https://github.com/doublify/pre-commit-rust
+  #   rev: v1.0
+  #   hooks:
+  #     - id: fmt
+  #     - id: clippy
+
+  # # Shell scripts — shellcheck
+  # - repo: https://github.com/koalaman/shellcheck-precommit
+  #   rev: v0.10.0
+  #   hooks:
+  #     - id: shellcheck
+
+  # # Docker / Compose — hadolint
+  # - repo: https://github.com/hadolint/hadolint
+  #   rev: v2.13.0-beta
+  #   hooks:
+  #     - id: hadolint-docker

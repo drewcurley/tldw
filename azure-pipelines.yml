@@ -1,0 +1,289 @@
+# Azure DevOps pipeline — server-side mirror of .githooks/.
+#
+# For teams whose pipelines live in Azure DevOps (ADOPTING.md § 4b). Code stays in
+# GitHub; Azure connects through the Azure Pipelines GitHub App. GitHub Actions
+# runs the same checks from .github/workflows/checks.yml (the default, § 4a); both
+# call scripts/ci-checks.sh. Using only Azure? Park that workflow so each PR isn't
+# checked twice (§ 4b).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ REQUIRED SETUP PER REPO — the pipeline does NOT enforce anything until BOTH:
+#   1. This pipeline is created in your ADO project against the GitHub repo
+#      (ADOPTING.md § 4). The `pr:` trigger below then builds every PR on its own;
+#      no Azure branch policy is needed (Build Validation is for Azure Repos only).
+#   2. Its check is required in GitHub branch protection on `main`, with Azure
+#      Pipelines as the expected source (ADOPTING.md § 5). Until then a red build
+#      blocks nothing and --no-verify fully bypasses the hooks.
+# A freshly-forked repo has NO enforced CI until the above is done. See AGENTS.md § 7.
+# ─────────────────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    # hackathon/demo is this fork's integration branch (T-003).
+    include: [main, master, hackathon/demo]
+
+# Builds every PR for a GitHub repo (verified in starter T-021). Leave the pipeline's
+# Triggers → "Override the YAML pull request trigger" unchecked, or this is ignored.
+pr:
+  branches:
+    include: ['*']
+
+# Pinned like shellcheck below, so a new image can't change an unrelated PR's result.
+# Keep equal to runs-on in .github/workflows/checks.yml (test-ci-wiring.sh checks).
+pool:
+  vmImage: ubuntu-24.04
+
+variables:
+  # Pin shellcheck so a new release can't fail an unrelated PR, and so the gate is
+  # reproducible. Bump deliberately. (The image ships shellcheck, but its
+  # version floats; pinning a downloaded binary removes that drift + network apt risk.)
+  # The checksum pins the release file itself, since a release asset can be replaced
+  # (starter T-021). Keep both equal in the GitHub workflow; test-ci-wiring.sh checks.
+  SHELLCHECK_VERSION: v0.10.0
+  SHELLCHECK_SHA256: 6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87
+
+jobs:
+  - job: scripts
+    displayName: shell scripts (lint + test)
+    timeoutInMinutes: 15
+    steps:
+      - checkout: self
+        fetchDepth: 0
+      - script: |
+          set -e
+          # Pinned, checksummed shellcheck binary (reproducible). A checksum mismatch
+          # fails the job; only a failed download falls back to apt, with a loud warning.
+          url="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          tarball="$(Agent.TempDirectory)/shellcheck.tar.xz"
+          if curl -sSfL -o "$tarball" "$url"; then
+            echo "${SHELLCHECK_SHA256}  $tarball" | sha256sum -c - \
+              || { echo "##[error]shellcheck ${SHELLCHECK_VERSION} doesn't match its pinned checksum; not running it."; exit 1; }
+            tar -xJf "$tarball" -C "$(Agent.TempDirectory)"
+            sc="$(Agent.TempDirectory)/shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          else
+            echo "##[warning]Could not fetch pinned shellcheck; falling back to apt (version may drift)."
+            sudo apt-get update -qq && sudo apt-get install -y shellcheck
+            sc="shellcheck"
+          fi
+          "$sc" --version
+          "$sc" .githooks/pre-commit .githooks/commit-msg .githooks/pre-push \
+                scripts/*.sh scripts/test/*.sh
+        displayName: shellcheck hooks and scripts
+      - script: sh scripts/test/test-setup-workspace.sh
+        displayName: setup-workspace.sh fixture tests
+      - script: sh scripts/test/test-ci-checks.sh
+        displayName: ci-checks.sh fixture tests
+      - script: sh scripts/test/test-pre-commit.sh
+        displayName: pre-commit hook fixture tests
+      - script: sh scripts/test/test-commit-msg.sh
+        displayName: commit-msg hook fixture tests
+      - script: sh scripts/test/test-ci-base.sh
+        displayName: ci-base.sh fixture tests
+      - script: sh scripts/test/test-ci-pr-checks.sh
+        displayName: ci-pr-checks.sh fixture tests
+      - script: sh scripts/test/test-task-ledgers.sh
+        displayName: task ledger invariants
+      - script: sh scripts/test/test-ci-wiring.sh
+        displayName: every fixture suite runs in CI
+      - script: sh scripts/test/test-setup-hooks.sh
+        displayName: setup-hooks.sh fixture tests
+      - script: sh scripts/test/test-aggregate-docs.sh
+        displayName: aggregate-docs.sh fixture tests
+      - script: sh scripts/test/test-claude-settings.sh
+        displayName: Claude Code push-rule tests
+      - script: sh scripts/test/test-pr-body-check.sh
+        displayName: PR-body check fixture tests
+      - script: sh scripts/test/test-ci-deck-needed.sh
+        displayName: ci-deck-needed.sh fixture tests
+      - script: sh scripts/test/test-pre-push.sh
+        displayName: pre-push hook fixture tests
+      - script: sh scripts/test/test-ci-tldw-tests.sh
+        displayName: ci-tldw-tests.sh report-check fixture tests
+
+  # tldw's own tests (T-003), mirrored from .github/workflows/checks.yml so the two
+  # CI files run the same checks. INERT in this fork: no Azure DevOps pipeline is
+  # connected, so this job never runs and its presence is not Linux coverage. The
+  # GitHub Actions copy is the one that runs. Same rules as the deck job: hash-locked
+  # third-party packages, no credentials, no secrets, no artifacts.
+  - job: tldw
+    displayName: tldw tests (pytest + extension)
+    timeoutInMinutes: 15
+    steps:
+      - checkout: self
+        persistCredentials: false
+      - script: sh scripts/ci-tldw-tests.sh run "$(Agent.TempDirectory)/tldw"
+        displayName: tldw tests (hash-locked install, pytest, full-pass check)
+
+  # Third-party Python packages run here and in the tldw job only (starter T-016; T-003): no credentials,
+  # no secrets, no artifacts, and no job waits on this one. scripts/test/test-deck.sh checks that.
+  # PR builds that change nothing the deck suite reads skip the build (starter T-022).
+  - job: deck
+    displayName: overview deck (build + compare)
+    timeoutInMinutes: 15
+    steps:
+      - checkout: self
+        fetchDepth: 2
+        persistCredentials: false
+      - script: |
+          set -e
+          t="$(Agent.TempDirectory)"
+          # BEGIN deck-gate (starter T-022). Keep identical in azure-pipelines.yml and
+          # .github/workflows/checks.yml; scripts/test/test-ci-deck-needed.sh runs it.
+          # Asks the TARGET branch's scripts/ci-deck-needed.sh whether this build needs
+          # the deck, so a PR can't skip it by editing that script. Only an explicit
+          # verdict (exit 1 with a "skip:" line) skips; anything else builds.
+          rm -f "$t/deck-skip"
+          if git show 'HEAD^1:scripts/ci-deck-needed.sh' > "$t/deck-needed.sh" 2>/dev/null; then
+            rc=0
+            sh "$t/deck-needed.sh" > "$t/deck-needed.out" 2>&1 || rc=$?
+            cat "$t/deck-needed.out"
+            if [ "$rc" -eq 1 ] && grep -q '^skip:' "$t/deck-needed.out"; then
+              : > "$t/deck-skip"
+            fi
+          else
+            echo "run: the target branch has no scripts/ci-deck-needed.sh"
+          fi
+          # END deck-gate
+          if [ -e "$t/deck-skip" ]; then
+            echo "##[warning]Deck build skipped: this PR changes no file the deck suite reads."
+            exit 0
+          fi
+          if [ ! -f scripts/build_deck.py ]; then
+            echo "SKIP: scripts/build_deck.py is gone; not installing deck dependencies."
+            exit 0
+          fi
+          python3 --version
+          python3 -m venv "$(Agent.TempDirectory)/deck-venv"
+          "$(Agent.TempDirectory)/deck-venv/bin/python" -m pip install \
+            --disable-pip-version-check --no-input --require-hashes --only-binary :all: \
+            -r scripts/requirements-deck.txt
+          "$(Agent.TempDirectory)/deck-venv/bin/python" -m pip freeze
+        displayName: install deck build dependencies
+      - script: sh scripts/test/test-deck.sh
+        displayName: overview deck fixture tests
+        env:
+          DECK_BUILD_REQUIRED: '1'
+          DECK_PYTHON: $(Agent.TempDirectory)/deck-venv/bin/python
+          DECK_SKIP_FILE: $(Agent.TempDirectory)/deck-skip
+
+  - job: procedure
+    displayName: procedure checks
+    timeoutInMinutes: 10
+    steps:
+      - checkout: self
+        fetchDepth: 0
+        persistCredentials: true
+
+      - script: |
+          set -e
+          head=$(git rev-parse --verify 'HEAD^{commit}')
+          # BEGIN pr-mode (starter T-022). scripts/test/test-ci-pr-checks.sh runs it.
+          # Azure exports its predefined variables as env vars, so no macro text is
+          # pasted into the script. A PR build is BUILD_REASON=PullRequest or any build
+          # with a PR target; an unknown build type fails closed rather than taking
+          # the weaker branch-build scan.
+          target="${SYSTEM_PULLREQUEST_TARGETBRANCH:-}"
+          if [ -n "${TF_BUILD:-}" ] && [ -z "${BUILD_REASON:-}" ]; then
+            echo "##[error]BUILD_REASON is empty, so this can't tell a PR build from a branch build. Failing closed."
+            exit 1
+          fi
+          if [ "${BUILD_REASON:-}" = "PullRequest" ] || [ -n "$target" ]; then
+            if [ -z "$target" ]; then
+              echo "##[error]PR build with no target branch (SYSTEM_PULLREQUEST_TARGETBRANCH is empty). Failing closed."
+              exit 1
+            fi
+            case "$target" in -*)
+              echo "##[error]PR target '$target' looks like an option. Failing closed."; exit 1 ;;
+            esac
+            # PR build. ADO may check out a synthetic merge ref; the gate diffs from
+            # the merge base with the TARGET tip, so the checkout shape doesn't matter.
+            target="${target#refs/heads/}"
+            git fetch -q origin "$target"
+            target_sha=$(git rev-parse --verify 'FETCH_HEAD^{commit}')
+            echo "PR build: target $target ($target_sha), head $head"
+            # BEGIN trusted-gate (starter T-014). Keep identical in azure-pipelines.yml and
+            # .github/workflows/checks.yml; scripts/test/test-ci-pr-checks.sh runs it.
+            # Takes ci-pr-checks.sh from the TARGET branch, so a PR can't swap the gate out by
+            # editing it; the PR's own copy runs only while the target has none (bootstrap).
+            warn='WARNING:'
+            [ -z "${TF_BUILD:-}" ] || warn='##[warning]'
+            [ -z "${GITHUB_ACTIONS:-}" ] || warn='::warning::'
+            runner=$(mktemp)
+            trap 'rm -f "$runner"' EXIT
+            runner_entry=$(git ls-tree --full-tree "$target_sha" -- scripts/ci-pr-checks.sh)
+            case "$runner_entry" in
+              '100644 blob '*|'100755 blob '*)
+                echo "Gate runner: the target's scripts/ci-pr-checks.sh ($runner_entry)"
+                git cat-file blob "$target_sha:scripts/ci-pr-checks.sh" > "$runner" ;;
+              '')
+                echo "$warn the target branch has no scripts/ci-pr-checks.sh; running this PR's copy (bootstrap only)."
+                cp scripts/ci-pr-checks.sh "$runner" ;;
+              *)
+                echo "$warn the target's scripts/ci-pr-checks.sh is not a regular file. Failing closed."
+                exit 1 ;;
+            esac
+            sh "$runner" "$target_sha" "$head"
+            # END trusted-gate
+          else
+            # Branch/CI build (already merged): scan the tip commit (HEAD~1...HEAD, or
+            # the whole tree for a root commit). ci-base.sh fails rather than fall
+            # back to HEAD...HEAD, which would scan nothing (starter T-013).
+            base=$(sh scripts/ci-base.sh)
+            echo "Diff range: $base...$head"
+            sh scripts/ci-checks.sh "$base" "$head"
+          fi
+          # END pr-mode
+        displayName: procedure checks (mirror of .githooks/)
+
+      # PR-body template check. The PR description lives in GitHub (not ADO), so it
+      # needs a GitHub token, not System.AccessToken. It is OPT-IN: set a secret
+      # pipeline variable GITHUB_TOKEN holding a fine-grained token for this repo only,
+      # with read-only Pull requests access and an expiry. Without it (and on fork PRs,
+      # which never get secrets) the step is skipped with a warning rather than
+      # silently passing or failing. The per-PR template completeness is also checked
+      # by human review + the PR template itself, so this is a belt-and-suspenders gate.
+      - script: |
+          # BEGIN pr-body-check (starter T-021). scripts/test/test-pr-body-check.sh runs it.
+          set -e
+          # Azure's predefined variables arrive as env vars; the block holds no macros.
+          if [ "${BUILD_REASON:-}" != "PullRequest" ]; then
+            echo "Not a PR build; skipping PR-body template check."; exit 0
+          fi
+          # An undefined pipeline variable reaches env: as its own unexpanded macro
+          # text, not as empty, so "unset" is either. The pattern stays out of macro
+          # syntax so Azure can't expand it into the token.
+          case "${GITHUB_TOKEN:-}" in
+            ''|'$('*)
+              echo "##[warning]GITHUB_TOKEN not set; skipping PR-body template check. Set it (a fine-grained token with read-only Pull requests access) to enable."
+              exit 0 ;;
+          esac
+          command -v jq >/dev/null 2>&1 \
+            || { echo "##[error]jq is not installed on this agent; can't check the PR body."; exit 1; }
+          pr="${SYSTEM_PULLREQUEST_PULLREQUESTNUMBER:-}"
+          repo="${BUILD_REPOSITORY_NAME:-}"   # owner/repo for GitHub-connected pipelines
+          # Check both before the token is used for anything.
+          case "$pr" in ''|*[!0-9]*)
+            echo "##[error]PR build without a usable PR number ('$pr'). Failing closed."; exit 1 ;;
+          esac
+          if ! printf '%s\n' "$repo" | grep -Eqx '[A-Za-z0-9._-]+/[A-Za-z0-9._-]+'; then
+            echo "##[error]PR build without a usable owner/repo name ('$repo'). Failing closed."; exit 1
+          fi
+          # Fetch, then parse: in a pipe, curl's failure is lost and an empty body
+          # reads as six missing sections. The header goes in on stdin (printf is a
+          # shell builtin), so the token is never in a process's arguments. On a
+          # redirect, curl sends it only to the same host.
+          pr_json=$(printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" \
+                    | curl -sSfL -H @- -H "Accept: application/vnd.github+json" \
+                        "https://api.github.com/repos/${repo}/pulls/${pr}") \
+            || { echo "##[error]Couldn't read PR #${pr} from the GitHub API; check that GITHUB_TOKEN is valid and can read ${repo}."; exit 1; }
+          body=$(printf '%s' "$pr_json" | jq -er '.body // ""') \
+            || { echo "##[error]Couldn't parse the GitHub API's reply for PR #${pr}."; exit 1; }
+          missing=0
+          for section in '## Task' '## Summary' '## Agent sign-offs' '## Human review' '## Risk' '## Redlines'; do
+            printf '%s' "$body" | grep -qF "$section" || { echo "##[error]PR body missing section: $section"; missing=1; }
+          done
+          [ "$missing" = "1" ] && exit 1 || true
+          # END pr-body-check
+        displayName: pull request body must use the project template
+        env:
+          GITHUB_TOKEN: $(GITHUB_TOKEN)
