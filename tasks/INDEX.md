@@ -8,7 +8,7 @@
 
 | ID | Title | Owner | Tier | State | Branch | PR |
 |----|-------|-------|------|-------|--------|----|
-| [T-001](./T-001.md) | Bootstrap `/docs/` folder | review-coordinator | 1+2 | in-progress | chore/docs-tier1 | — |
+| [T-001](./T-001.md) | Bootstrap `/docs/` folder | review-coordinator | 1+2 | in-progress | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) |
 
 ## Backlog — Tier 1 (blocks feature work)
 
@@ -50,19 +50,19 @@
 | ID | Title | Owner | Tier | Branch | PR | Review |
 |----|-------|-------|------|--------|----|--------|
 | [T-003](./T-003.md) | Adopt the agentic starter (bb9406f) as this repo's playbook | review-coordinator | — | chore/adopt-playbook | [#11](https://github.com/drewcurley/tldw/pull/11) | [artifact](./T-003.md#review-artifact) |
-| [T-001.1](./T-001.1.md) | Draft docs index | analyst | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.2](./T-001.2.md) | Write `architecture.md` | architect | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.17](./T-001.17.md) | Write `contracts.md` ⭐ exhaustive code-grounded inventory | backend-engineer | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.5](./T-001.5.md) | Write `api.md` | backend-engineer | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.4](./T-001.4.md) | Write `data-model.md` | data-engineer | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.6](./T-001.6.md) | Write `stack.md` | architect | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.8](./T-001.8.md) | Write `testing.md` | sdet | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.9](./T-001.9.md) | Write `deployment.md` | devops | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.11](./T-001.11.md) | Set up `decisions/` + Architectural Decision Record 0001 | architect | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.12](./T-001.12.md) | Set up `reviews/` skeleton | review-coordinator | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.13](./T-001.13.md) | Tier 1 review + collect 9 sign-offs | review-coordinator | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.14](./T-001.14.md) | Write `ownership.md` (Directly Responsible Individual map) | architect | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
-| [T-001.15](./T-001.15.md) | Write `onboarding.md` | analyst | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.1](./T-001.1.md) | Draft docs index | analyst | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.2](./T-001.2.md) | Write `architecture.md` | architect | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.17](./T-001.17.md) | Write `contracts.md` ⭐ exhaustive code-grounded inventory | backend-engineer | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.5](./T-001.5.md) | Write `api.md` | backend-engineer | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.4](./T-001.4.md) | Write `data-model.md` | data-engineer | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.6](./T-001.6.md) | Write `stack.md` | architect | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.8](./T-001.8.md) | Write `testing.md` | sdet | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.9](./T-001.9.md) | Write `deployment.md` | devops | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.11](./T-001.11.md) | Set up `decisions/` + Architectural Decision Record 0001 | architect | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.12](./T-001.12.md) | Set up `reviews/` skeleton | review-coordinator | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.13](./T-001.13.md) | Tier 1 review + collect 9 sign-offs | review-coordinator | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.14](./T-001.14.md) | Write `ownership.md` (Directly Responsible Individual map) | architect | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.15](./T-001.15.md) | Write `onboarding.md` | analyst | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
 
 ## Cancelled / Superseded
 
