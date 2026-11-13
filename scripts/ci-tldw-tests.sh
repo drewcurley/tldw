@@ -24,7 +24,7 @@
 set -eu
 LC_ALL=C; export LC_ALL
 
-MIN_TESTS=717
+MIN_TESTS=723
 
 die() { printf 'ci-tldw-tests: %s\n' "$*" >&2; exit 1; }
 

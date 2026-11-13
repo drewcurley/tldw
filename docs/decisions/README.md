@@ -9,6 +9,7 @@ This folder holds tldw's Architectural Decision Records (ADRs): one file per dec
 | [0001](./0001-foundational-stack.md) | Foundational stack: local-only, the user's own Claude plan, a stdlib server, an MV3 extension in plain JS | accepted | 2026-11-12 (records decisions made 2026-06-17 to 2026-06-18) |
 | [0002](./0002-hackathon-fork-departures.md) | This hackathon fork's departures from the agentic starter | accepted | 2026-11-12 |
 | [0003](./0003-local-security-model.md) | Plain HTTP on loopback, against the "TLS everywhere" redline | accepted | 2026-11-12 |
+| [0004](./0004-accept-gpl-tts-dependency.md) | Accept piper-tts's GPL-3.0-or-later license for the optional `[tts]` extra | accepted | 2026-11-12 |
 
 Add a row here in the same PR as each new ADR.
 
@@ -56,7 +57,7 @@ Copy `_TEMPLATE.md` to `NNNN-slug.md` and fill every section. A section that doe
 
 ## How this was verified
 
-The conventions restate T-001.11's acceptance criteria (`tasks/T-001.11.md`) and the Architect's redline-override clause (`.claude/agents/architect.md`, "Wins on" and "Redlines"). The three ADRs' statuses are their own status lines.
+The conventions restate T-001.11's acceptance criteria (`tasks/T-001.11.md`) and the Architect's redline-override clause (`.claude/agents/architect.md`, "Wins on" and "Redlines"). The four ADRs' statuses are their own status lines.
 
 ## Update this doc when
 
