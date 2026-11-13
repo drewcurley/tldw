@@ -375,7 +375,7 @@ def _short(path: Path) -> str:
 
 def _run_cache(argv: list[str]) -> int:
     """`tldw cache` — what tldw keeps on disk; `tldw cache clean` tidies it."""
-    from . import audio, hygiene, server, txcache
+    from . import align, audio, hygiene, server, txcache
     from . import whisper_transcribe as wt
     p = argparse.ArgumentParser(
         prog="tldw cache",
@@ -388,12 +388,15 @@ def _run_cache(argv: list[str]) -> int:
     args = p.parse_args(argv)
 
     areas = [("transcripts", txcache.CACHE_DIR), ("summaries", txcache.SUMMARY_DIR),
-             ("key moments", txcache.SEGMENT_DIR), ("voices", audio.VOICE_DIR),
-             ("whisper models", wt._CACHE_DIR)]
+             ("key moments", txcache.SEGMENT_DIR), ("word timings", align.ALIGN_DIR),
+             ("voices", audio.VOICE_DIR), ("whisper models", wt._CACHE_DIR)]
+    # Chosen by name, never by position: appending an area must not leave it
+    # reported but never cleaned.
+    expiring = ("transcripts", "summaries", "key moments", "word timings")
 
     if args.action == "clean":
         out = hygiene.Removal()
-        for _name, d in areas[:3]:
+        for _name, d in [a for a in areas if a[0] in expiring]:
             for f in hygiene.expired_entries(d, txcache.TTL_SECONDS):
                 hygiene.remove_under(f, d, out, dry_run=args.dry_run)
         swept = hygiene.sweep_stale_audio(server._stale_audio_age(),

@@ -16,7 +16,10 @@
     .voicerow { display: flex; gap: 8px; align-items: stretch; }
     .voicerow select { flex: 1; min-width: 0; padding: 8px 10px; font: inherit;
       border: 1px solid #bbb; border-radius: 8px; background: #fff; }
-    #closeAction, #model, #segmentRatio, #whisper { width: 100%; padding: 8px 10px; font: inherit;
+    textarea { width: 100%; box-sizing: border-box; padding: 8px 10px; font: inherit;
+      border: 1px solid #bbb; border-radius: 8px; }
+    button.secondary { margin-top: 8px; background: #444; }
+    #closeAction, #model, #segmentRatio, #whisper, #muteSound { width: 100%; padding: 8px 10px; font: inherit;
       background: #fff; border: 1px solid #bbb; border-radius: 8px; }
     #preview { margin-top: 0; flex: 0 0 auto; background: #444; }
     #preview[disabled] { opacity: .6; cursor: default; }
@@ -64,7 +67,19 @@
     transcribe the audio on this machine with Whisper instead, which takes roughly
     a minute for every five and a half minutes of video and uses the CPU while it
     runs. The transcript is kept, so it only happens once per video. Needs
-    <code>pipx inject youtube-tldw faster-whisper</code>.</p>
+    <code>pipx inject youtube-tldw faster-whisper</code>.
+    <span id="whisperCoverHint">It also controls word timing for "Cover listed words": unless this is set to "Don't transcribe", turning that on fetches the video's audio once and runs Whisper on a few seconds around each listed word, without asking. With "Don't transcribe", each word is covered for its whole caption line instead.</span></p>
+  <label for="muteWords">Words to cover (for 'Cover listed words')</label>
+  <textarea id="muteWords" rows="5" spellcheck="false" aria-describedby="muteWordsHint"></textarea>
+  <p class="hint" id="muteWordsHint">Separate with commas or new lines. Whole words, any case. Leave empty to turn off Cover listed words.</p>
+  <button id="muteRestore" type="button" class="secondary">Restore default list</button>
+  <label for="muteSound">Sound for listed words</label>
+  <select id="muteSound" aria-describedby="muteSoundHint">
+    <option value="bleep">Bleep (default)</option>
+    <option value="mute">Mute</option>
+    <option value="moo">Moo</option>
+  </select>
+  <p class="hint" id="muteSoundHint">Every choice silences the video during the word. Bleep and Moo also play a short sound over it.</p>
   <label for="closeAction">If you close the panel while it's still working</label>
   <select id="closeAction">
     <option value="continue">Keep working in the background</option>
@@ -80,6 +95,7 @@
     machine, on your own Claude plan. If it saves you time,
     <a href="https://github.com/sponsors/drewcurley" target="_blank"
        rel="noopener noreferrer">sponsoring it on GitHub</a> is welcome — never required.</p>
+  <script src="mute_words.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

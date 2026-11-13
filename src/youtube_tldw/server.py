@@ -64,6 +64,19 @@ _seg_progress: dict = {}
 _tx_jobs: dict = {}             # video_id -> job dict, while a transcription runs
 _tx_permit = threading.Semaphore(1)
 WHISPER_POLICIES = ("off", "ask", "always")
+# Word timing (T-020, /align/stream). One alignment at a time, process-wide, so two
+# tabs can't each start a YouTube download; it shares _tx_permit with whole-video
+# transcription, waiting at most ALIGN_PERMIT_WAIT_S for it. After a YouTube 429 it
+# does no fetch for ALIGN_COOLDOWN_S (in memory: a restart clears it).
+# _align_backoff_until is read and written only while holding _align_lock.
+_align_lock = threading.Lock()
+_align_backoff_until = 0.0
+_align_clock = time.monotonic       # a module attribute so tests can drive it
+ALIGN_DOWNLOAD_TIMEOUT = 300.0
+ALIGN_BUDGET_S = 600.0
+ALIGN_WINDOW_DEADLINE_S = 30.0
+ALIGN_PERMIT_WAIT_S = 20.0
+ALIGN_COOLDOWN_S = 600.0
 # A ceiling on what may be transcribed at all, checked before any audio is fetched.
 # At the measured 5.5x realtime, two hours of video is already ~22 minutes of
 # full-core CPU; beyond that the honest answer is no.
@@ -533,7 +546,7 @@ from . import (
 from . import metadata as md
 from . import transcript
 from . import ask, audio, claude_client, config, core, textmode, txcache, usage
-from . import hygiene, whisper_transcribe
+from . import align, hygiene, whisper_transcribe
 from . import summarize
 from .summarize import SINGLE_PASS_CHARS
 from .urls import canonical_video_id
@@ -1014,6 +1027,11 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/ask/stream":
             self._guarded(self._run_ask, slots=_claude_slots, max_bytes=MAX_ASK_BYTES)
             return
+        if path == "/align/stream":
+            # No claude slot: it takes the transcription permit itself, around the
+            # Whisper work only (T-020).
+            self._guarded(self._run_align, slots=None)
+            return
         if path not in ("/summarize", "/summarize/stream", "/segments/stream") and not speak:
             self._send_json(404, {"error": "not found"})
             return
@@ -1101,8 +1119,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _guarded(self, handler, *, slots: "_Slots | None",
                  max_bytes: int = MAX_BODY_BYTES) -> None:
-        """auth -> bounded body -> a slot from `slots` (None: work that costs
-        nothing takes none), then run `handler(body)`."""
+        """auth -> bounded body -> a slot from `slots`, then run `handler(body)`.
+        None takes no pool slot: either the work costs nothing, or (/align/stream)
+        it brings its own lock and the transcription permit."""
         if not self._authorized():
             self._send_json(401, {"error": "missing or invalid token"})
             return
@@ -1853,6 +1872,229 @@ class _Handler(BaseHTTPRequestHandler):
         print(f"  answered ({len(answered)} chars) in {time.monotonic()-start:.1f}s",
               flush=True)
         emit({"type": "answer_done"})
+
+    def _run_align(self, body) -> None:
+        """POST /align/stream (T-020): word timing for "Cover listed words".
+
+        Checks that can fail before any work answer as plain JSON; everything after
+        the 200 is an in-stream `error`. Every refusal after the body is validated
+        carries `reason` and logs `align: <reason> <video_id>` -- never words or
+        windows. The order is
+        contracted (docs/contracts.md): cached windows are served before any
+        dependency is required, and nothing is downloaded until the model, the
+        lock, the cooldown and any running transcription all allow it.
+
+        Long synchronous work in a request is accepted here: it streams, follows
+        /summarize/stream's precedent, and stops when the client goes.
+        """
+        global _align_backoff_until
+        vid = "-"
+
+        def refuse(status, reason, error, **extra):
+            print(f"  align: {reason} {vid}", flush=True)
+            self._send_json(status, {"error": error, "reason": reason, **extra})
+
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "expected a JSON object"})
+            return
+        try:
+            vid = canonical_video_id(str(body.get("url")))
+        except TldrError:
+            self._send_json(400, {"error": "bad video url"})
+            return
+        try:
+            windows = align.parse_windows(body.get("windows"))
+        except align.WindowError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        policy = _whisper_policy(body)
+        if policy is None:
+            self._send_json(400, {"error": "whisper must be one of: off, ask, always"})
+            return
+        if policy == "off":
+            pinned = config.get("whisper") == "off"
+            refuse(503, "whisper_off",
+                   align.WHISPER_PINNED_OFF_TEXT if pinned else align.WHISPER_OFF_TEXT)
+            return
+        fp = align.fingerprint() if whisper_transcribe.is_available() else None
+        if fp is None:
+            refuse(503, "whisper_missing", align.WHISPER_MISSING_TEXT,
+                   install_hint=whisper_transcribe.INSTALL_HINT)
+            return
+        ceiling = _max_transcribe_ms()
+        if any(end > ceiling for _start, end in windows):
+            refuse(413, "too_long", align.TOO_LONG_TEXT)
+            return
+        model_size = whisper_transcribe.resolve_model()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self._cors_headers()
+        self.end_headers()
+        gone = [False]
+
+        def emit(obj):
+            # Only the write is guarded: a model-load OSError must not read as
+            # "the client went away".
+            if gone[0]:
+                return
+            try:
+                self.wfile.write((json.dumps(obj) + "\n").encode("utf-8"))
+                self.wfile.flush()
+            except OSError:
+                gone[0] = True
+
+        def fail(status, reason, error, **extra):
+            print(f"  align: {reason} {vid}", flush=True)
+            emit({"type": "error", "status": status, "reason": reason,
+                  "error": error, **extra})
+
+        # Exact duplicates are timed once; each original index still gets its event.
+        indices: dict = {}
+        for i, key in enumerate(windows):
+            indices.setdefault(key, []).append(i)
+        counts = {"timed": 0, "cached": 0, "failed": 0}
+
+        def send_window(key, words, cached):
+            for i in indices[key]:
+                emit({"type": "window", "i": i, "start_ms": key[0], "end_ms": key[1],
+                      "words": [{"s": s, "e": e, "w": w} for s, e, w in words],
+                      "cached": cached})
+
+        missing = []
+        for key in indices:
+            words = align.get_window(vid, key[0], key[1], model_size, fp)
+            if words is None:
+                missing.append(key)
+                continue
+            send_window(key, words, True)
+            counts["timed"] += len(indices[key])
+            counts["cached"] += len(indices[key])
+        if not missing:
+            emit({"type": "result", **counts})
+            return
+
+        import shutil
+        import tempfile
+        if shutil.which("ffmpeg") is None:
+            fail(503, "ffmpeg_missing", align.FFMPEG_MISSING_TEXT)
+            return
+        try:
+            on_disk = whisper_transcribe.model_on_disk(model_size)
+        except ImportError:
+            fail(503, "whisper_missing", align.WHISPER_BROKEN_TEXT.format(
+                hint=whisper_transcribe.INSTALL_HINT),
+                 install_hint=whisper_transcribe.INSTALL_HINT)
+            return
+        if not on_disk:
+            fail(503, "model_missing", align.MODEL_MISSING_TEXT)
+            return
+        if not _align_lock.acquire(blocking=False):
+            fail(429, "busy", align.ALIGN_BUSY_TEXT)
+            return
+        have_permit = False
+        workdir = None
+        # The budget covers the whole request, download and permit wait included,
+        # so the server always finishes inside the extension's 660 s timer.
+        started = _align_clock()
+        try:
+            with _cache_lock:
+                transcribing = bool(_tx_jobs)
+            if transcribing:
+                fail(429, "busy", align.TX_BUSY_TEXT)
+                return
+            if _align_clock() < _align_backoff_until:
+                fail(429, "rate_limited", align.ALIGN_RATE_LIMITED_TEXT)
+                return
+            workdir = Path(tempfile.mkdtemp(prefix=hygiene.AUDIO_TMP_PREFIX))
+            emit({"type": "progress", "message": "Fetching the video's audio…"})
+            if gone[0]:
+                return
+            try:
+                audio_path = whisper_transcribe.download_audio(
+                    vid, workdir, timeout=ALIGN_DOWNLOAD_TIMEOUT,
+                    max_duration_s=ceiling // 1000)
+            except TldrTimeoutError:
+                fail(504, "timeout", align.DOWNLOAD_TIMEOUT_TEXT)
+                return
+            except TldrError as exc:
+                # Checked on yt-dlp's own text, before anything rewrites it.
+                if md.rate_limited(str(exc)):
+                    _align_backoff_until = _align_clock() + ALIGN_COOLDOWN_S
+                    fail(429, "rate_limited", align.ALIGN_RATE_LIMITED_TEXT)
+                elif "produced no audio" in str(exc):
+                    # The match filter skipped it: no duration, or over the ceiling.
+                    fail(502, "download_failed", align.AUDIO_SKIPPED_TEXT)
+                else:
+                    fail(502, "download_failed", align.DOWNLOAD_FAILED_TEXT)
+                return
+            # A progress line after every long silent step, so a client that gave
+            # up is noticed at the next write instead of after the whole budget.
+            emit({"type": "progress", "message": "Got the audio. Timing the words…"})
+            if gone[0]:
+                return
+            waited_from = last_note = _align_clock()
+            while not _tx_permit.acquire(timeout=0.5):
+                now = _align_clock()
+                if now - waited_from >= ALIGN_PERMIT_WAIT_S:
+                    fail(429, "busy", align.TX_BUSY_TEXT)
+                    return
+                if now - last_note >= 5.0:
+                    last_note = now
+                    emit({"type": "progress",
+                          "message": "Waiting for Whisper: a transcription is running…"})
+                    if gone[0]:
+                        return
+            have_permit = True
+            try:
+                model = whisper_transcribe._load_model(model_size, local_only=True)
+            except ImportError:
+                fail(503, "whisper_missing", align.WHISPER_BROKEN_TEXT.format(
+                    hint=whisper_transcribe.INSTALL_HINT),
+                     install_hint=whisper_transcribe.INSTALL_HINT)
+                return
+            except Exception as exc:
+                print(f"  align: model load failed {vid}: {type(exc).__name__}", flush=True)
+                fail(503, "model_missing", align.MODEL_MISSING_TEXT)
+                return
+            for n, key in enumerate(missing):
+                if gone[0]:
+                    break
+                if ALIGN_BUDGET_S - (_align_clock() - started) < ALIGN_WINDOW_DEADLINE_S:
+                    # Not enough budget left for one more window's worst case.
+                    left = sum(len(indices[k]) for k in missing[n:])
+                    counts["failed"] += left
+                    print(f"  align: budget spent {vid}: {left} windows left", flush=True)
+                    break
+                try:
+                    words = align.time_window(
+                        model, audio_path, workdir, n, key[0], key[1],
+                        deadline=_align_clock() + ALIGN_WINDOW_DEADLINE_S,
+                        clock=_align_clock)
+                except Exception as exc:
+                    counts["failed"] += len(indices[key])
+                    print(f"  align: window {n} failed {vid}: {type(exc).__name__}",
+                          flush=True)
+                    emit({"type": "progress", "message": "One window couldn't be timed."})
+                    continue
+                align.put_window(vid, key[0], key[1], model_size, fp, words)
+                send_window(key, words, False)
+                counts["timed"] += len(indices[key])
+            emit({"type": "result", **counts})
+        except Exception as exc:
+            # Anything unforeseen still ends the stream with a reason; its detail
+            # stays in the log.
+            print(f"  align: unexpected {vid}: {type(exc).__name__}", flush=True)
+            fail(500, "other", align.ALIGN_OTHER_TEXT)
+        finally:
+            if have_permit:
+                _tx_permit.release()
+            _align_lock.release()
+            if workdir is not None:
+                shutil.rmtree(workdir, ignore_errors=True)
+            align.prune()
 
     def _run_preview(self, body: dict) -> None:
         """A short spoken sample of one voice, for the voice pickers. Memoized."""

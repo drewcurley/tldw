@@ -266,10 +266,21 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
   eval(grab("  function audioRowHtml(pending)", "\n  // --- The summary as it's written"));
   const pending = audioRowHtml(true), done = audioRowHtml(false);
   check("in-progress controls are all disabled",
-    (pending.match(/ disabled /g) || []).length, 4);
+    (pending.match(/ disabled /g) || []).length, 5);   // + "Cover listed words" (T-020)
   check("finished controls are not", / disabled /.test(done), false);
   check("both views share one layout (no jump when the result lands)",
     pending.replace(/ disabled title="[^"]*"/g, ""), done);
+  // T-020: the toggle is a real button with aria-pressed and a visible check mark
+  // (not colour alone), its status line isn't live, and its announcements are.
+  check("cover toggle is a pressed-state button",
+    /<button class="covertoggle" aria-pressed="false"><span class="covercheck" aria-hidden="true"><\/span>Cover listed words<\/button>/.test(done), true);
+  check("cover status line is not a live region",
+    /<div class="coverstatus"><\/div>/.test(done), true);
+  check("cover announcements have a live region",
+    /<div class="coverlive sr" role="status" aria-live="polite"><\/div>/.test(done), true);
+  check("pressed shows a check mark",
+    /\.covertoggle\[aria-pressed="true"\] \.covercheck::before \{ content: "✓ "; \}/.test(src), true);
+  check("busy marks the region", /row\.setAttribute\("aria-busy", "true"\)/.test(src), true);
 
   const body = stripComments(src.slice(src.indexOf("  function showPartial()"),
                                        src.indexOf("  function showResult(")));

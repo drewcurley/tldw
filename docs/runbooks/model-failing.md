@@ -9,9 +9,9 @@ For a summary or key moments, the panel always shows the same fixed text, whatev
 
 > The model call failed. If you're on the Claude CLI, make sure `claude` is logged in; otherwise check your configured model command.
 
-- It's what `httpError` shows for any `502`; the server's own explanation is dropped (`extension/background.js:578`; `docs/contracts.md`, "What the extension does with a status"). **The real reason is only in the `tldw serve` terminal** (Check, step 1).
+- It's what `httpError` shows for any `502`; the server's own explanation is dropped (`extension/background.js:652`; `docs/contracts.md`, "What the extension does with a status"). **The real reason is only in the `tldw serve` terminal** (Check, step 1).
 
-For a question, the panel shows the server's text instead (`background.js:446`). When the `claude` CLI printed nothing at all, that is:
+For a question, the panel shows the server's text instead (`background.js:520`). When the `claude` CLI printed nothing at all, that is:
 
 > Claude returned no output. Are you logged in? Try `claude` once interactively to confirm your session.
 
@@ -71,7 +71,7 @@ A model call that takes too long is a `504` timeout, not this; see the "Less com
 ## How this was verified
 
 - **Read on `a7f104c`:** `claude_client.py:36-62`, `:90-98`, `:390-495`; `server.py:660-679`, `:711-717`, `:1180-1188`, `:1300-1310`, `:1628-1638`, `:1836-1846`, `:1942-1963`; `background.js:440-447`, `:571-581`; `README.md:73-74`; `cli.py:314-367`.
-- **The two quoted messages** were checked against their string constants (`background.js:578`; `claude_client.py:41-44`, one string by implicit concatenation). Messages carrying the CLI's words are f-strings, so they are cited, not quoted.
+- **The two quoted messages** were checked against their string constants (`background.js:652`; `claude_client.py:41-44`, one string by implicit concatenation). Messages carrying the CLI's words are f-strings, so they are cited, not quoted.
 - **No model call was made** for this doc, and no login was changed. The `read -rs` line is standard `zsh` and `bash`, not part of tldw.
 
 ## Update this doc when

@@ -45,7 +45,7 @@
 | Definition site | What it decides | Invariant | Blast radius | Source |
 |---|---|---|---|---|
 | `do_GET` | The two `GET` routes, `/health` and `/voices`; any other GET path is a JSON 404 | A new GET route is added here and nowhere else (GET routes take no body, no auth, no slot) | `options.js` reads both; a rename silently breaks the Options page (it swallows errors, `options.js:66`, `options.js:75`) | `server.py:972-980` |
-| `do_POST` chain (routes outside the slot block) | `/transcribe/stop` (inline, no slot), `/preview` and `/summarize/cached` (`_guarded`, `slots=None`), `/ask/stream` (`_guarded`, claude pool) | A route handled here must `return` before the tuple check below, or it is 404'd | Every POST caller in `background.js` and `options.js` | `server.py:982-1016` |
+| `do_POST` chain (routes outside the slot block) | `/transcribe/stop` (inline, no slot), `/preview`, `/summarize/cached` and `/align/stream` (`_guarded`, `slots=None`; `/align/stream` brings its own `_align_lock` and the transcription permit, T-020), `/ask/stream` (`_guarded`, claude pool) | A route handled here must `return` before the tuple check below, or it is 404'd | Every POST caller in `background.js` and `options.js` | `server.py:982-1016` (before T-020); the chain now runs `server.py:995-1036`, with `/align/stream` at `:1030-1034` |
 | The "not one of ours" tuple | `("/summarize", "/summarize/stream", "/segments/stream")` plus `speak = path in ("/speak", "/speak/stream")`; anything else that reached here is a JSON 404, **sent before auth** | A route dispatched in the slot block must appear in this tuple (or in `speak`), or it can never be reached | Every slot-block route; the tuple is the only place `/summarize` (buffered) is named besides `_body_limit` and the dispatch | `server.py:984`, `server.py:1017-1019` |
 | In-slot dispatch | Which handler runs after auth, body, validation, model check and slot | Each name here must also be in the tuple; the `else` branch is `/summarize` (buffered). Before dispatch, every non-`speak` path runs `_validate` (a `url` is required) and takes a `_claude_slots` slot; only `speak` selects `_speech_slots` (`server.py:1026-1033`) | Same routes as the tuple | `server.py:1036-1049` |
 | `_body_limit` | Per-path body cap for the slot-block routes | A new large-body route gets its cap here **and** must be routed through `_read_body(_body_limit(path))` | 413s on any route whose cap is wrong | `server.py:773-782`, used at `server.py:1023` |
@@ -62,15 +62,16 @@ Order of checks, for every non-`speak` POST route in the slot block: path (404) 
 |---|---|---|---|---|---|---|---|---|---|
 | `/health` | `GET` | none | no body read | none | JSON `200` (keys below) | `options.js:53` | Unauthenticated and must stay so; must not reveal the operator's model command (`claude_client.py:238-248`) | Options page hides the model picker for a custom backend (`options.js:54-63`) | `server.py:974-976` |
 | `/voices` | `GET` | none | no body read | none | JSON `200` `{"voices": [{"id","label"}]}` | `options.js:70` | Shape is `audio.voice_list()` | Options voice picker (falls back to `VOICE_FALLBACK` if the call fails) | `server.py:977-978`, `audio.py:73-74` |
-| `/transcribe/stop` | `POST` | bearer | 16 KiB (`MAX_BODY_BYTES`) | **none, on purpose** (it must work while every slot is busy) | JSON `200` `{"stopped": bool}` | `background.js:231` | Never takes a slot; does no work but setting a flag; does not validate `model` | Stop button during a transcription; `tests/test_server.py:1617` | `server.py:985-1005` |
-| `/preview` | `POST` | bearer | 16 KiB | none for a memoized preview; a `speech` slot around synthesis (`try_take`, given back in `finally`) | `audio/mpeg` bytes `200` | `background.js:466`, `options.js:97` | Voice is allowlisted before anything runs | Voice pickers in the panel and in Options | `server.py:1006-1009`, `server.py:1857-1901` |
-| `/summarize/cached` | `POST` | bearer | 16 KiB | none (one disk read); a hit may start a key-moment prefetch, which takes its own claude slot with the full reserve | plain JSON `200`: `{"type":"miss"}` or `{"type":"result", …}` | `background.js:108` | Read-only on a miss: fetches nothing, starts nothing. A separate route (not a flag) so an older server answers 404, which the extension treats as a miss | The panel's cache probe before it reads the page (`background.js:113-126`) | `server.py:1011-1013`, `server.py:1330-1369` |
-| `/ask/stream` | `POST` | bearer | 64 KiB (`MAX_ASK_BYTES`) | `claude` | NDJSON `200` | `background.js:385` | Validation errors are sent before the stream starts; a question never starts a transcription | Q&A in the panel | `server.py:1014-1016`, `server.py:1743-1855` |
+| `/transcribe/stop` | `POST` | bearer | 16 KiB (`MAX_BODY_BYTES`) | **none, on purpose** (it must work while every slot is busy) | JSON `200` `{"stopped": bool}` | `background.js:305` | Never takes a slot; does no work but setting a flag; does not validate `model` | Stop button during a transcription; `tests/test_server.py:1617` | `server.py:985-1005` |
+| `/preview` | `POST` | bearer | 16 KiB | none for a memoized preview; a `speech` slot around synthesis (`try_take`, given back in `finally`) | `audio/mpeg` bytes `200` | `background.js:540`, `options.js:97` | Voice is allowlisted before anything runs | Voice pickers in the panel and in Options | `server.py:1006-1009`, `server.py:1857-1901` |
+| `/summarize/cached` | `POST` | bearer | 16 KiB | none (one disk read); a hit may start a key-moment prefetch, which takes its own claude slot with the full reserve | plain JSON `200`: `{"type":"miss"}` or `{"type":"result", …}` | `background.js:182` | Read-only on a miss: fetches nothing, starts nothing. A separate route (not a flag) so an older server answers 404, which the extension treats as a miss | The panel's cache probe before it reads the page (`background.js:187-200`) | `server.py:1011-1013`, `server.py:1330-1369` |
+| `/ask/stream` | `POST` | bearer | 64 KiB (`MAX_ASK_BYTES`) | `claude` | NDJSON `200` | `background.js:459` | Validation errors are sent before the stream starts; a question never starts a transcription | Q&A in the panel | `server.py:1014-1016`, `server.py:1743-1855` |
+| `/align/stream` | `POST` | bearer | 16 KiB (`MAX_BODY_BYTES`) | none from the pools; `_align_lock` (one alignment at a time, process-wide) and `_tx_permit` (waited for at most `ALIGN_PERMIT_WAIT_S`, 20 s), both taken only when some window misses the cache | NDJSON `200`, or plain JSON `400`/`401`/`411`/`413`/`415`/`503` before the stream | `background.js` `handleAlign` (T-020) | The check order is contracted (see "Word timing (`/align/stream`, T-020)"). Cached windows are served before anything is required; nothing is downloaded until ffmpeg, the model on disk, the lock, the cooldown and any running transcription all allow it. The word list is never in the request. | "Cover listed words" word timing. An older server answers `404`, and the panel keeps every hit on its caption-line range | `server.py:1030-1031`, `server.py:1876-2096`, `align.py` |
 | `/summarize` | `POST` | bearer | 8 MiB (`MAX_SUMMARIZE_BYTES`) | `claude` | JSON `200` (`_to_payload`, no `stats`) or JSON error | none in the repo outside `tests/test_server.py`; external callers `UNKNOWN — needs human confirmation` | Buffered. Ignores `page`, `whisper`, `refresh`; always reports `transcript_source` `captions` (`server.py:1188` calls `_to_payload` without a source); does not write the summary cache | Tests (`tests/test_server.py:103`, `:119`, `:159`, `:176`) | `server.py:1017`, `server.py:1047`, `server.py:1172-1188` |
-| `/summarize/stream` | `POST` | bearer | 8 MiB | `claude` (released while waiting on a transcription, retaken after) | NDJSON `200` | `background.js:149` | One terminal event per stream (`result`, `error` or `needs_transcription`) unless the client hung up | The main summary flow | `server.py:1042-1043`, `server.py:1190-1328` |
-| `/segments/stream` | `POST` | bearer | 16 KiB | `claude` (released while waiting on a prefetch, retaken before a live call) | NDJSON `200` | `background.js:511` | One terminal event (`segments`, `segments_done` or `error`) | "Play key moments" | `server.py:1044-1045`, `server.py:1485-1650` |
+| `/summarize/stream` | `POST` | bearer | 8 MiB | `claude` (released while waiting on a transcription, retaken after) | NDJSON `200` | `background.js:223` | One terminal event per stream (`result`, `error` or `needs_transcription`) unless the client hung up | The main summary flow | `server.py:1042-1043`, `server.py:1190-1328` |
+| `/segments/stream` | `POST` | bearer | 16 KiB | `claude` (released while waiting on a prefetch, retaken before a live call) | NDJSON `200` | `background.js:585` | One terminal event (`segments`, `segments_done` or `error`) | "Play key moments" | `server.py:1044-1045`, `server.py:1485-1650` |
 | `/speak` | `POST` | bearer | 64 KiB (`MAX_SPEAK_BYTES`) | `speech` | `audio/mpeg` bytes `200` or JSON error | none in the repo outside `tests/test_server.py`; external callers `UNKNOWN — needs human confirmation` | Buffered mp3 | Tests (`tests/test_server.py:282`, `:397`, `:465`, `:473`, `:486`) | `server.py:1038-1039`, `server.py:1652-1741` |
-| `/speak/stream` | `POST` | bearer | 64 KiB | `speech` | NDJSON `200` | `background.js:266` | `stream_audio: true` opts into `audio_chunk`/`audio_end`; without it, one `audio` event | "Listen" in the panel | `server.py:1040-1041`, `server.py:1652-1741` |
+| `/speak/stream` | `POST` | bearer | 64 KiB | `speech` | NDJSON `200` | `background.js:340` | `stream_audio: true` opts into `audio_chunk`/`audio_end`; without it, one `audio` event | "Listen" in the panel | `server.py:1040-1041`, `server.py:1652-1741` |
 | any path | `OPTIONS` | none | no body read | none | `204`, CORS headers only if the Origin is allowed | the browser (preflight) | See the definition-site table | Every extension POST | `server.py:966-970` |
 | any other method (`PUT`, `DELETE`, `HEAD`, `PATCH`, …) | — | none | — | none | stdlib HTML `501` ("Unsupported method"), **no CORS headers** | none | There is no `do_<METHOD>` for them; the stdlib answers | None today | Python `http.server.BaseHTTPRequestHandler`; observed by the probe in "How this was verified" |
 | any unknown path | `GET` / `POST` | none (POST 404 is sent **before** the token check) | — | none | JSON `404` `{"error": "not found"}` | none | — | An unauthenticated caller can tell known POST paths from unknown ones (follow-up) | `server.py:979-980`, `server.py:1017-1019` |
@@ -103,13 +104,16 @@ Unknown keys are ignored on every route (bodies are read with `.get`; there is n
 
 | Key | Route(s) | Type / validation | Invariant | Blast radius | Source |
 |---|---|---|---|---|---|
-| `url` | `/summarize`, `/summarize/stream`, `/segments/stream`, `/summarize/cached`, `/ask/stream`, `/transcribe/stop` | string; through the YouTube allowlist (`urls.canonical_video_id`) before any subprocess | No URL reaches yt-dlp unvalidated | Every video request | `server.py:1153-1154`, `server.py:1747-1750`, `server.py:1000`, `urls.py:22-60` |
-| `video_id` | `/transcribe/stop` | used if `url` is absent, same allowlist | — | Nothing in the extension sends it (`background.js:235` sends `url`) | `server.py:1000` |
-| `ratio` | `/summarize`, `/summarize/stream`, `/segments/stream`, `/summarize/cached` | number in `(0, 1]`, else 400 | Part of the summary and selection cache keys | `background.js:514` sends it to `/segments/stream` as the segment ratio | `server.py:1155-1162` |
+| `url` | `/summarize`, `/summarize/stream`, `/segments/stream`, `/summarize/cached`, `/ask/stream`, `/transcribe/stop`, `/align/stream` | string; through the YouTube allowlist (`urls.canonical_video_id`) before any subprocess | No URL reaches yt-dlp unvalidated | Every video request | `server.py:1153-1154`, `server.py:1747-1750`, `server.py:1000`, `urls.py:22-60` |
+| `video_id` | `/transcribe/stop` | used if `url` is absent, same allowlist | — | Nothing in the extension sends it (`background.js:309` sends `url`) | `server.py:1000` |
+| `ratio` | `/summarize`, `/summarize/stream`, `/segments/stream`, `/summarize/cached` | number in `(0, 1]`, else 400 | Part of the summary and selection cache keys | `background.js:588` sends it to `/segments/stream` as the segment ratio | `server.py:1155-1162` |
 | `lang` | `/summarize`, `/summarize/stream`, `/segments/stream`, `/summarize/cached`, `/ask/stream` | string matching `^[A-Za-z][A-Za-z0-9-]{0,15}$`, default `en`, else 400 | Becomes a yt-dlp argument, so it is regex-bound | The extension never sends it (default used) | `server.py:688`, `server.py:1163-1165`, `server.py:1758-1760` |
 | `model` | every POST route except `/transcribe/stop` | `null`/absent, or a key of `claude_client.MODELS` (`opus`, `sonnet`); anything else is a **400 `unknown model`** | Ends up in argv, so it is an allowlist, never a default swap | `background.js` sends it on summarize, probe, segments, ask | `server.py:1090-1100`, `claude_client.py:164` |
 | `refresh` | `/summarize/stream` | `true` re-runs the model but keeps the cached transcript | Only `is True` counts | "Regenerate" in the panel | `server.py:1217` |
-| `whisper` | `/summarize/stream` | `off`/`ask`/`always`; absent means `off`; anything else is an **in-stream** 400 `unknown whisper setting`; a server-side `whisper` config key overrides the body | Absent must keep meaning the pre-transcription behaviour | `background.js:153` | `server.py:136-160`, `server.py:1219-1223` |
+| `whisper` | `/summarize/stream` | `off`/`ask`/`always`; absent means `off`; anything else is an **in-stream** 400 `unknown whisper setting`; a server-side `whisper` config key overrides the body | Absent must keep meaning the pre-transcription behaviour | `background.js:227` | `server.py:136-160`, `server.py:1219-1223` |
+| `whisper` (on `/align/stream`) | `/align/stream` | the same `_whisper_policy` (`off`/`ask`/`always`, a server-pinned `whisper` wins); an unknown value is a plain-JSON `400`; `off` is a `503` `whisper_off`. `ask` allows word timing with no second prompt: turning the feature on is the consent (T-020 Q4) | `off` must block alignment, pinned or client-sent | `background.js` `handleAlign` sends the `whisper` setting | `server.py:1909-1918` |
+| `windows` | `/align/stream` | list of 1–`MAX_ALIGN_WINDOWS` (200) objects; else `400` naming the field (`align.WindowError`). Exact duplicates are timed once, and each original index still gets its `window` event | Only server-validated ints reach ffmpeg's argv | "Cover listed words" | `align.py:96-118`, `server.py:1905` |
+| `start_ms`, `end_ms` (in `windows`) | `/align/stream` | `int`, not `bool`; `0 <= start_ms < end_ms`; `end_ms - start_ms <= MAX_ALIGN_WINDOW_MS` (12,000); any `end_ms` past `_max_transcribe_ms()` is a `413` `too_long` (not a `400`) | Rendered into argv only through `timing.to_ffmpeg_ts` | Same | `align.py:107-117`, `server.py:1923-1925` |
 | `transcribe` | `/summarize/stream` | `true` accepts a transcription offer | Only `is True` counts | Accepting the offer in the panel | `server.py:1380` |
 | `segment_ratio` | `/summarize/stream`, `/summarize/cached` | number in `(0, 1]`, else ignored (no error) | Must match the ratio the later `/segments/stream` uses, or the prefetch is wasted | Key-moment prefetch | `server.py:360-373` |
 | `page` | `/summarize/stream` | object, or ignored | Untrusted; every field is bounded | The page-transcript path (no YouTube request) | `server.py:785-834`, `server.py:1246-1250` |
@@ -123,10 +127,10 @@ Unknown keys are ignored on every route (bodies are read with `.get`; there is n
 | `captions_format` (in `page`) | `/summarize/stream` | string hint (`json3` or other) | — | Same | `server.py:820-821`, `transcript.py:143-147` |
 | `status` (in `page`) | `/summarize/stream` | logged (first 200 chars), never used otherwise | — | Server log only | `server.py:1247-1248` |
 | `max_length` | `/segments/stream` | duration string (`90s`, `5m`); unparseable is ignored; a capped request has no cache key | A capped selection never reads or overwrites the shared one | The extension never sends it | `server.py:1487-1493`, `server.py:1554-1558` |
-| `title`, `channel`, `summary` | `/speak`, `/speak/stream` | required strings, else 400 | — | "Listen" (`background.js:270-271`) | `server.py:1465-1466` |
+| `title`, `channel`, `summary` | `/speak`, `/speak/stream` | required strings, else 400 | — | "Listen" (`background.js:344-345`) | `server.py:1465-1466` |
 | `key_points` | `/speak`, `/speak/stream` | list of strings, default `[]`, else 400 | — | Same | `server.py:1467-1469` |
 | `voice` | `/speak`, `/speak/stream`, `/preview` | string, allowlisted by `audio.resolve_voice` (`female`/`male` aliases too); default `amy` | The caller's string is only an allowlist key, never a path | Voice pickers | `server.py:1470-1476`, `server.py:1861-1867`, `audio.py:59-70` |
-| `stream_audio` | `/speak/stream` | `true` opts into `audio_chunk` blocks | Only `is True` counts; absent keeps the single `audio` event | `background.js:272` | `server.py:1658` |
+| `stream_audio` | `/speak/stream` | `true` opts into `audio_chunk` blocks | Only `is True` counts; absent keeps the single `audio` event | `background.js:346` | `server.py:1658` |
 | `question` | `/ask/stream` | non-empty string, at most `ask.MAX_QUESTION_CHARS` (2,000) or 413 | — | Q&A | `server.py:1748-1754`, `ask.py:17` |
 | `history` | `/ask/stream` | list (else 400); items that aren't `{role, content}` are dropped; last 12 turns, each cut to 4,000 chars | — | Q&A context | `server.py:1755-1757`, `ask.py:52-64` |
 | `role`, `content` | inside `history` items | `role` is `user` or `assistant`; `content` a string | — | Same | `ask.py:58-63` |
@@ -139,7 +143,7 @@ Returned by `/summarize`, carried by the `result` event of `/summarize/stream`, 
 
 | Key | Meaning | Invariant | Blast radius | Source |
 |---|---|---|---|---|
-| `transcript_source` | `captions` or `audio:<model>` | Rides in the payload because a cached summary never touches a transcript | Panel's "transcribed from audio" note and the saved `.md` (`content.js:1895`) | `server.py:1911` |
+| `transcript_source` | `captions` or `audio:<model>` | Rides in the payload because a cached summary never touches a transcript | Panel's "transcribed from audio" note and the saved `.md` (`content.js:3191`) | `server.py:1911` |
 | `video_id` | 11-character id | — | Extension's in-memory cache key | `server.py:1912` |
 | `title` | video title | — | Panel header, saved `.md` | `server.py:1913` |
 | `channel` | channel name | — | Same | `server.py:1914` |
@@ -150,7 +154,7 @@ Returned by `/summarize`, carried by the `result` event of `/summarize/stream`, 
 | `summary_md` | markdown body | — | Panel, Listen, saved `.md` | `server.py:1919` |
 | `rationale` | model's note on its compression | — | Panel | `server.py:1920` |
 
-Added outside `_to_payload`: `stats` (from `usage.stats()`: `videos`, `watch_ms`, `read_ms`, `saved_ms`, `saved_hours`; `usage.py:208-224`) on every streamed or probed `result`, and `cached: true` on a result served from the summary cache (`server.py:1233-1234`, `server.py:1328`, `server.py:1368-1369`). The stored payload never contains `stats` (`server.py:1325-1327`). The extension reads `stats.videos` and `stats.saved_hours` (`content.js:1194-1202`).
+Added outside `_to_payload`: `stats` (from `usage.stats()`: `videos`, `watch_ms`, `read_ms`, `saved_ms`, `saved_hours`; `usage.py:208-224`) on every streamed or probed `result`, and `cached: true` on a result served from the summary cache (`server.py:1233-1234`, `server.py:1328`, `server.py:1368-1369`). The stored payload never contains `stats` (`server.py:1325-1327`). The extension reads `stats.videos` and `stats.saved_hours` (`content.js:1221-1229`).
 
 ### `/health`
 
@@ -179,11 +183,11 @@ Added outside `_to_payload`: `stats` (from `usage.stats()`: `videos`, `watch_ms`
 
 ## NDJSON events
 
-Every stream is `application/x-ndjson`: one JSON object per line, `\n`-terminated, written and flushed one at a time (`server.py:1201-1203`, `:1503-1505`, `:1674-1686`, `:1777-1786`). Each object has a `type`. The extension ignores lines it can't parse and types it doesn't know (`background.js:174-209`).
+Every stream is `application/x-ndjson`: one JSON object per line, `\n`-terminated, written and flushed one at a time (`server.py:1201-1203`, `:1503-1505`, `:1674-1686`, `:1777-1786`). Each object has a `type`. The extension ignores lines it can't parse and types it doesn't know (`background.js:248-283`).
 
 | `type` | Route(s) | Fields | Terminal? | Invariant | Blast radius | Source |
 |---|---|---|---|---|---|---|
-| `progress` | all four streams | `message`, `percent` (number or null); `/summarize/stream` adds `creep` (bool: "ease forward until the result") | no | Human-readable; never parsed | Progress bar and status line | `server.py:1205-1207`, `:1507-1509`, `:1688-1690`, `:1788-1790` |
+| `progress` | all four streams, and `/align/stream` (`message` only) | `message`, `percent` (number or null); `/summarize/stream` adds `creep` (bool: "ease forward until the result") | no | Human-readable; never parsed | Progress bar and status line | `server.py:1205-1207`, `:1507-1509`, `:1688-1690`, `:1788-1790` |
 | `meta` | `/summarize/stream` | `video_id`, `title`, `channel`, `source_url`, `original_length` | no | Sent before the summary, including on a cache hit | Panel draws its layout early | `server.py:1229-1232`, `server.py:1252-1258` |
 | `partial` | `/summarize/stream` | `kind`, `text` | no | `kind` is one of the values in the next table | Summary fills in as it is written | `server.py:1259-1260` |
 | `result` | `/summarize/stream` | the `_to_payload` keys, `stats`, and `cached: true` on a cache hit | yes | Exactly one per successful stream | Panel's final render, extension cache | `server.py:1233-1234`, `server.py:1328` |
@@ -195,9 +199,11 @@ Every stream is `application/x-ndjson`: one JSON object per line, `\n`-terminate
 | `audio_chunk` | `/speak/stream` with `stream_audio: true` | `seq` (0-based), `mp3_base64` | no | Blocks concatenate (as bytes) into one mp3 | Streaming playback | `server.py:1702-1705` |
 | `audio_end` | `/speak/stream` with `stream_audio: true` | `chunks`, `bytes` | yes | — | Same | `server.py:1735-1736` |
 | `audio` | `/speak/stream` without `stream_audio` | `mp3_base64` (the whole clip) | yes | Kept for older extensions | Older extensions | `server.py:1737-1739` |
+| `window` | `/align/stream` (T-020) | `i` (the index into the request's `windows`), `start_ms`, `end_ms`, `words` (a list of at most 200 `{s, e, w}`: absolute media ms, clamped to the window, `w` at most 64 characters), `cached` (bool) | no | One per request index, cached ones first; words with `e < s`, or more than `BAD_TIMESTAMP_SLACK_MS` (1 s) outside the window, are dropped on the server. The words are only ever compared with the list's pattern in the browser, never put in the DOM | Word ranges replace caption-line ranges | `server.py:1959-1963` |
+| `result` (align) | `/align/stream` | `timed`, `cached`, `failed` (counts of request indices) | yes | Exactly one per finished request | The "done" status | `server.py:1975`, `server.py:2084` |
 | `delta` | `/ask/stream` | `text` | no | Appended in order | The answer as it streams | `server.py:1821-1822` |
 | `answer_done` | `/ask/stream` | none | yes | — | End of an answer | `server.py:1855` |
-| `error` | all four streams | `status` (an HTTP status number), `error` (string) | yes | The in-stream error layer (below) | Every error message the panel shows mid-stream | `server.py:1084-1085`, `:1221-1222`, `:1304`, `:1307`, `:1395`, `:1429`, `:1449`, `:1453`, `:1633`, `:1637`, `:1714`, `:1721`, `:1841`, `:1845` |
+| `error` | all four streams, and `/align/stream` | `status` (an HTTP status number), `error` (string); on `/align/stream` also `reason` (every value is in "Word timing (`/align/stream`, T-020)") and, for `whisper_missing`, `install_hint` | yes | The in-stream error layer (below) | Every error message the panel shows mid-stream | `server.py:1084-1085`, `:1221-1222`, `:1304`, `:1307`, `:1395`, `:1429`, `:1449`, `:1453`, `:1633`, `:1637`, `:1714`, `:1721`, `:1841`, `:1845` |
 
 The plain-JSON `/summarize/cached` response also carries a `type`: `miss` or `result` (`server.py:1361`, `server.py:1368`).
 
@@ -249,11 +255,11 @@ For the status → copy mapping itself see the extension section (`httpError`, `
 
 | Mapper | Statuses whose server text is **replaced** by fixed copy | Every other status | Used for | Source |
 |---|---|---|---|---|
-| `httpError` | `401`, `502`, `504` | server `error` text shown if non-empty | `/summarize/stream`, `/segments/stream` | `background.js:571-581` |
-| `askError` | `401`, `413`, `504` | server text shown if non-empty | `/ask/stream` | `background.js:440-447` |
-| `speakError` | `401`, `504` | server text shown if non-empty | `/speak/stream`, `/preview` from the panel | `background.js:491-497` |
+| `httpError` | `401`, `502`, `504` | server `error` text shown if non-empty | `/summarize/stream`, `/segments/stream` | `background.js:645-655` |
+| `askError` | `401`, `413`, `504` | server text shown if non-empty | `/ask/stream` | `background.js:514-521` |
+| `speakError` | `401`, `504` | server text shown if non-empty | `/speak/stream`, `/preview` from the panel | `background.js:565-571` |
 | Options preview | `401` | server text shown if non-empty | `/preview` from Options | `options.js:105-107` |
-| (none) | — | never shown | `/summarize/cached` (any non-`200` is a miss, `background.js:113-126`), `/transcribe/stop` (response ignored, `background.js:231-239`) | — |
+| (none) | — | never shown | `/summarize/cached` (any non-`200` is a miss, `background.js:187-200`), `/transcribe/stop` (response ignored, `background.js:305-313`) | — |
 
 ### Server error text the extension can show (interface copy)
 
@@ -279,7 +285,7 @@ Strings in `server.py`. "Shown" means it can reach the user verbatim through the
 | `bad video url` | `400` | `/transcribe/stop`, `/summarize/cached` | no (both ignored) | `server.py:1002`, `:1357` |
 | `unknown whisper setting` | `400` in-stream | `/summarize/stream` | yes | `server.py:1222` |
 | ``This video is <length> long and has no captions. Transcribing its audio is limited to <N> minutes of video (`tldw config set whisper-max-minutes N` to change that).`` | `413` in-stream | `/summarize/stream` | yes | `server.py:1395-1399` |
-| `Transcribing this video is taking longer than expected. It may still finish; try again in a few minutes.` | `504` in-stream | `/summarize/stream` | **no** — `httpError` replaces every `504` with its summarizing copy (follow-up) | `server.py:1429-1431`, `background.js:579` |
+| `Transcribing this video is taking longer than expected. It may still finish; try again in a few minutes.` | `504` in-stream | `/summarize/stream` | **no** — `httpError` replaces every `504` with its summarizing copy (follow-up) | `server.py:1429-1431`, `background.js:653` |
 | `Transcription produced nothing usable.` | `500` in-stream | `/summarize/stream` | yes | `server.py:1453-1454` |
 | `Transcription cancelled.` | `499` (permit wait) or `500` (see the pass-through table) | `/summarize/stream` | yes | `server.py:245`, `server.py:248` |
 | `Whisper is installed but could not be loaded. Try reinstalling it: pipx inject youtube-tldw faster-whisper` | `500` in-stream | `/summarize/stream` | yes | `server.py:270-272`, `whisper_transcribe.py:62` |
@@ -359,8 +365,16 @@ Not reachable from a route: `timing.py` duration errors (the only server use swa
 | `SPEAK_TIMEOUT` | 600 s for one whole synthesis | — | `/speak*`, `/preview` | `server.py:687` |
 | `ASK_TIMEOUT` | 300 s per answer | — | `/ask/stream` | `server.py:549` |
 | `ask.MAX_QUESTION_CHARS` / `MAX_HISTORY_TURNS` / `MAX_HISTORY_CHARS` | 2,000 / 12 / 4,000 | — | `/ask/stream` | `ask.py:17-19` |
+| `MAX_ALIGN_WINDOWS` / `MAX_ALIGN_WINDOW_MS` | 200 windows / 12,000 ms each: at most 40 minutes of audio per request | Checked before any work | `/align/stream` | `align.py:30-31` |
+| `MAX_WORDS_PER_WINDOW` / `MAX_WORD_CHARS` | 200 / 64 | Enforced on the way out and on every cache read | `/align/stream`, store 13 | `align.py:32-33` |
+| `_align_lock` | 1 alignment at a time, process-wide (a non-blocking acquire; a second request gets an in-stream `429` `busy`) | Bounds parallel YouTube fetches; a held lock is never released by the refused request | `/align/stream` | `server.py:72`, `server.py:1993` |
+| `ALIGN_PERMIT_WAIT_S` | 20 s waiting for `_tx_permit`, with a `progress` line about every 5 s; then an in-stream `429` `busy` | Alignment is an improvement, so it never queues behind a long transcription | `/align/stream` | `server.py:78`, `server.py:2037-2049` |
+| `ALIGN_BUDGET_S` | 600 s for the **whole** request from the moment `_align_lock` is taken (download, permit wait, model load and windows); no window starts with less than `ALIGN_WINDOW_DEADLINE_S` (30 s) left, and the rest are counted `failed` | The server ends within about 630 s, inside the extension's 660 s timer. While it runs it holds `_tx_permit`, so a queued whole-video transcription can wait that long | `/align/stream`, transcriptions | `server.py:76-77`, `server.py:2000` |
+| `ALIGN_DOWNLOAD_TIMEOUT` | 300 s for the one audio download; no retry | — | `/align/stream` | `server.py:75` |
+| `ALIGN_CUT_TIMEOUT_S` | 15 s per ffmpeg window cut; a timed-out cut fails that window and the next one runs | — | `/align/stream` | `align.py:35` |
+| `ALIGN_COOLDOWN_S` | 600 s with no YouTube fetch for alignment after a YouTube 429; in memory, so a restart clears it; alignment only | — | `/align/stream` | `server.py:79` |
 
-**Routes that take no slot:** `GET` `/health`, `GET` `/voices`, `OPTIONS`, `/transcribe/stop`, `/summarize/cached`, and `/preview` when the preview is already memoized (`server.py:985-1012`, `server.py:1872-1876`).
+**Routes that take no slot:** `GET` `/health`, `GET` `/voices`, `OPTIONS`, `/transcribe/stop`, `/summarize/cached`, `/align/stream` (its own lock and the permit instead), and `/preview` when the preview is already memoized (`server.py:985-1012`, `server.py:1872-1876`, as of the Tier 1 docs; after T-020 the chain is `server.py:995-1036` and the memoized preview is in `_run_preview`, `server.py:2098`).
 
 **Logged, not returned:** every refusal prints `busy: <pool> <in_use>/<limit>` (`server.py:1062`, `server.py:1083`); startup prints the limits line (`server.py:654-656`, `server.py:1943`).
 
@@ -368,7 +382,7 @@ Not reachable from a route: `timing.py` duration errors (the only server use swa
 
 | Behaviour | Invariant | Blast radius | Source |
 |---|---|---|---|
-| One connection per response (HTTP/1.0); a stream ends when the socket closes | The extension reads to EOF and treats a stream with no terminal event as "ended unexpectedly" | Every stream | `server.py:929`; `background.js:210-212` |
+| One connection per response (HTTP/1.0); a stream ends when the socket closes | The extension reads to EOF and treats a stream with no terminal event as "ended unexpectedly" | Every stream | `server.py:929`; `background.js:284-286` |
 | Waiting on a key-moment prefetch: a progress heartbeat every **2 s**, sent only when the message changes | — | `/segments/stream` | `server.py:1517-1536` |
 | Waiting on a transcription: narrated every **0.5 s** from the job's published progress, mapped to 10–70 % | A client hanging up stops the narration, never the job | `/summarize/stream` | `server.py:1427-1447` |
 | Getting a released slot back: one `progress` line `Waiting for a free slot (<pool> <in_use>/<limit>)…`, then up to `RETAKE_BUDGET` | Ends in the slot or an in-stream `429` | `/summarize/stream`, `/segments/stream` | `server.py:1065-1088` |
@@ -381,13 +395,13 @@ The narrative and procedure are in `api.md`. This is the inventory of the mechan
 
 | Mechanism | Invariant | Who depends on it | Source |
 |---|---|---|---|
-| New behaviour on a **new route**: `/summarize/cached` instead of a flag, so an older server's `404` reads as a miss | An unknown route must stay a `404`, and the extension must keep treating a non-`200` probe as a miss | Newer extension against an older server | `server.py:1341-1343`, `background.js:113-126` |
-| New behaviour behind an **opt-in body flag**: `stream_audio` | Absent keeps the single `audio` event | Older extension against a newer server | `server.py:1657-1658`, `background.js:281-282` |
+| New behaviour on a **new route**: `/summarize/cached` instead of a flag, so an older server's `404` reads as a miss | An unknown route must stay a `404`, and the extension must keep treating a non-`200` probe as a miss | Newer extension against an older server | `server.py:1341-1343`, `background.js:187-200` |
+| New behaviour behind an **opt-in body flag**: `stream_audio` | Absent keeps the single `audio` event | Older extension against a newer server | `server.py:1657-1658`, `background.js:355-356` |
 | Absent `whisper` means the old behaviour exactly (`off`) | — | Older extensions | `server.py:136-160` |
 | `page.cues` preferred, `page.captions` still parsed | — | Older extensions | `server.py:809-821` |
 | Unknown keys ignored, except an unknown `model` (`400`), `voice` (`400`) or `whisper` (in-stream `400`) | Values that end up in argv or cost CPU are refused, not defaulted | Every client | `server.py:1090-1100`, `server.py:1470-1476`, `server.py:152-160` |
 | `/health` reports `version` | Nothing reads it today | — | `server.py:975` |
-| Busy text from an older server still reads fine in the extension | The extension shows `429` detail verbatim | — | `background.js:575-577` |
+| Busy text from an older server still reads fine in the extension | The extension shows `429` detail verbatim | — | `background.js:649-651` |
 
 There is no version prefix in any path, no version header, and no machine-readable schema (this inventory is the schema).
 
@@ -533,6 +547,7 @@ All of it lives in module globals and is guarded:
 - **`_preview_lock`** (`server.py:552`) guards `_preview_cache`.
 - **Each pool's own `Condition`** guards its counter (`server.py:582`).
 - **`_tx_permit`** (`server.py:65`).
+- **`_align_lock`** (`server.py:72`) serialises `/align/stream`. **`_align_backoff_until`** (`server.py:73`), the rate-limit cooldown, is read and written only while holding it. `_tx_jobs` is read under `_cache_lock` before an alignment downloads anything.
 - **The model** is thread-local (`claude_client.py:165`), so the prefetch thread re-enters `use_model` (`server.py:499-500`), and selection keys are built in the request thread (`server.py:376-394`).
 - **Usage accounting** has its own lock and thread-local (`usage.py:27-28`).
 - **Per-stream write locks** stop two threads interleaving NDJSON lines (`server.py:1672`, `server.py:1775`).
@@ -560,11 +575,11 @@ Invariant: a new piece of shared state takes `_cache_lock` (or its own lock). Bl
 The extension has three scripts: `content.js` (the on-page panel), `background.js` (the MV3 service worker, or a Firefox event page) and `options.js` (the Options page). The content script and the worker talk in two ways:
 
 - **Long-lived ports**, opened by `content.js` with `runtime.connect`. Each piece of work opens its own port:
-  - the summarize port, `content.js:577`;
-  - the speak port, `content.js:1047`;
-  - the ask port, `content.js:1319`;
-  - the preview port, `content.js:1421`;
-  - the key-moments port, `content.js:1489`.
+  - the summarize port, `content.js:598`;
+  - the speak port, `content.js:1074`;
+  - the ask port, `content.js:1346`;
+  - the preview port, `content.js:1448`;
+  - the key-moments port, `content.js:2785`.
 - **One-shot `tabs.sendMessage`**, from the worker to the tab, after a toolbar click (`background.js:54-68`).
 
 There is **no messaging between `options.js` and `background.js`**. `options.js` calls the server itself (see "Extension → server HTTP calls"). The two only share `chrome.storage.local`.
@@ -575,7 +590,7 @@ The port message types below are the extension's internal protocol. They are **n
 
 | Item | Invariant | Blast radius | Source |
 |---|---|---|---|
-| `tldw` | Every `runtime.connect` in `content.js` uses `{ name: "tldw" }`. The worker drops any port with a different name (`if (port.name !== "tldw") return;`). | If either side is renamed alone, every feature's messages go nowhere. The content side then sees only its own safety timer, or a disconnect. | `background.js:71`; `content.js:577`, `:1047`, `:1319`, `:1421`, `:1489` |
+| `tldw` | Every `runtime.connect` in `content.js` uses `{ name: "tldw" }`. The worker drops any port with a different name (`if (port.name !== "tldw") return;`). | If either side is renamed alone, every feature's messages go nowhere. The content side then sees only its own safety timer, or a disconnect. | `background.js:71`; `content.js:598`, `:1074`, `:1346`, `:1448`, `:2785` |
 
 ### Content → background port messages
 
@@ -583,53 +598,59 @@ The dispatcher is `background.js:72-82`. `stopSpeak` and `stopAsk` are not in th
 
 | Item | Payload keys | Invariant | Blast radius | Source (sent → handled) |
 |---|---|---|---|---|
-| `summarize` | `url`, `videoId`, `refresh` (bool), `page` (see "The `summarize` message's `page` payload"), `transcribe` (bool) | Sent only after the page read finishes, and only if the run is still live and still owns the port (`if (!requestActive \|\| port !== myPort) return;`). `refresh: true` skips the worker's cache (`cache.has(videoId) && !refresh`). | Breaks every summary. `probe_checks.js:101-149` and the `render_checks.js:335-345` regexes match this message's shape. | sent `content.js:585-586`; handled `background.js:74` → `handleSummarize` `background.js:129-225` |
-| `probeCache` | `url`, `videoId` | Sent first on an ordinary click, before the page is read. Refresh and an accepted transcription skip it (`content.js:655-656`). | If this goes away, every click reads YouTube's transcript panel, even for cached videos. Guarded by `probe_checks.js:93-101` and `render_checks.js:540-542`. | sent `content.js:656`; handled `background.js:75` → `handleProbe` `background.js:92-127` |
-| `speak` | `videoId`, `voice`, `payload` (the whole result payload; the worker reads `title`, `channel`, `key_points` and `summary_md`), `stream` (bool: `mseSupported()`) | `stream: false` asks for one buffered clip. The worker sends `stream_audio: msg.stream !== false`. | Listen breaks. Firefox has no MSE `audio/mpeg` and relies on `stream: false` (`content.js:29-31`). | sent `content.js:1073-1077`; handled `background.js:76` → `handleSpeak` `background.js:242-337` |
-| `stopSpeak` | none | The only thing that cancels synthesis. A plain disconnect deliberately does not (`background.js:257-263`). | If it is dropped, Stop and "Stop and discard" leave synthesis running for up to 600 s. Guarded by `render_checks.js:144-145`. | sent `content.js:345`, `:1086`; handled `background.js:261-263` |
-| `getSegments` | `url` (`lastPayload.source_url`, falling back to `location.href`) | — | Play key moments breaks. | sent `content.js:1535-1538`; handled `background.js:77` → `handleSegments` `background.js:499-565` |
-| `preview` | `voice` | The same type string is used in both directions (see the next table). | Voice preview in the panel breaks. | sent `content.js:1438`; handled `background.js:78` → `handlePreview` `background.js:451-489` |
-| `ask` | `url` (`lastPayload.source_url`), `question`, `history` (`[{role, content}]`, without the new question: `chat.history.slice(0, -1)`) | `role` is `"user"` or `"assistant"` (`content.js:1311`, `:1335`). The transcript is never sent; the server already has it. | Follow-up questions break. | sent `content.js:1355-1358`; handled `background.js:79` → `handleAsk` `background.js:367-438` |
-| `stopAsk` | none | The only thing that cancels an answer. A plain disconnect lets it finish (`background.js:377-382`). | If it is dropped, Stop and "Stop and discard" leave the model call running. Guarded by `render_checks.js:144-145`. | sent `content.js:346`, `:1368`; handled `background.js:380-382` |
-| `stopTranscribe` | `url` | Travels over the live summarize port. The worker sends nothing back. It needs a token and a `url`, and otherwise does nothing (`background.js:229`). | A transcription can't be stopped, from the Stop button or from "Stop and discard". Guarded by `render_checks.js:395-404`. | sent `content.js:839` (called from `:350`, `:698`); handled `background.js:80` → `handleStopTranscribe` `background.js:227-240` |
-| `ping` | none | **Ignored on purpose** (`background.js:81`). It is sent every 20 s on the summarize, speak, ask and key-moments ports (the preview port has no ping and no panel timer, `content.js:1421-1438`), and it is what keeps the MV3 worker alive through a long fetch. A background close must leave it running (`content.js:332-335`). | If the pings stop, Chrome suspends the worker mid-fetch and the work is lost. Guarded by `render_checks.js:132-148`. | sent `content.js:660`, `:1048`, `:1320`, `:1490`; ignored `background.js:81` |
+| `summarize` | `url`, `videoId`, `refresh` (bool), `page` (see "The `summarize` message's `page` payload"), `transcribe` (bool) | Sent only after the page read finishes, and only if the run is still live and still owns the port (`if (!requestActive \|\| port !== myPort) return;`). `refresh: true` skips the worker's cache (`cache.has(videoId) && !refresh`). | Breaks every summary. `probe_checks.js:101-149` and the `render_checks.js:335-345` regexes match this message's shape. | sent `content.js:606-607`; handled `background.js:74` → `handleSummarize` `background.js:203-299` |
+| `probeCache` | `url`, `videoId` | Sent first on an ordinary click, before the page is read. Refresh and an accepted transcription skip it (`content.js:676-677`). | If this goes away, every click reads YouTube's transcript panel, even for cached videos. Guarded by `probe_checks.js:93-101` and `render_checks.js:540-542`. | sent `content.js:677`; handled `background.js:75` → `handleProbe` `background.js:166-201` |
+| `speak` | `videoId`, `voice`, `payload` (the whole result payload; the worker reads `title`, `channel`, `key_points` and `summary_md`), `stream` (bool: `mseSupported()`) | `stream: false` asks for one buffered clip. The worker sends `stream_audio: msg.stream !== false`. | Listen breaks. Firefox has no MSE `audio/mpeg` and relies on `stream: false` (`content.js:29-31`). | sent `content.js:1100-1104`; handled `background.js:76` → `handleSpeak` `background.js:316-411` |
+| `stopSpeak` | none | The only thing that cancels synthesis. A plain disconnect deliberately does not (`background.js:331-337`). | If it is dropped, Stop and "Stop and discard" leave synthesis running for up to 600 s. Guarded by `render_checks.js:144-145`. | sent `content.js:366`, `:1113`; handled `background.js:335-337` |
+| `getSegments` | `url` (`lastPayload.source_url`, falling back to `location.href`) | — | Play key moments breaks. | sent `content.js:2831-2834`; handled `background.js:77` → `handleSegments` `background.js:573-639` |
+| `preview` | `voice` | The same type string is used in both directions (see the next table). | Voice preview in the panel breaks. | sent `content.js:1465`; handled `background.js:78` → `handlePreview` `background.js:525-563` |
+| `ask` | `url` (`lastPayload.source_url`), `question`, `history` (`[{role, content}]`, without the new question: `chat.history.slice(0, -1)`) | `role` is `"user"` or `"assistant"` (`content.js:1338`, `:1362`). The transcript is never sent; the server already has it. | Follow-up questions break. | sent `content.js:1382-1385`; handled `background.js:79` → `handleAsk` `background.js:441-512` |
+| `stopAsk` | none | The only thing that cancels an answer. A plain disconnect lets it finish (`background.js:451-456`). | If it is dropped, Stop and "Stop and discard" leave the model call running. Guarded by `render_checks.js:144-145`. | sent `content.js:367`, `:1395`; handled `background.js:454-456` |
+| `stopTranscribe` | `url` | Travels over the live summarize port. The worker sends nothing back. It needs a token and a `url`, and otherwise does nothing (`background.js:303`). | A transcription can't be stopped, from the Stop button or from "Stop and discard". Guarded by `render_checks.js:395-404`. | sent `content.js:860` (called from `:371`, `:719`); handled `background.js:80` → `handleStopTranscribe` `background.js:301-314` |
+| `align` | `url` (`location.href`), `windows` (`[{start_ms, end_ms}]`, whole numbers) | Sent once per toggle-on, on the mute session's **own** port (`alignPort`), so closing the panel doesn't drop it. Never carries the word list. The extension never retries on its own (T-020). | Word timing for "Cover listed words". | sent `content.js:2422-2423`; handled `background.js:81` → `handleAlign` `background.js:93-158` |
+| `ping` | none | **Ignored on purpose** (`background.js:81`). It is sent every 20 s on the summarize, speak, ask and key-moments ports (the preview port has no ping and no panel timer, `content.js:1448-1465`), and it is what keeps the MV3 worker alive through a long fetch. A background close must leave it running (`content.js:353-356`). | If the pings stop, Chrome suspends the worker mid-fetch and the work is lost. Guarded by `render_checks.js:132-148`. | sent `content.js:681`, `:1075`, `:1347`, `:2786`; ignored `background.js:81` |
 
 ### Background → content port messages
 
-The worker posts everything through `safePost` (`background.js:567-569`), which swallows errors from a port that has already closed.
+The worker posts everything through `safePost` (`background.js:641-643`), which swallows errors from a port that has already closed.
 
-On the **summarize port**, the content listener (`content.js:588-642`) treats **any type it doesn't recognise as the end of the run**. It falls through to `requestActive = false` (`content.js:632-634`) and renders nothing. So a new type on that port needs a handler above `content.js:632`. `render_checks.js:287` and `:546` guard the order for `partial` and `probe`.
+On the **summarize port**, the content listener (`content.js:609-663`) treats **any type it doesn't recognise as the end of the run**. It falls through to `requestActive = false` (`content.js:653-655`) and renders nothing. So a new type on that port needs a handler above `content.js:653`. `render_checks.js:287` and `:546` guard the order for `partial` and `probe`.
 
 On the other ports, an unknown type is ignored.
 
 | Item | Port | Payload keys | Invariant | Blast radius | Source (sent → handled) |
 |---|---|---|---|---|---|
-| `probe` | summarize | `hit` (bool); `payload` when `hit` is true | Any failure is a miss: a 404 from an older server, `{"type":"miss"}`, a network error, a timeout or non-JSON. A hit without a `payload` is not trusted (`probeOutcome`, `content.js:559-563`). | If a miss became an error, a new extension would stop working against an older server. Guarded by `probe_checks.js:152-187` and `render_checks.js:528-551`. | sent `background.js:95`, `:117`, `:126`; handled `content.js:590-594` |
-| `progress` | summarize | `message`, `percent`, `creep` | Remembered as `lastProgress` so the bar can be replayed after the panel is re-opened (`content.js:596`). | The loading bar. | sent `background.js:177-178`; handled `content.js:595-600` |
-| `meta` | summarize | `meta`: `video_id`, `title`, `channel`, `source_url`, `original_length` | Starts the partial view. The panel renders `channel`, `original_length` and `title`, all escaped (`content.js:887-888`). | The streamed partial summary. | sent `background.js:181-183`; handled `content.js:601` → `onPartial` `content.js:907-924` |
-| `partial` | summarize | `kind` (`key_point` or `paragraph`), `text` | Other `kind` values are dropped (`content.js:911-913`). Text is escaped (`content.js:900`, `:903`). | The streamed partial summary. | sent `background.js:198`; handled `content.js:601` → `onPartial` / `appendPartial` `content.js:897-924` |
-| `transcribing` | summarize | `videoId`, `estimateS` (the panel reads neither; it uses only the type) | Adds the Stop control and swaps in the 2,460,000 ms safety timer (`content.js:602-617`). | If it is lost, a transcription can't be stopped, and the 160 s panel timer fires part-way through it. Guarded by `render_checks.js:379-387`. | sent `background.js:185-186`; handled `content.js:602-617` |
-| `needsTranscription` | summarize | `offer`: `video_id`, `title`, `channel`, `duration_ms`, `estimate_s`, `model`, `installed`, `install_hint` | Ends this request. Accepting the offer sends a new `summarize` with `transcribe: true` (`content.js:830`). The panel reads `installed`, `install_hint`, `estimate_s` and `model` (`content.js:798-822`). | The no-captions flow. Guarded by `render_checks.js:367-374`, `:388-392`, `:417-420` and `:473-525`. | sent `background.js:192-196`; handled `content.js:618-631` → `showTranscribeOffer` `content.js:793-833` |
-| `result` | summarize | `payload` (the server's `result` event, unchanged), `cached` (bool) | Also **built locally** from a probe hit: `{ type: "result", payload: m.payload, cached: true }` at `content.js:561`. `cached: true` drives the `" (cached)"` heading. | Every summary view. The keys the panel reads from `payload` are listed in "Result payload keys the panel reads". | sent `background.js:132` (worker cache hit, `cached: true`), `:203` (`cached: !!ev.cached`); built `content.js:561`; handled `content.js:635-637` |
-| `error` | summarize | `error` (the user-facing text) | The text already says what to do next (see "User-facing message contracts"). Shown through `showError`, or through a toast when the panel was closed. | Every summarize failure. | sent `background.js:101`, `:137`, `:159`, `:206`, `:211`, `:215-217`, `:219-220`; handled `content.js:638-641` |
-| `speakProgress` | speak | `message`, `percent` | — | Listen status. | sent `background.js:299`; handled `content.js:1052` |
-| `audioChunk` | speak | `b64`, `first` (bool) | `first` starts a new MediaSource (`content.js:1137-1156`). | Streaming playback. | sent `background.js:303`; handled `content.js:1053` |
-| `audioEnd` | speak | `dataUrl` (`data:audio/mpeg;base64,…`) | Ends the stream and enables the download button (`content.js:1059`). | The mp3 download, and the clip being restored on re-open. Guarded by `render_checks.js:241-242`. | sent `background.js:309`; handled `content.js:1054-1059` |
-| `audio` | speak | `dataUrl`; `cached: true` when it came from `audioCache` (the panel ignores `cached`) | The single-clip path: the worker's audio cache, an older server, or `stream: false`. | Listen on Firefox, and replays. | sent `background.js:246`, `:314`; handled `content.js:1060-1061` |
-| `speakError` | speak | `error` | Shown with `textContent` in `.audiostatus`, so backticks appear literally (see "Backtick rendering"). | Listen failures. | sent `background.js:251`, `:278`, `:317`, `:322`, `:328-332`; handled `content.js:1062-1063` |
-| `askProgress` | ask | `message` | — | Ask status line. | sent `background.js:411`; handled `content.js:1324` |
-| `askDelta` | ask | `text` | Appended, then re-rendered through `renderAnswer`, which escapes it (`content.js:1326-1330`). | Streamed answers. | sent `background.js:413`; handled `content.js:1325-1331` |
-| `askDone` | ask | none | Pushes the answer into `chat.history` (`content.js:1335`). | Conversation history. | sent `background.js:416`; handled `content.js:1333-1337` |
-| `askError` | ask | `error` | A partial answer is kept and an empty bubble is dropped (`content.js:1340-1341`). | Ask failures. | sent `background.js:371`, `:393`, `:419`, `:424`, `:430`, `:432-433`; handled `content.js:1338-1345` |
-| `preview` | preview | `voice`, `dataUrl` | The panel plays the clip only if `m.voice === voice` (`content.js:1428`). | Voice preview. | sent `background.js:454`, `:480`; handled `content.js:1428-1431` |
-| `previewError` | preview | `voice`, `error` | The panel does not check `voice` here (`content.js:1432`). | Voice preview failures. | sent `background.js:459`, `:474`, `:482-485`; handled `content.js:1432-1435` |
-| `segProgress` | key moments | `message`, `percent` | — | Key-moments status. | sent `background.js:537`; handled `content.js:1495` |
-| `segmentAdded` | key moments | `segment` (the panel reads `start` and `end`, in seconds; the server also sends `label`, `core.py:132-136`) | The first one starts playback and closes the modal with `keepSeg: true`, so the port stays open (`content.js:1570-1589`). | Streaming skip playback. | sent `background.js:539`; handled `content.js:1496-1502` |
-| `segmentsDone` | key moments | `title`, `channel`, `source_url` (the panel reads none of them) | Sets `segsComplete` and patches the `"trimmed video"` note (`content.js:1505-1506`). | The end of skip playback. | sent `background.js:542-543`; handled `content.js:1504-1517` |
-| `segments` | key moments | `segments` (each with `start` and `end`), `title` (unread) | The batch, cache or prefetch path: every clip at once (`content.js:1519-1522`). | Skip playback. | sent `background.js:546`; handled `content.js:1519-1522` |
-| `segError` | key moments | `error` | Shown with `textContent`, so backticks appear literally. | Key-moments failures. | sent `background.js:503`, `:519`, `:549`, `:554`, `:558`, `:560`; handled `content.js:1523` |
+| `probe` | summarize | `hit` (bool); `payload` when `hit` is true | Any failure is a miss: a 404 from an older server, `{"type":"miss"}`, a network error, a timeout or non-JSON. A hit without a `payload` is not trusted (`probeOutcome`, `content.js:580-584`). | If a miss became an error, a new extension would stop working against an older server. Guarded by `probe_checks.js:152-187` and `render_checks.js:528-551`. | sent `background.js:95`, `:191`, `:200`; handled `content.js:611-615` |
+| `progress` | summarize | `message`, `percent`, `creep` | Remembered as `lastProgress` so the bar can be replayed after the panel is re-opened (`content.js:617`). | The loading bar. | sent `background.js:251-252`; handled `content.js:616-621` |
+| `meta` | summarize | `meta`: `video_id`, `title`, `channel`, `source_url`, `original_length` | Starts the partial view. The panel renders `channel`, `original_length` and `title`, all escaped (`content.js:913-914`). | The streamed partial summary. | sent `background.js:255-257`; handled `content.js:622` → `onPartial` `content.js:933-950` |
+| `partial` | summarize | `kind` (`key_point` or `paragraph`), `text` | Other `kind` values are dropped (`content.js:937-939`). Text is escaped (`content.js:926`, `:929`). | The streamed partial summary. | sent `background.js:272`; handled `content.js:622` → `onPartial` / `appendPartial` `content.js:923-950` |
+| `transcribing` | summarize | `videoId`, `estimateS` (the panel reads neither; it uses only the type) | Adds the Stop control and swaps in the 2,460,000 ms safety timer (`content.js:623-638`). | If it is lost, a transcription can't be stopped, and the 160 s panel timer fires part-way through it. Guarded by `render_checks.js:379-387`. | sent `background.js:259-260`; handled `content.js:623-638` |
+| `needsTranscription` | summarize | `offer`: `video_id`, `title`, `channel`, `duration_ms`, `estimate_s`, `model`, `installed`, `install_hint` | Ends this request. Accepting the offer sends a new `summarize` with `transcribe: true` (`content.js:851`). The panel reads `installed`, `install_hint`, `estimate_s` and `model` (`content.js:819-843`). | The no-captions flow. Guarded by `render_checks.js:367-374`, `:388-392`, `:417-420` and `:473-525`. | sent `background.js:266-270`; handled `content.js:639-652` → `showTranscribeOffer` `content.js:814-854` |
+| `result` | summarize | `payload` (the server's `result` event, unchanged), `cached` (bool) | Also **built locally** from a probe hit: `{ type: "result", payload: m.payload, cached: true }` at `content.js:582`. `cached: true` drives the `" (cached)"` heading. | Every summary view. The keys the panel reads from `payload` are listed in "Result payload keys the panel reads". | sent `background.js:206` (worker cache hit, `cached: true`), `:277` (`cached: !!ev.cached`); built `content.js:582`; handled `content.js:656-658` |
+| `error` | summarize | `error` (the user-facing text) | The text already says what to do next (see "User-facing message contracts"). Shown through `showError`, or through a toast when the panel was closed. | Every summarize failure. | sent `background.js:175`, `:211`, `:233`, `:280`, `:285`, `:289-291`, `:293-294`; handled `content.js:659-662` |
+| `speakProgress` | speak | `message`, `percent` | — | Listen status. | sent `background.js:373`; handled `content.js:1079` |
+| `audioChunk` | speak | `b64`, `first` (bool) | `first` starts a new MediaSource (`content.js:1164-1183`). | Streaming playback. | sent `background.js:377`; handled `content.js:1080` |
+| `audioEnd` | speak | `dataUrl` (`data:audio/mpeg;base64,…`) | Ends the stream and enables the download button (`content.js:1086`). | The mp3 download, and the clip being restored on re-open. Guarded by `render_checks.js:241-242`. | sent `background.js:383`; handled `content.js:1081-1086` |
+| `audio` | speak | `dataUrl`; `cached: true` when it came from `audioCache` (the panel ignores `cached`) | The single-clip path: the worker's audio cache, an older server, or `stream: false`. | Listen on Firefox, and replays. | sent `background.js:320`, `:388`; handled `content.js:1087-1088` |
+| `speakError` | speak | `error` | Shown with `textContent` in `.audiostatus`, so backticks appear literally (see "Backtick rendering"). | Listen failures. | sent `background.js:325`, `:352`, `:391`, `:396`, `:402-406`; handled `content.js:1089-1090` |
+| `askProgress` | ask | `message` | — | Ask status line. | sent `background.js:485`; handled `content.js:1351` |
+| `askDelta` | ask | `text` | Appended, then re-rendered through `renderAnswer`, which escapes it (`content.js:1353-1357`). | Streamed answers. | sent `background.js:487`; handled `content.js:1352-1358` |
+| `askDone` | ask | none | Pushes the answer into `chat.history` (`content.js:1362`). | Conversation history. | sent `background.js:490`; handled `content.js:1360-1364` |
+| `askError` | ask | `error` | A partial answer is kept and an empty bubble is dropped (`content.js:1367-1368`). | Ask failures. | sent `background.js:445`, `:467`, `:493`, `:498`, `:504`, `:506-507`; handled `content.js:1365-1372` |
+| `preview` | preview | `voice`, `dataUrl` | The panel plays the clip only if `m.voice === voice` (`content.js:1455`). | Voice preview. | sent `background.js:528`, `:554`; handled `content.js:1455-1458` |
+| `previewError` | preview | `voice`, `error` | The panel does not check `voice` here (`content.js:1459`). | Voice preview failures. | sent `background.js:533`, `:548`, `:556-559`; handled `content.js:1459-1462` |
+| `segProgress` | key moments | `message`, `percent` | — | Key-moments status. | sent `background.js:611`; handled `content.js:2791` |
+| `segmentAdded` | key moments | `segment` (the panel reads `start` and `end`, in seconds; the server also sends `label`, `core.py:132-136`) | The first one starts playback and closes the modal with `keepSeg: true`, so the port stays open (`content.js:2866-2885`). | Streaming skip playback. | sent `background.js:613`; handled `content.js:2792-2798` |
+| `segmentsDone` | key moments | `title`, `channel`, `source_url` (the panel reads none of them) | Sets `segsComplete` and patches the `"trimmed video"` note (`content.js:2801-2802`). | The end of skip playback. | sent `background.js:616-617`; handled `content.js:2800-2813` |
+| `segments` | key moments | `segments` (each with `start` and `end`), `title` (unread) | The batch, cache or prefetch path: every clip at once (`content.js:2815-2818`). | Skip playback. | sent `background.js:620`; handled `content.js:2815-2818` |
+| `segError` | key moments | `error` | Shown with `textContent`, so backticks appear literally. | Key-moments failures. | sent `background.js:577`, `:593`, `:623`, `:628`, `:632`, `:634`; handled `content.js:2819` |
 
-`preview` is the one type name used in **both directions**. Content→background, it is `{type, voice}` (`content.js:1438`). Background→content, it is `{type, voice, dataUrl}` (`background.js:454`, `:480`).
+| `alignProgress` | align | `message` | Not shown (the panel shows its own "Timed to the word: K of N."). | — | sent `background.js:135`; ignored by `content.js` |
+| `alignWindow` | align | `i`, `words` (`[{s, e, w}]`), `cached` | Dropped unless the session, its port and the page's video id are all still the live ones. Words only feed `refineHit`; they never reach the DOM (tested). | Word ranges. | sent `background.js:137`; handled `content.js:2371-2385` |
+| `alignDone` | align | `timed`, `cached`, `failed` | Ends the request; picks the "done" status. | The done statuses. | sent `background.js:141`; handled `content.js:2386-2390` |
+| `alignError` | align | `status` (0 for a worker-side failure), `reason`, `error`, `installHint` | Ends the request. The panel picks its text by `reason`, then by `status` (a `404` with no reason is an older server). The worker adds `token` (no token, before any fetch), `unreachable`, `timeout` (its 660 s `ALIGN_TIMEOUT_MS` timer, or an abort) and `other` (a stream that ended with no `result` or `error`). Nothing is posted after a terminal event. A port disconnect before `alignDone` counts as `other` on the content side. | Every failure status. | sent `background.js:94-96` (the helper), `:105` (token), `:117` (plain JSON), `:145` (in-stream), `:149` (no terminal event), `:152-153` (abort, network); handled `content.js:2393-2394` |
+
+`preview` is the one type name used in **both directions**. Content→background, it is `{type, voice}` (`content.js:1465`). Background→content, it is `{type, voice, dataUrl}` (`background.js:528`, `:554`).
 
 ### Background → content via `tabs.sendMessage`
 
@@ -637,20 +658,20 @@ These are sent through `send()` (`background.js:54-56`), which swallows rejectio
 
 | Item | Payload keys | Invariant | Blast radius | Source (sent → handled) |
 |---|---|---|---|---|
-| `TLDW_INVOKE` | `url`, `videoId` | Sent only when `videoIdFromUrl(tab.url)` finds an 11-character id (`background.js:28-41`). The handler has three branches: re-show the stored `lastPayload` for the same video, re-attach to a run already in flight for it, or start a new run (`content.js:1909-1934`). | The toolbar button stops doing anything. | sent `background.js:67`; handled `content.js:1909-1934` |
-| `TLDW_ERROR` | `error` | Sent when the tab is not a `/watch` or `youtu.be` URL. Rendered by `showError`. | The "open a video first" guidance. | sent `background.js:63-64`; handled `content.js:1935` |
+| `TLDW_INVOKE` | `url`, `videoId` | Sent only when `videoIdFromUrl(tab.url)` finds an 11-character id (`background.js:28-41`). The handler has three branches: re-show the stored `lastPayload` for the same video, re-attach to a run already in flight for it, or start a new run (`content.js:3205-3230`). | The toolbar button stops doing anything. | sent `background.js:67`; handled `content.js:3205-3230` |
+| `TLDW_ERROR` | `error` | Sent when the tab is not a `/watch` or `youtu.be` URL. Rendered by `showError`. | The "open a video first" guidance. | sent `background.js:63-64`; handled `content.js:3231` |
 
 ### The `summarize` message's `page` payload
 
-Built by `collectPageTranscript` (`content.js:517-544`) and `pageMeta` (`content.js:480-499`). The worker forwards it unchanged (`background.js:153`). The server reads it in `_page_transcript` (`server.py:785-834`) and logs `status` (`server.py:1246-1248`).
+Built by `collectPageTranscript` (`content.js:538-565`) and `pageMeta` (`content.js:501-520`). The worker forwards it unchanged (`background.js:227`). The server reads it in `_page_transcript` (`server.py:785-834`) and logs `status` (`server.py:1246-1248`).
 
 | Item | Shape | Invariant | Blast radius | Source |
 |---|---|---|---|---|
-| `title` | string | From `meta[name="title"]`, then the page `h1`. The server keeps the first 300 characters and falls back to `"(untitled)"`. | Summary title and file names. | `content.js:491-492`; `server.py:831` |
-| `channel` | string | From the author `link`, then the channel-name link. The server keeps the first 200 characters and falls back to `"(unknown)"`. | Summary byline and file names. | `content.js:493-494`; `server.py:832` |
-| `duration_ms` | integer, **sent only when it parses** | From `meta[itemprop="duration"]` (ISO 8601 `PT#H#M#S`). The server accepts only a number with 0 < value < 24 h. Without it, the last cue's end stands in for the length. | The last cue's end time, and therefore the duration. | `content.js:417-422`, `:496-497`; `server.py:805-808`, `:830` |
-| `cues` | `[{start_ms, text}]`, **only on success** | Rows without a clock-like start or without text are dropped on the client (`content.js:458`). The server re-validates every row (`transcript.py:104-127`). | Whether the server can summarize without contacting YouTube. Guarded by `page_transcript_checks.js:180-232`. | `content.js:453-461`, `:540`; `server.py:809-815` |
-| `status` | `no-transcript-button`, `panel-empty`, `ok-panel (N cues)` or `error-<exception name>` | Always present. The `error-…` form carries **no** `title`, `channel` or `duration_ms` (`content.js:542`). The server only logs it. | Diagnosis only. Its strings are checked in `page_transcript_checks.js:184`, `:212`, `:217` and `:232`. | `content.js:523`, `:538`, `:540`, `:542`; `server.py:1246-1248` |
+| `title` | string | From `meta[name="title"]`, then the page `h1`. The server keeps the first 300 characters and falls back to `"(untitled)"`. | Summary title and file names. | `content.js:512-513`; `server.py:831` |
+| `channel` | string | From the author `link`, then the channel-name link. The server keeps the first 200 characters and falls back to `"(unknown)"`. | Summary byline and file names. | `content.js:514-515`; `server.py:832` |
+| `duration_ms` | integer, **sent only when it parses** | From `meta[itemprop="duration"]` (ISO 8601 `PT#H#M#S`). The server accepts only a number with 0 < value < 24 h. Without it, the last cue's end stands in for the length. | The last cue's end time, and therefore the duration. | `content.js:438-443`, `:517-518`; `server.py:805-808`, `:830` |
+| `cues` | `[{start_ms, text}]`, **only on success** | Rows without a clock-like start or without text are dropped on the client (`content.js:479`). The server re-validates every row (`transcript.py:104-127`). | Whether the server can summarize without contacting YouTube. Guarded by `page_transcript_checks.js:180-232`. | `content.js:474-482`, `:561`; `server.py:809-815` |
+| `status` | `no-transcript-button`, `panel-empty`, `ok-panel (N cues)` or `error-<exception name>` | Always present. The `error-…` form carries **no** `title`, `channel` or `duration_ms` (`content.js:563`). The server only logs it. | Diagnosis only. Its strings are checked in `page_transcript_checks.js:184`, `:212`, `:217` and `:232`. | `content.js:544`, `:559`, `:561`, `:563`; `server.py:1246-1248` |
 
 The server also accepts a legacy `captions` / `captions_format` pair (`server.py:816-821`). **The current extension does not send it.**
 
@@ -660,18 +681,18 @@ This is the server's `result` event, used by `showResult`, `toMarkdown`, `speak`
 
 | Item | Read at | Use |
 |---|---|---|
-| `video_id` | `content.js:962`, `:998`, `:1056`, `:1074`, `:1231`, `:1471`, `:1911` | Session caches and re-open matching |
-| `title` | `content.js:937`, `:1837`, `:1903`; `background.js:270` | Heading, mp3 file name, Copy, speech |
-| `channel` | `content.js:934`, `:1837`, `:1903`; `background.js:270` | Byline, mp3 file name, Copy, speech |
-| `original_length` | `content.js:934`, `:1903` | Byline |
-| `length_label` | `content.js:934`, `:1903` | Byline |
-| `source_url` | `content.js:935`, `:962`, `:1356`, `:1537`, `:1905` | The "original" link, regenerate, ask, key moments |
-| `transcript_source` | `content.js:1895-1897` | "transcribed from audio by Whisper (…)" note, shown when the value starts with `audio:` |
-| `key_points` | `content.js:932`, `:1901`; `background.js:271` | Key points list, speech |
-| `summary_md` | `content.js:940`, `:1905`; `background.js:271` (sent to the server as `summary`) | Summary body, speech |
-| `rationale` | `content.js:941` | Footer note |
-| `stats` (`videos`, `saved_hours`) | `content.js:976`, `:1194-1203` | Sponsor ask threshold |
-| `cached` | `background.js:203` | `" (cached)"` heading |
+| `video_id` | `content.js:988`, `:1025`, `:1083`, `:1101`, `:1258`, `:2767`, `:3207` | Session caches and re-open matching |
+| `title` | `content.js:963`, `:3133`, `:3199`; `background.js:344` | Heading, mp3 file name, Copy, speech |
+| `channel` | `content.js:960`, `:3133`, `:3199`; `background.js:344` | Byline, mp3 file name, Copy, speech |
+| `original_length` | `content.js:960`, `:3199` | Byline |
+| `length_label` | `content.js:960`, `:3199` | Byline |
+| `source_url` | `content.js:961`, `:988`, `:1383`, `:2833`, `:3201` | The "original" link, regenerate, ask, key moments |
+| `transcript_source` | `content.js:3191-3193` | "transcribed from audio by Whisper (…)" note, shown when the value starts with `audio:` |
+| `key_points` | `content.js:958`, `:3197`; `background.js:345` | Key points list, speech |
+| `summary_md` | `content.js:966`, `:3201`; `background.js:345` (sent to the server as `summary`) | Summary body, speech |
+| `rationale` | `content.js:967` | Footer note |
+| `stats` (`videos`, `saved_hours`) | `content.js:1002`, `:1221-1230` | Sponsor ask threshold |
+| `cached` | `background.js:277` | `" (cached)"` heading |
 
 ### Server NDJSON events read by background.js
 
@@ -679,26 +700,30 @@ These are **server** event types, read as `ev.type` in `background.js`. They are
 
 | Item | Stream | Fields read | Forwarded as | Source |
 |---|---|---|---|---|
-| `progress` | `/summarize/stream` | `message`, `percent`, `creep` | `progress` | `background.js:176-178` |
-| `meta` | `/summarize/stream` | `video_id`, `title`, `channel`, `source_url`, `original_length` | `meta` | `background.js:179-183` |
-| `transcribing` | `/summarize/stream` | `video_id`, `estimate_s` | `transcribing` | `background.js:184-186` |
-| `needs_transcription` | `/summarize/stream` | `video_id`, `title`, `channel`, `duration_ms`, `estimate_s`, `model`, `installed`, `install_hint` | `needsTranscription` (ends the stream) | `background.js:187-196` |
-| `partial` | `/summarize/stream` | `kind`, `text` | `partial` | `background.js:197-198` |
-| `result` | `/summarize/stream`; also the JSON body of `/summarize/cached` | the whole event, plus `cached` | `result` / `probe` | `background.js:115`, `:199-203` |
-| `error` | all four streams | `status`, `error` | `error`, `speakError`, `askError` or `segError`, through the mapping functions | `background.js:204-206`, `:315-317`, `:417-419`, `:547-549` |
-| `progress` | `/speak/stream` | `message`, `percent` | `speakProgress` | `background.js:298-299` |
-| `audio_chunk` | `/speak/stream` | `mp3_base64` | `audioChunk` | `background.js:300-304` |
-| `audio_end` | `/speak/stream` | none (the clip is joined from the chunks, as bytes) | `audioEnd` | `background.js:305-309`, `:341-355` |
-| `audio` | `/speak/stream` | `mp3_base64` | `audio` | `background.js:310-314` |
-| `progress` | `/ask/stream` | `message` | `askProgress` | `background.js:410-411` |
-| `delta` | `/ask/stream` | `text` | `askDelta` | `background.js:412-413` |
-| `answer_done` | `/ask/stream` | none | `askDone` | `background.js:414-416` |
-| `progress` | `/segments/stream` | `message`, `percent` | `segProgress` | `background.js:536-537` |
-| `segment_added` | `/segments/stream` | `segment` | `segmentAdded` | `background.js:538-539` |
-| `segments_done` | `/segments/stream` | `title`, `channel`, `source_url` | `segmentsDone` | `background.js:540-543` |
-| `segments` | `/segments/stream` | `segments`, `title` | `segments` | `background.js:544-546` |
+| `progress` | `/summarize/stream` | `message`, `percent`, `creep` | `progress` | `background.js:250-252` |
+| `meta` | `/summarize/stream` | `video_id`, `title`, `channel`, `source_url`, `original_length` | `meta` | `background.js:253-257` |
+| `transcribing` | `/summarize/stream` | `video_id`, `estimate_s` | `transcribing` | `background.js:258-260` |
+| `needs_transcription` | `/summarize/stream` | `video_id`, `title`, `channel`, `duration_ms`, `estimate_s`, `model`, `installed`, `install_hint` | `needsTranscription` (ends the stream) | `background.js:261-270` |
+| `partial` | `/summarize/stream` | `kind`, `text` | `partial` | `background.js:271-272` |
+| `result` | `/summarize/stream`; also the JSON body of `/summarize/cached` | the whole event, plus `cached` | `result` / `probe` | `background.js:189`, `:273-277` |
+| `error` | all four streams | `status`, `error` | `error`, `speakError`, `askError` or `segError`, through the mapping functions | `background.js:278-280`, `:389-391`, `:491-493`, `:621-623` |
+| `progress` | `/speak/stream` | `message`, `percent` | `speakProgress` | `background.js:372-373` |
+| `audio_chunk` | `/speak/stream` | `mp3_base64` | `audioChunk` | `background.js:374-378` |
+| `audio_end` | `/speak/stream` | none (the clip is joined from the chunks, as bytes) | `audioEnd` | `background.js:379-383`, `:415-429` |
+| `audio` | `/speak/stream` | `mp3_base64` | `audio` | `background.js:384-388` |
+| `progress` | `/ask/stream` | `message` | `askProgress` | `background.js:484-485` |
+| `delta` | `/ask/stream` | `text` | `askDelta` | `background.js:486-487` |
+| `answer_done` | `/ask/stream` | none | `askDone` | `background.js:488-490` |
+| `progress` | `/segments/stream` | `message`, `percent` | `segProgress` | `background.js:610-611` |
+| `segment_added` | `/segments/stream` | `segment` | `segmentAdded` | `background.js:612-613` |
+| `segments_done` | `/segments/stream` | `title`, `channel`, `source_url` | `segmentsDone` | `background.js:614-617` |
+| `segments` | `/segments/stream` | `segments`, `title` | `segments` | `background.js:618-620` |
+| `progress` | `/align/stream` | `message` | `alignProgress` | `background.js:134-135` |
+| `window` | `/align/stream` | `i`, `words`, `cached` | `alignWindow` | `background.js:136-138` |
+| `result` | `/align/stream` | `timed`, `cached`, `failed` | `alignDone` | `background.js:139-142` |
+| `error` | `/align/stream` | `status`, `reason`, `error`, `install_hint` | `alignError` | `background.js:143-145` |
 
-The worker ignores any other `ev.type`, and any line that isn't valid JSON (`background.js:175`, `:297`, `:409`, `:535`). If a stream ends with no terminal event, the worker posts the "ended unexpectedly" error for that feature (`background.js:210-212`, `:321-323`, `:423-425`, `:553-555`).
+The worker ignores any other `ev.type`, and any line that isn't valid JSON (`background.js:249`, `:371`, `:483`, `:609`). If a stream ends with no terminal event, the worker posts the "ended unexpectedly" error for that feature (`background.js:284-286`, `:395-397`, `:497-499`, `:627-629`).
 
 ### Matching timeouts between panel and worker
 
@@ -706,13 +731,14 @@ The panel keeps its own safety timer, so it can still say something if the worke
 
 | Item | Worker budget | Panel timer | Holds today? | Source |
 |---|---|---|---|---|
-| `CLIENT_TIMEOUT_MS` (summarize) | 150,000 ms | 160,000 ms | Yes, except with `whisper: "always"`. The worker's budget is then `TRANSCRIBE_TIMEOUT_MS` (`background.js:144-145`), but the panel stays at 160,000 ms until a `transcribing` event arrives (`content.js:602-615`, `:670`), so the panel fires first and says to check `tldw serve` while the worker is still working (follow-up 10) | `background.js:16`; `content.js:670` |
-| `TRANSCRIBE_TIMEOUT_MS` | 2,400,000 ms | 2,460,000 ms | Yes; guarded by `render_checks.js:405-406` and `:410-415` | `background.js:20`, `:144-145`; `content.js:615`, `:670` |
-| `ASK_TIMEOUT_MS` | 300,000 ms (total) | 300,000 ms (idle, re-armed on every message) | Equal, not greater | `background.js:22`; `content.js:1392` |
-| `SEG_TIMEOUT_MS` | 320,000 ms | 320,000 ms (not re-armed) | Equal, not greater | `background.js:21`; `content.js:1534` |
-| `SPEAK_TIMEOUT_MS` | 600,000 ms (total; also used for `/preview`) | 185,000 ms (idle, re-armed on every message) | Different meaning: the panel's timer is an idle watchdog | `background.js:23`, `:464`; `content.js:1108-1115` |
-| `/preview` (panel) | 600,000 ms (`SPEAK_TIMEOUT_MS`) | none: the panel's idle watchdog is armed only on the speak port, and the preview button resets only on a reply or a disconnect | No panel timer | `background.js:464`; `content.js:1051`, `:1108-1115`, `:1437` |
+| `CLIENT_TIMEOUT_MS` (summarize) | 150,000 ms | 160,000 ms | Yes, except with `whisper: "always"`. The worker's budget is then `TRANSCRIBE_TIMEOUT_MS` (`background.js:218-219`), but the panel stays at 160,000 ms until a `transcribing` event arrives (`content.js:623-636`, `:691`), so the panel fires first and says to check `tldw serve` while the worker is still working (follow-up 10) | `background.js:16`; `content.js:691` |
+| `TRANSCRIBE_TIMEOUT_MS` | 2,400,000 ms | 2,460,000 ms | Yes; guarded by `render_checks.js:405-406` and `:410-415` | `background.js:20`, `:218-219`; `content.js:636`, `:691` |
+| `ASK_TIMEOUT_MS` | 300,000 ms (total) | 300,000 ms (idle, re-armed on every message) | Equal, not greater | `background.js:22`; `content.js:1419` |
+| `SEG_TIMEOUT_MS` | 320,000 ms | 320,000 ms (not re-armed) | Equal, not greater | `background.js:21`; `content.js:2830` |
+| `SPEAK_TIMEOUT_MS` | 600,000 ms (total; also used for `/preview`) | 185,000 ms (idle, re-armed on every message) | Different meaning: the panel's timer is an idle watchdog | `background.js:23`, `:538`; `content.js:1135-1142` |
+| `/preview` (panel) | 600,000 ms (`SPEAK_TIMEOUT_MS`) | none: the panel's idle watchdog is armed only on the speak port, and the preview button resets only on a reply or a disconnect | No panel timer | `background.js:538`; `content.js:1078`, `:1135-1142`, `:1464` |
 | `PROBE_TIMEOUT_MS` | 5,000 ms | covered by the summarize timer | — | `background.js:85` |
+| `ALIGN_TIMEOUT_MS` (word timing) | 660,000 ms (the server's 600 s whole-request budget plus a minute) | 660,000 ms (`MUTE_SAFETY_MS`, not re-armed) | Equal, not greater. The server ends within about 630 s, so neither normally fires | `background.js:91`; `content.js:1873` |
 
 ## Extension → server HTTP calls
 
@@ -722,13 +748,14 @@ Every call builds its URL as `serverUrl.replace(/\/+$/, "") + route`. `serverUrl
 
 | Item | Method | Auth header | Caller | Request body keys | Response fields read | Invariant | Blast radius | Source |
 |---|---|---|---|---|---|---|---|---|
-| `/summarize/cached` | `POST` | `Authorization: Bearer <your-token>` | `background.js` `handleProbe` | `url`, `model`, `segment_ratio` | `resp.ok`; JSON `type === "result"` (the whole object becomes the payload) | Anything else is a miss, including a `404` from an older server and `{"type":"miss"}`. The 5 s abort is a miss too. `model` must be sent because the summary cache key depends on it (the backend fingerprint). `segment_ratio` is sent so that, on a hit, the key-moments prefetch checks its cache under the *segment* ratio (`_run_cached`: validation and key at `server.py:1350-1359`, prefetch at `:1364-1367`). The summary key uses the body's `ratio`, which the extension never sends, so it is `auto` (`server.py:748-770`). | Cache-before-read. Guarded by `probe_checks.js:152-187`. | `background.js:107-127` |
-| `/summarize/stream` | `POST` | `Bearer` | `background.js` `handleSummarize` | `url`, `model`, `segment_ratio`, `refresh`, `page`, `whisper`, `transcribe` | when not ok: JSON `error`; otherwise the NDJSON events above | `transcribe === true` or `whisper === "always"` selects the 40-minute budget. | Every summary. | `background.js:144-160` |
-| `/transcribe/stop` | `POST` | `Bearer` | `background.js` `handleStopTranscribe` | `url` | nothing (best effort, no timeout) | Skipped without a token or a `url`. | Stopping a transcription. | `background.js:227-240` |
-| `/speak/stream` | `POST` | `Bearer` | `background.js` `handleSpeak` | `title`, `channel`, `key_points`, `summary` (from `payload.summary_md`), `voice`, `stream_audio` | when not ok: JSON `error`; otherwise the NDJSON events above | `model` is not sent. `stream_audio: false` means one `audio` event. | Listen. | `background.js:266-279` |
-| `/ask/stream` | `POST` | `Bearer` | `background.js` `handleAsk` | `url`, `question`, `history`, `model` | when not ok: JSON `error`; otherwise the NDJSON events above | `segment_ratio` is read from settings (`background.js:369`) but not sent. | Follow-up questions. | `background.js:385-394` |
-| `/preview` | `POST` | `Bearer` | `background.js` `handlePreview` | `voice` | when not ok: JSON `error`; otherwise the bytes (`arrayBuffer`), wrapped as `data:audio/mpeg;base64,…` | Cached per voice in the worker's memory. | Voice preview in the panel. | `background.js:466-480` |
-| `/segments/stream` | `POST` | `Bearer` | `background.js` `handleSegments` | `url`, `model`, `ratio` (from the `segmentRatio` setting; **not** `segment_ratio`) | when not ok: JSON `error`; otherwise the NDJSON events above | `ratio` is `null` for `"auto"`. | Play key moments. | `background.js:511-520` |
+| `/summarize/cached` | `POST` | `Authorization: Bearer <your-token>` | `background.js` `handleProbe` | `url`, `model`, `segment_ratio` | `resp.ok`; JSON `type === "result"` (the whole object becomes the payload) | Anything else is a miss, including a `404` from an older server and `{"type":"miss"}`. The 5 s abort is a miss too. `model` must be sent because the summary cache key depends on it (the backend fingerprint). `segment_ratio` is sent so that, on a hit, the key-moments prefetch checks its cache under the *segment* ratio (`_run_cached`: validation and key at `server.py:1350-1359`, prefetch at `:1364-1367`). The summary key uses the body's `ratio`, which the extension never sends, so it is `auto` (`server.py:748-770`). | Cache-before-read. Guarded by `probe_checks.js:152-187`. | `background.js:181-201` |
+| `/summarize/stream` | `POST` | `Bearer` | `background.js` `handleSummarize` | `url`, `model`, `segment_ratio`, `refresh`, `page`, `whisper`, `transcribe` | when not ok: JSON `error`; otherwise the NDJSON events above | `transcribe === true` or `whisper === "always"` selects the 40-minute budget. | Every summary. | `background.js:218-234` |
+| `/transcribe/stop` | `POST` | `Bearer` | `background.js` `handleStopTranscribe` | `url` | nothing (best effort, no timeout) | Skipped without a token or a `url`. | Stopping a transcription. | `background.js:301-314` |
+| `/speak/stream` | `POST` | `Bearer` | `background.js` `handleSpeak` | `title`, `channel`, `key_points`, `summary` (from `payload.summary_md`), `voice`, `stream_audio` | when not ok: JSON `error`; otherwise the NDJSON events above | `model` is not sent. `stream_audio: false` means one `audio` event. | Listen. | `background.js:340-353` |
+| `/ask/stream` | `POST` | `Bearer` | `background.js` `handleAsk` | `url`, `question`, `history`, `model` | when not ok: JSON `error`; otherwise the NDJSON events above | `segment_ratio` is read from settings (`background.js:443`) but not sent. | Follow-up questions. | `background.js:459-468` |
+| `/preview` | `POST` | `Bearer` | `background.js` `handlePreview` | `voice` | when not ok: JSON `error`; otherwise the bytes (`arrayBuffer`), wrapped as `data:audio/mpeg;base64,…` | Cached per voice in the worker's memory. | Voice preview in the panel. | `background.js:540-554` |
+| `/segments/stream` | `POST` | `Bearer` | `background.js` `handleSegments` | `url`, `model`, `ratio` (from the `segmentRatio` setting; **not** `segment_ratio`) | when not ok: JSON `error`; otherwise the NDJSON events above | `ratio` is `null` for `"auto"`. | Play key moments. | `background.js:585-594` |
+| `/align/stream` | `POST` | `Bearer` | `background.js` `handleAlign` | `url`, `whisper`, `windows` | when not ok: JSON `error`, `reason`, `install_hint`; otherwise the NDJSON events above | Skipped without a token (`token`). Aborted on port disconnect and after 660 s. | Word timing. | `background.js:93-158` |
 | `/health` | `GET` | **none** | `options.js` `load` | none | `backend.kind`. If it is set and isn't `"claude"`, the model picker is disabled and `#modelNote` explains why. | Every failure is ignored. There is no timeout. | Model picker state. | `options.js:51-66` |
 | `/voices` | `GET` | **none** | `options.js` `load` | none | `resp.ok`; `voices` (an array of `{id, label}`), used only when it is a non-empty array | **Inserted with `innerHTML` and not escaped** (`options.js:30`). If it fails, `VOICE_FALLBACK` is used. | The Options voice list. | `options.js:68-75`, `:28-32` |
 | `/preview` | `POST` | `Bearer`, using the token **typed in the field, saved or not** | `options.js` `preview` | `voice` | `resp.ok`, `resp.status` (`401`); when not ok: JSON `error`; otherwise `resp.blob()`, as an object URL | It uses the server URL in the field too, so a voice can be auditioned before saving. Cached per voice for the page's lifetime. | Options voice preview. | `options.js:83-120` |
@@ -749,36 +776,36 @@ The worker turns an HTTP status (from a non-ok response, or from a stream `error
 
 | Item | Message text (exact) | Server detail | Invariant | Blast radius | Source |
 |---|---|---|---|---|---|
-| `401` | `Token mismatch. Re-check the token in the extension's Options.` | ignored | Names the fix. | Summary and key-moments token errors. | `background.js:572` |
-| `413` | `This transcript is too long for the browser; use the tldw CLI.` | pass-through | — | — | `background.js:573` |
-| `422` | `This video has no captions/transcript to summarize.` | pass-through | **Names no next step** (follow-up). | — | `background.js:574` |
-| `429` | `Server busy, try again in a moment.` | pass-through: the server says which limit was hit | Guarded by `probe_checks.js:194-203`. | Busy messages. | `background.js:577` |
-| `502` | ``The model call failed. If you're on the Claude CLI, make sure `claude` is logged in; otherwise check your configured model command.`` | ignored | — | — | `background.js:578` |
-| `504` | `Summarizing timed out on the server. Try again, or use the CLI for long videos.` | ignored | Also shown for a **key-moments** timeout, where "Summarizing" is the wrong word (follow-up). | — | `background.js:579` |
-| any other status | `Server error (<status>).` | pass-through | The fallback **names no next step** (follow-up). | — | `background.js:580` |
+| `401` | `Token mismatch. Re-check the token in the extension's Options.` | ignored | Names the fix. | Summary and key-moments token errors. | `background.js:646` |
+| `413` | `This transcript is too long for the browser; use the tldw CLI.` | pass-through | — | — | `background.js:647` |
+| `422` | `This video has no captions/transcript to summarize.` | pass-through | **Names no next step** (follow-up). | — | `background.js:648` |
+| `429` | `Server busy, try again in a moment.` | pass-through: the server says which limit was hit | Guarded by `probe_checks.js:194-203`. | Busy messages. | `background.js:651` |
+| `502` | ``The model call failed. If you're on the Claude CLI, make sure `claude` is logged in; otherwise check your configured model command.`` | ignored | — | — | `background.js:652` |
+| `504` | `Summarizing timed out on the server. Try again, or use the CLI for long videos.` | ignored | Also shown for a **key-moments** timeout, where "Summarizing" is the wrong word (follow-up). | — | `background.js:653` |
+| any other status | `Server error (<status>).` | pass-through | The fallback **names no next step** (follow-up). | — | `background.js:654` |
 
 ### askError status mapping
 
 | Item | Message text (exact) | Server detail | Invariant | Blast radius | Source |
 |---|---|---|---|---|---|
-| `401` | `Token mismatch. Re-check the token in the extension's Options.` | ignored | — | — | `background.js:441` |
-| `429` | `Server busy, try again in a moment.` | pass-through | Guarded by `probe_checks.js:194-203`. | — | `background.js:442` |
-| `413` | `That question is too long.` | ignored | **Names no next step** in words (follow-up). | — | `background.js:443` |
-| `422` | `This video has no transcript to answer from.` | pass-through | **Names no next step** (follow-up). | — | `background.js:444` |
-| `504` | `That question took too long. Try again.` | ignored | — | — | `background.js:445` |
-| any other status | `Couldn't answer (server error <status>).` | pass-through | The fallback **names no next step** (follow-up). | — | `background.js:446` |
+| `401` | `Token mismatch. Re-check the token in the extension's Options.` | ignored | — | — | `background.js:515` |
+| `429` | `Server busy, try again in a moment.` | pass-through | Guarded by `probe_checks.js:194-203`. | — | `background.js:516` |
+| `413` | `That question is too long.` | ignored | **Names no next step** in words (follow-up). | — | `background.js:517` |
+| `422` | `This video has no transcript to answer from.` | pass-through | **Names no next step** (follow-up). | — | `background.js:518` |
+| `504` | `That question took too long. Try again.` | ignored | — | — | `background.js:519` |
+| any other status | `Couldn't answer (server error <status>).` | pass-through | The fallback **names no next step** (follow-up). | — | `background.js:520` |
 
 ### speakError status mapping
 
-`speakError` also serves `/preview` (`background.js:474`).
+`speakError` also serves `/preview` (`background.js:548`).
 
 | Item | Message text (exact) | Server detail | Invariant | Blast radius | Source |
 |---|---|---|---|---|---|
-| `401` | `Token mismatch. Re-check the token in the extension's Options.` | ignored | — | — | `background.js:492` |
-| `429` | `Server busy, try again in a moment.` | pass-through | Guarded by `probe_checks.js:194-203`. | — | `background.js:493` |
-| `503` | `Audio isn't available — Piper TTS isn't installed on the server.` | pass-through | **Names no next step** (no install command; follow-up). | — | `background.js:494` |
-| `504` | `Audio generation timed out. Try again.` | ignored | — | — | `background.js:495` |
-| any other status | `Audio failed (server error <status>).` | pass-through | The fallback **names no next step** (follow-up). | — | `background.js:496` |
+| `401` | `Token mismatch. Re-check the token in the extension's Options.` | ignored | — | — | `background.js:566` |
+| `429` | `Server busy, try again in a moment.` | pass-through | Guarded by `probe_checks.js:194-203`. | — | `background.js:567` |
+| `503` | `Audio isn't available — Piper TTS isn't installed on the server.` | pass-through | **Names no next step** (no install command; follow-up). | — | `background.js:568` |
+| `504` | `Audio generation timed out. Try again.` | ignored | — | — | `background.js:569` |
+| any other status | `Audio failed (server error <status>).` | pass-through | The fallback **names no next step** (follow-up). | — | `background.js:570` |
 
 ### options.js status mapping
 
@@ -787,64 +814,64 @@ The worker turns an HTTP status (from a non-ok response, or from a stream `error
 | `401` | ``Token mismatch — check the token from `tldw serve`.`` | ignored | `options.js:105-106` |
 | any other status | `Preview failed (<status>).` | pass-through | `options.js:107` |
 
-`404` is never mapped to text. On `/summarize/cached` it means a miss (`background.js:113-126`, guarded by `probe_checks.js:155-158`).
+`404` is never mapped to text. On `/summarize/cached` it means a miss (`background.js:187-200`, guarded by `probe_checks.js:155-158`).
 
 ### Fixed messages from the worker
 
 | Item | Message text (exact) | Source |
 |---|---|---|
-| No token (probe, summarize, speak, ask, preview, segments) | ``No server token set. Open the extension's Options and paste the token from `tldw serve`.`` | `background.js:102`, `:138`, `:252`, `:372`, `:460`, `:504` |
+| No token (probe, summarize, speak, ask, preview, segments) | ``No server token set. Open the extension's Options and paste the token from `tldw serve`.`` | `background.js:176`, `:212`, `:326`, `:446`, `:534`, `:578` |
 | Not a video page (`TLDW_ERROR`) | `Open a YouTube video (a /watch page) first, then click TL;DW.` | `background.js:64` |
-| Summary stream ended without a terminal event | `The summary stream ended unexpectedly. Try again.` | `background.js:211` |
-| Audio stream ended without a terminal event | `Audio stream ended unexpectedly. Try again.` | `background.js:322` |
-| Answer stream ended without a terminal event | `The answer stream ended unexpectedly. Try again.` | `background.js:424` |
-| Key-moments stream ended without a terminal event | `The segment stream ended unexpectedly. Try again.` | `background.js:554` |
-| Transcribe budget aborted | `Transcribing timed out. The transcript may still finish on the server — try again in a few minutes.` | `background.js:216` |
-| Summarize budget aborted | `Summarizing timed out (over 150s). Try again, or use the tldw CLI for long videos.` | `background.js:217` |
-| Speak budget aborted | `Audio generation timed out. Try again (first use downloads the voice).` | `background.js:329` |
-| Ask budget aborted | `That question took too long. Try again.` | `background.js:430` |
-| Preview budget aborted | `Voice preview timed out (first use downloads the voice).` (**names no next step**) | `background.js:484` |
-| Key-moments budget aborted | `Finding key moments timed out. Try again.` | `background.js:558` |
-| Network failure (summarize) | `Can't reach the tldw server. Is it running? In a terminal:  tldw serve` (two spaces before `tldw`) | `background.js:220` |
-| Network failure (speak, ask, preview, segments) | `Can't reach the tldw server. Is it running?  tldw serve` (two spaces before `tldw`) | `background.js:332`, `:433`, `:485`, `:560` |
+| Summary stream ended without a terminal event | `The summary stream ended unexpectedly. Try again.` | `background.js:285` |
+| Audio stream ended without a terminal event | `Audio stream ended unexpectedly. Try again.` | `background.js:396` |
+| Answer stream ended without a terminal event | `The answer stream ended unexpectedly. Try again.` | `background.js:498` |
+| Key-moments stream ended without a terminal event | `The segment stream ended unexpectedly. Try again.` | `background.js:628` |
+| Transcribe budget aborted | `Transcribing timed out. The transcript may still finish on the server — try again in a few minutes.` | `background.js:290` |
+| Summarize budget aborted | `Summarizing timed out (over 150s). Try again, or use the tldw CLI for long videos.` | `background.js:291` |
+| Speak budget aborted | `Audio generation timed out. Try again (first use downloads the voice).` | `background.js:403` |
+| Ask budget aborted | `That question took too long. Try again.` | `background.js:504` |
+| Preview budget aborted | `Voice preview timed out (first use downloads the voice).` (**names no next step**) | `background.js:558` |
+| Key-moments budget aborted | `Finding key moments timed out. Try again.` | `background.js:632` |
+| Network failure (summarize) | `Can't reach the tldw server. Is it running? In a terminal:  tldw serve` (two spaces before `tldw`) | `background.js:294` |
+| Network failure (speak, ask, preview, segments) | `Can't reach the tldw server. Is it running?  tldw serve` (two spaces before `tldw`) | `background.js:406`, `:507`, `:559`, `:634` |
 
 ### Fixed messages from the panel and Options
 
 | Item | Message text (exact) | Surface | Source |
 |---|---|---|---|
-| Summarize port lost | `Lost connection to the extension worker. Click TL;DW to try again.` | `showError` or toast | `content.js:646` |
-| Panel safety timer, transcription | `Transcribing is taking longer than expected. It may still finish on the server — try again in a few minutes.` | `showError` or toast | `content.js:611-612` |
-| Panel safety timer, summarize | ``This is taking too long. Make sure `tldw serve` is running, then try again.`` | `showError` or toast | `content.js:667` |
-| No captions, Whisper not installed | `This video has no subtitles or auto-captions. TL;DW can transcribe the audio locally instead, but that needs Whisper, which isn't installed yet.` / ``Install it, then restart `tldw serve` and click TL;DW again:``, then the server's `install_hint` (fallback `pipx inject youtube-tldw faster-whisper`), then the `pip install faster-whisper` alternative | `.status.err` with `role="status" aria-live="polite"`, written directly into `.content` (not through `showError`); the hint is escaped with `esc()` | `content.js:798-808` |
-| Speak or key-moments port lost | `Lost connection to the worker. Try again.` | `.audiostatus` | `content.js:1069`, `:1528` |
-| Ask port lost | `Lost connection to the worker. Try again.` | `.askstatus` | `content.js:1352` |
-| Audio idle watchdog | ``Audio is taking too long. Make sure `tldw serve` is running.`` | `.audiostatus` | `content.js:1113` |
-| Ask safety timer | ``That question is taking too long. Is `tldw serve` running?`` | `.askstatus` | `content.js:1391` |
-| Key-moments safety timer | ``Finding key moments is taking too long. Is `tldw serve` running?`` | `.audiostatus` | `content.js:1533` |
-| No clips came back | `No key moments found.` (**names no next step**) | `.audiostatus` | `content.js:1510` |
-| No player found | `Couldn't find the YouTube player to control.` (**names no next step**) | `.audiostatus` | `content.js:1552`, `:1573` |
-| Listen stopped | `Stopped. Pick another voice and try again.` | `.audiostatus` | `content.js:1091` |
-| Ask stopped | `Stopped.` (a confirmation, not an error) | `.askstatus` | `content.js:1376` |
-| Background summary finished | `TL;DW summary ready — click to read` | toast | `content.js:636`, `:764` |
-| Background offer waiting | `TL;DW needs an answer about this video — click to read` | toast | `content.js:626`, `:764` |
+| Summarize port lost | `Lost connection to the extension worker. Click TL;DW to try again.` | `showError` or toast | `content.js:667` |
+| Panel safety timer, transcription | `Transcribing is taking longer than expected. It may still finish on the server — try again in a few minutes.` | `showError` or toast | `content.js:632-633` |
+| Panel safety timer, summarize | ``This is taking too long. Make sure `tldw serve` is running, then try again.`` | `showError` or toast | `content.js:688` |
+| No captions, Whisper not installed | `This video has no subtitles or auto-captions. TL;DW can transcribe the audio locally instead, but that needs Whisper, which isn't installed yet.` / ``Install it, then restart `tldw serve` and click TL;DW again:``, then the server's `install_hint` (fallback `pipx inject youtube-tldw faster-whisper`), then the `pip install faster-whisper` alternative | `.status.err` with `role="status" aria-live="polite"`, written directly into `.content` (not through `showError`); the hint is escaped with `esc()` | `content.js:819-829` |
+| Speak or key-moments port lost | `Lost connection to the worker. Try again.` | `.audiostatus` | `content.js:1096`, `:2824` |
+| Ask port lost | `Lost connection to the worker. Try again.` | `.askstatus` | `content.js:1379` |
+| Audio idle watchdog | ``Audio is taking too long. Make sure `tldw serve` is running.`` | `.audiostatus` | `content.js:1140` |
+| Ask safety timer | ``That question is taking too long. Is `tldw serve` running?`` | `.askstatus` | `content.js:1418` |
+| Key-moments safety timer | ``Finding key moments is taking too long. Is `tldw serve` running?`` | `.audiostatus` | `content.js:2829` |
+| No clips came back | `No key moments found.` (**names no next step**) | `.audiostatus` | `content.js:2806` |
+| No player found | `Couldn't find the YouTube player to control.` (**names no next step**) | `.audiostatus` | `content.js:2848`, `:2869` |
+| Listen stopped | `Stopped. Pick another voice and try again.` | `.audiostatus` | `content.js:1118` |
+| Ask stopped | `Stopped.` (a confirmation, not an error) | `.askstatus` | `content.js:1403` |
+| Background summary finished | `TL;DW summary ready — click to read` | toast | `content.js:657`, `:785` |
+| Background offer waiting | `TL;DW needs an answer about this video — click to read` | toast | `content.js:647`, `:785` |
 | Options: no token for preview | `Paste the token first.` | `#previewStatus` | `options.js:90` |
 | Options: preview network failure | ``Can't reach the server. Is `tldw serve` running?`` | `#previewStatus` | `options.js:115` |
 | Options: custom backend | `Your server is configured to use a custom model command, so this setting doesn't apply. Change the model where that command is configured (tldw config llm_cmd ... or TLDW_LLM_CMD).` (begins with a space). **The command it names doesn't work:** `config` accepts only `set`, `get` and `unset`, and anything else prints the usage line and exits 1 (`cli.py:349`, `cli.py:365-367`). The working form is `tldw config set llm_cmd …` (→ [T-012](../tasks/T-012.md)) | `#modelNote` | `options.js:60-63` |
-| Options: saved | `Saved` (cleared after 1.5 s) | `#status` | `options.js:140-141` |
+| Options: saved | `Saved. Videos where Cover listed words is on use the new settings right away.` (cleared after 4 s; T-020 rev 5.6, AC18: the user is in this tab when a running Cover listed words session picks the change up) | `#status` | `options.js:185-186` |
 
 ### Backtick rendering
 
 | Item | Invariant | Blast radius | Source |
 |---|---|---|---|
-| `showError` backtick → `<code>` | The message is **escaped first** with `esc()`, and only then is `` `x` `` turned into `<code>x</code>`. So a server `error` string can't inject markup. Only `showError` does this. | Every message shown in the panel's main error view: `error` port messages, `TLDW_ERROR`, and the panel's own safety and disconnect messages. | `content.js:842-847` |
-| Every other surface uses `textContent` | Backticks show **literally** in `.audiostatus` (`content.js:1888`), `.askstatus` (`content.js:1408`), the toast (`content.js:764`) and the Options notes (`options.js:90`, `:105-107`, `:115`). So the no-token message and the `502` message show raw backticks when they arrive as `speakError`, `askError`, `previewError` or `segError`, or as a toast. | How those messages look. | as cited |
+| `showError` backtick → `<code>` | The message is **escaped first** with `esc()`, and only then is `` `x` `` turned into `<code>x</code>`. So a server `error` string can't inject markup. Only `showError` does this. | Every message shown in the panel's main error view: `error` port messages, `TLDW_ERROR`, and the panel's own safety and disconnect messages. | `content.js:863-868` |
+| Every other surface uses `textContent` | Backticks show **literally** in `.audiostatus` (`content.js:3184`), `.askstatus` (`content.js:1435`), the toast (`content.js:785`) and the Options notes (`options.js:90`, `:105-107`, `:115`). So the no-token message and the `502` message show raw backticks when they arrive as `speakError`, `askError`, `previewError` or `segError`, or as a toast. | How those messages look. | as cited |
 
 ### Text the code depends on
 
 | Item | Invariant | Blast radius | Source |
 |---|---|---|---|
-| `"trimmed video"` | `trimmedNote()` produces `` ` · <dur> trimmed video` ``, plus ` (<pct>%)` when the percentage is known. `refreshTrimmedNote()` inserts the note only if the header doesn't already contain `"trimmed video"`. Both strings must change together. | If they differ, the note is inserted again every time key moments finish. | `content.js:1666`, `:1680` |
-| `" (cached)"` | Appended to the `#tldw-h` heading when `cached` is true. Nothing reads it back. It does become part of the dialog's accessible name, through `aria-labelledby="tldw-h"`. `cached` is true for the worker's cache (`background.js:132`), a server cache hit (`background.js:203`), a probe hit (`content.js:561`), and a re-open from a toast or a toolbar click (`content.js:773`, `:1911`). So it means "not freshly generated for this click". | The heading, and screen-reader announcements. | `content.js:930` |
+| `"trimmed video"` | `trimmedNote()` produces `` ` · <dur> trimmed video` ``, plus ` (<pct>%)` when the percentage is known. `refreshTrimmedNote()` inserts the note only if the header doesn't already contain `"trimmed video"`. Both strings must change together. | If they differ, the note is inserted again every time key moments finish. | `content.js:2962`, `:2976` |
+| `" (cached)"` | Appended to the `#tldw-h` heading when `cached` is true. Nothing reads it back. It does become part of the dialog's accessible name, through `aria-labelledby="tldw-h"`. `cached` is true for the worker's cache (`background.js:206`), a server cache hit (`background.js:277`), a probe hit (`content.js:582`), and a re-open from a toast or a toolbar click (`content.js:794`, `:3207`). So it means "not freshly generated for this click". | The heading, and screen-reader announcements. | `content.js:956` |
 
 ### Every message names a next step
 
@@ -855,11 +882,88 @@ The worker turns an HTTP status (from a non-ok response, or from a stream `error
 - `httpError`: `422` and the fallback;
 - `askError`: `413`, `422` and the fallback;
 - `speakError`: `503` and the fallback;
-- the preview timeout, `background.js:484`;
-- `No key moments found.`, `content.js:1510`;
-- `Couldn't find the YouTube player to control.`, `content.js:1552` and `:1573`;
+- the preview timeout, `background.js:558`;
+- `No key moments found.`, `content.js:2806`;
+- `Couldn't find the YouTube player to control.`, `content.js:2848` and `:2869`;
 - the Options custom-backend note (`options.js:60-63`), which names `tldw config llm_cmd`, a form that exits 1 (→ T-012);
 - any pass-through server `detail` that names no next step itself, such as `internal error`, which the server emits as a stream error (`server.py:1307`).
+
+## Word timing (`/align/stream`, T-020) and "Cover listed words"
+
+Everything the hybrid caption-and-Whisper feature adds to the server's and the panel's contracts, in one place. The narrative is in [`api.md`](./api.md) (the route), [`data-model.md`](./data-model.md) (store 13 and the two storage keys) and [`ux.md`](./ux.md) (the journey). **Every string below is quoted verbatim and checked:** `test_contracts_md_quotes_every_status_string_verbatim` reads them from the code (between the `// T-020 status text: BEGIN`/`END` markers in `content.js`, the `# T-020 align text: BEGIN`/`END` markers in `align.py`, and `#whisperCoverHint` in `options.html`) and fails if one is missing here.
+
+### The order of checks in `_run_align`
+
+1. **Before the 200, as plain JSON:** auth (`401`) and the body (`_read_body`: `400`/`411`/`413`/`415`); the body is an object; `canonical_video_id(url)` (`400` `bad video url`); `parse_windows` (`400` naming the field); `_whisper_policy` (`400` for an unknown value; `503` `whisper_off` for `off`); `is_available()` and a readable fingerprint (`align.fingerprint()`, called `ALIGN_FINGERPRINT` in these docs; `503` `whisper_missing`, with `install_hint`); any window past `_max_transcribe_ms()` (`413` `too_long`). An oversized body is also a `413`, **with no `reason`**.
+2. **Then the 200 NDJSON headers.** Exact duplicate windows are collapsed; every window found in store 13 is sent at once (`cached: true`). If none miss: `result`, done, with no ffmpeg, no lock, no permit and no YouTube call.
+3. **Only if some windows miss, each as an in-stream `error`:** `shutil.which("ffmpeg")` (`503` `ffmpeg_missing`); the model on disk, `model_on_disk` (`503` `model_missing`, before any download; `503` `whisper_missing` if faster-whisper can't even be imported); `_align_lock` (`429` `busy`); a running whole-video transcription in `_tx_jobs` (`429` `busy`); the cooldown (`429` `rate_limited`); the download (`429` `rate_limited` and the cooldown set; `504` `timeout`; `502` `download_failed`); the permit, waited for at most 20 s (`429` `busy`); the model load (`503` `whisper_missing` on `ImportError`, `503` `model_missing` otherwise); then the windows, each cut with ffmpeg and transcribed with `word_timestamps=True`. A window that fails is counted `failed`, never cached, and the next one runs. An unexpected exception ends the stream with `500` `other`.
+
+**Shared-state rules:** the lock and the permit are released in `finally` only if this request took them; the workdir (a `youtube-tldw-audio-` temp dir, so the stale-audio sweep covers a crash) is always removed; store 13 is pruned once, in that `finally`. Requests that never take the lock never prune. **A client that goes away** is noticed at the next write (a `progress` line follows the download and every failed window), and the loop stops after the current window, which stays cached. **A second tab** on a partly cached video gets its cached windows, then `429` `busy`. Long synchronous work in a request is accepted here because it streams, follows `/summarize/stream`'s precedent, and stops when the client goes.
+
+### Every `reason`
+
+Carried by plain-JSON refusals and in-stream `error` events alike, and logged as `align: <reason> <video_id>` (words and windows are never logged; tested per reason). The panel picks its text by `reason`, then by `status`.
+
+| `reason` | Status | Where | Server text | Panel text |
+|---|---|---|---|---|
+| `whisper_off` | `503` | plain JSON | `Whisper is turned off.`, or when the operator pinned it, `Whisper is turned off for tldw serve on this machine (tldw config unset whisper turns it back on).` | `{verb} {n} by caption line, because Whisper is turned off. To time them to the word, set 'Videos with no subtitles' in TL;DW's options to either transcribe choice.`; a pinned `off` shows `{verb} {n} by caption line: {detail}` with the server's text |
+| `whisper_missing` | `503` | plain JSON (not installed, or a library version unreadable) or in-stream (installed but can't load: `Whisper is installed but could not be loaded. Try reinstalling it: {hint}, then restart tldw serve.`) | `Whisper isn't installed for tldw serve.`, with `install_hint` | `{verb} {n} by caption line. To time them to the word, install Whisper for tldw serve: {hint}, then restart tldw serve and turn this off and on again.`, `{hint}` from `install_hint` (default `pipx inject youtube-tldw faster-whisper`) |
+| `too_long` | `413` | plain JSON | `This video is longer than tldw serve's Whisper limit. To time words, run tldw config set whisper-max-minutes <minutes>, then turn this off and on again.` | `{verb} {n} by caption line: {detail}` |
+| `ffmpeg_missing` | `503` | in-stream | `Word timing needs ffmpeg, and tldw serve can't find it. Install ffmpeg, restart tldw serve, then turn this off and on again.` | `{verb} {n} by caption line: {detail}` |
+| `model_missing` | `503` | in-stream | `Whisper's model isn't downloaded yet.` | `{verb} {n} by caption line: Whisper's model isn't downloaded yet. Transcribe one video that has no subtitles to fetch it, then turn this off and on again.` |
+| `busy` | `429` | in-stream | `Already timing words for another video. Try again when it finishes.` (the lock) or `Whisper is busy transcribing another video. Try again when it finishes.` (a transcription, or the 20 s permit wait) | the server's text, then ` Until then, spots are covered by caption line.` |
+| `rate_limited` | `429` | in-stream | `YouTube is rate-limiting tldw serve, so it couldn't get the audio. Turn this off and on again in a few minutes; the wait is at most ten.`, for a fresh YouTube 429 and for the cooldown alike | the server's text, then ` Until then, spots are covered by caption line.` |
+| `download_failed` | `502` | in-stream | `YouTube didn't give this video's length, or it's longer than tldw serve's Whisper limit, so its audio can't be fetched. If it's the limit, run tldw config set whisper-max-minutes <minutes>, then turn this off and on again.` when yt-dlp's match filter skipped the video (no duration, or over the ceiling; it can't say which), else `Couldn't fetch this video's audio. Turn this off and on again to retry.` | `{verb} {n} by caption line: {detail}` |
+| `timeout` | `504` | in-stream, or the worker's own | `Fetching the video's audio timed out. Turn this off and on again to retry.`; the worker's 660 s timer sends none | `{verb} {n} by caption line: {detail}`, or `{verb} {n} by caption line: timing them to the word failed. Turn this off and on again to retry.` with no detail |
+| `other` | `500` | in-stream (`Timing the words failed unexpectedly. Turn this off and on again to retry.`), or the worker's own (a stream with no terminal event; a port lost before `alignDone`) | as said | `{verb} {n} by caption line: {detail}`, or `{verb} {n} by caption line: timing them to the word failed. Turn this off and on again to retry.` |
+| `token` | `0` | the worker: no token set | — | `{verb} {n} by caption line: TL;DW's token for tldw serve is missing or wrong. Paste the token tldw serve prints into TL;DW's options, then turn this off and on again.`; a `401` with no `reason` shows the same |
+| `unreachable` | `0` | the worker: the fetch failed | — | `{verb} {n} by caption line: couldn't reach tldw serve. Start it, then turn this off and on again.` |
+
+A `404` with no `reason` is a server too old to have the route: `{verb} {n} by caption line: this tldw serve can't time words. Update tldw, then restart tldw serve and turn this off and on again.`. A `503` with an `install_hint` and no `reason` gets `{verb} {n} by caption line. To time them to the word, install Whisper for tldw serve: {hint}, then restart tldw serve and turn this off and on again.`. Anything else gets `{verb} {n} by caption line: {detail}` when the server sent text, else `{verb} {n} by caption line: timing them to the word failed. Turn this off and on again to retry.`. Server text is always set with `textContent`, never parsed; no server text that reaches the panel carries backticks (tested).
+
+### The panel's statuses
+
+`{verb}` is `Bleeping`, `Muting` or `Mooing over` (`{verbLower}` the same in lower case); `{n}` is `1 spot` or `N spots`; `{s}` is whole seconds of covered audio; `{k}` and `{total}` count hits. **(A)** marks a status announced through a live region: the panel's (`.coverlive`) while the panel is open, otherwise the pill's, filled on a later tick (100 ms). Every status also goes on the panel's visible, non-live line (`.coverstatus`). Statuses never go through `showError`.
+
+| When | Text (exact) | (A)? | Source |
+|---|---|---|---|
+| Reading the captions | `Reading the captions…` | yes | `content.js` `start` |
+| The list is empty (`""`) | `No words are listed. Add some in TL;DW's extension options, then try again.` | yes | `load` |
+| No caption line matches; the toggle stays off | `None of this video's caption lines contain your listed words, so there's nothing to cover.` | yes | `load` |
+| On | `{verb} {n} from the captions (about {s} seconds of audio). Timing them to the word…` | yes | `load` |
+| The sound was changed in Options while on (rev 5.6); the spot playing now stays silent | `Sound changed: now {verbLower} listed words, starting at the next covered spot.` | yes | `setSound` |
+| The word list was changed in Options while on (rev 5.6); the progress and done statuses follow as usual | `Word list updated: {verb} {n} from the captions (about {s} seconds of audio).` | yes | `rebuild` |
+| The list was emptied in Options while on; the session ends as Stop does, without the "off" status | `No words are listed, so covering is off. Add some in TL;DW's extension options, then turn it on again.` | yes | `rebuild` |
+| A new list matches no caption line while on; the session ends as Stop does | `None of this video's caption lines contain your listed words, so covering is off.` | yes | `rebuild` |
+| Each window that arrives | `Timed to the word: {k} of {total}.` | no | `onAlign` |
+| Done, every hit word-timed | `{verb} {n}, all timed to the word (about {s} seconds of audio).` | yes | `alignDoneText` |
+| Done, some | `{verb} {n}: {k} timed to the word, the rest by caption line (about {s} seconds of audio).` | yes | `alignDoneText` |
+| Done, none (and fewer windows failed than were sent) | `{verb} {n} by caption line: Whisper didn't find the words in the audio.` | yes | `alignDoneText` |
+| Every window failed | `{verb} {n} by caption line: timing them to the word failed. Turn this off and on again to retry.` | yes | `alignDoneText` |
+| A failure | the "Panel text" column above | yes | `alignFailureText` |
+| The `AudioContext` isn't running, or `resume()` rejected; once per session | `The browser blocked the sound, so listed words are muted instead. Turn this off and on again to allow sound.` | yes | `startSound` |
+| Off | `Bleeping is off.`, `Muting is off.` or `Mooing is off.` | yes | `stop` |
+| The captions couldn't be read | `Couldn't read this video's captions, so no words will be covered. Open the video's transcript and try again, or try another video.` | yes | `load` |
+| No `<video>` on the page | `Couldn't find the YouTube player. Reload the page, then try again.` | yes | `start` |
+| A live stream (`duration === Infinity`) | `Covering words isn't available on live streams. Try again after the stream ends.` | yes | `start` |
+| The toggle pressed during an ad | `An ad is playing. Try again once the video starts.` | yes | `start` |
+| An ad starts while covering is on; when it ends, the status from before it (or one that arrived during it) returns to the visible line, unannounced | `An ad is playing, so covering is paused. It picks up again when the video comes back.` | yes | `tick` |
+
+**The pill** (`#tldw-mute-pill`): its label, not a live region, is `Bleeping listed words`, `Muting listed words` or `Mooing over listed words`, plus ` · now` while a range is active, after an `aria-hidden` emoji (🔔, 🔇 or 🐄). Its Stop button reads `Stop` and is named `Stop bleeping`, `Stop muting` or `Stop mooing`. A sound changed in Options while on updates the emoji, the label and the Stop button's name in place (`setMode`, rev 5.6); the pill is never rebuilt.
+
+**Options** (`options.html`): the `#whisper` select's hint gains `It also controls word timing for "Cover listed words": unless this is set to "Don't transcribe", turning that on fetches the video's audio once and runs Whisper on a few seconds around each listed word, without asking. With "Don't transcribe", each word is covered for its whole caption line instead.` The word-list label is `Words to cover (for 'Cover listed words')`, its hint `Separate with commas or new lines. Whole words, any case. Leave empty to turn off Cover listed words.`, the button `Restore default list`, and the sound select `Sound for listed words` (`Bleep (default)`, `Mute`, `Moo`) with the hint `Every choice silences the video during the word. Bleep and Moo also play a short sound over it.`
+
+### Invariants
+
+| Invariant | Blast radius | Source |
+|---|---|---|
+| **The word list never leaves the browser.** Matching runs in `content.js`; the request carries only `url`, `whisper` and `windows`. The list itself is in no log, cache or key, but store 13 holds every word heard around each hit, so whoever can read that directory can narrow each window to a few likely words. | Server logs and caches would hold the list | `content.js` `startAlign`; `background.js:93-158` (tested) |
+| **Server words never reach the DOM.** They are only compared with the list's pattern. | A word typed into the DOM is a markup path from the server | `content.js` `onAlign` (tested) |
+| **The feature unmutes only a mute it set.** A `volumechange` releases ownership only when `muted` differs from what the feature last set; a `.ytp-mute-button` click or an `m` key (no Ctrl, Meta or Alt, not in an editable target, read through `composedPath()`) releases it and stops the sound. A video already muted when a range begins gets no ownership and no sound. | The user's own mute | `muteStep`; `content.js` `attach` (tested) |
+| **Sound only in the first 1.5 s of a range** (`MUTE_SOUND_CAP_MS`), at most 0.15 (bleep) or 0.25 (moo) × `video.volume`. Mute mode never creates an `AudioContext`. A `ratechange` stops a playing sound and starts it again for the time left under the cap, at the new rate. | Loudness | `soundLengthMs`, `soundPlan` |
+| **Teardown removes every listener** (with its capture flag) on Stop, a new video id, a detached `<video>` and `pagehide`. `emptied`/`loadstart` with the same id give up the mute and sound but keep the session. | A muted video after the feature is off | `content.js` `stop` (tested) |
+| **One alignment at a time, process-wide; it never queues behind a transcription** (`429` `busy` after 20 s), and never downloads a Whisper model. | CPU, YouTube rate limit | `server.py:72`, `whisper_transcribe._load_model(local_only=True)` |
+| **The word list in the default** lives only in `extension/mute_words.js`: never in docs, tasks, reviews, commits or fixtures (which use made-up words). | Profanity in the repo's prose | `extension/mute_words.js` |
 
 ## chrome.storage.local keys
 
@@ -867,25 +971,34 @@ The defaults are defined in **three places**, and they differ:
 
 1. **`background.js` `DEFAULTS`** (`background.js:10-11`) has no `closeAction`.
 2. **`options.js` `DEFAULTS`** (`options.js:3-5`) has all seven settings.
-3. **`content.js`'s inline defaults** in each `storage.local.get` call (`content.js:47`, `:1008`, `:1195`).
+3. **`content.js`'s inline defaults** in each `storage.local.get` call (`content.js:47`, `:1035`, `:1222`).
 
 **The token is stored in plain text** in `chrome.storage.local`. The Options field is `type="password"` (`options.html:32`), which only masks it on screen. Whatever `serverUrl` says, the token is sent there as `Bearer`; nothing checks the host (see `architecture.md`).
 
-**The only `storage.onChanged` listener** is in `content.js:50-56`, and it watches only `closeAction`. Every other key is read again at the moment it is used: the worker calls `getSettings()` at the start of each handler (`background.js:43-52`), the panel reads `voice` when it renders a result (`content.js:1008`), and it reads the sponsor keys in `maybeThank` (`content.js:1195`). So a change made in Options applies to the next request, and requests already running are unaffected.
+**The only `storage.onChanged` listener** is in `content.js:50-70` (between its "settings listener" markers). It acts only in the `local` area, on `closeAction`, `muteSound` and `muteWords`. For the two T-020 keys it passes only their `newValue`s to the running "Cover listed words" session (`settingsChanged`); nothing else from `changes` is read or passed on (rev 5.6). Every other key is read again at the moment it is used: the worker calls `getSettings()` at the start of each handler (`background.js:43-52`), the panel reads `voice` when it renders a result (`content.js:1035`), and it reads the sponsor keys in `maybeThank` (`content.js:1222`). So a change made in Options applies to the next request; requests already running, and an open panel's chosen voice, keep the value they started with. **Cover listed words applies `muteSound` and `muteWords` while on** (`tests/js/settings_listener_checks.js`, `mute_wiring_checks.js` group `live`):
+- **A sound change:** the playing sound stops and the spot playing now stays silent (`quietCur`); the next covered spot uses the new sound. To `mute` closes the `AudioContext`; leaving `mute` opens one outside a gesture, which falls back to muted-only with the `soundBlocked` status if it won't run.
+- **A list change:** the captions read at toggle-on (kept in the tab's memory only, dropped on every end) are re-scanned in place. Hits inside windows Whisper already returned this session are timed locally; only the rest are sent on a new port, and the old port is ended first, so its late messages are dropped. An unchanged list (after normalising) does nothing. An empty list or no match ends the session with its own status.
+- **A busy refusal on a rebuilt session** is retried up to 3 times, after 5, 10 and 20 s, each on a fresh port, but only if it came before any `alignProgress` on that port (that is, before a download began). Every other reason, and a busy on the first toggle-on, is not retried.
+- **Save fires up to two events** (the `set`, which may carry `muteSound`, then `muteWords`'s `set` or `remove`): at most one rebuild per Save. During loading, a live value wins over the stored read still pending.
 
 | Item | Default (`background.js`) | Default (`options.js`) | Default (`content.js`) | Written by | What the user sees it change | Invariant | Blast radius | Source |
 |---|---|---|---|---|---|---|---|---|
-| `serverUrl` | `"http://127.0.0.1:8765"` | `"http://127.0.0.1:8765"` | — | `options.js:137` | Where every request goes. The Options "Server URL" field. | Empty falls back to the default. Trailing `/` characters are stripped. The default matches `host_permissions` (see "Manifests"). | Every server call; and where the token is sent. | `background.js:10`, `:47`; `options.js:3`, `:36`, `:125`, `:137` |
-| `token` | `""` | `""` | — | `options.js:137` | When empty, every feature shows the "No server token set" message. | Sent as `Authorization: Bearer <your-token>` on every `POST`. Never on `/health` or `/voices`. | Auth for every authenticated route. | `background.js:10`, `:47`; `options.js:3`, `:37`, `:126`, `:137` |
-| `voice` | `"amy"` (**read but never used** by the worker: `getSettings` doesn't return it) | `"amy"` | `"amy"` (`content.js:1008`) | `options.js:137` | Which voice is preselected in the panel's picker and in the Options picker. Picking a voice in the panel is **not saved**. | Applied in the panel only if it is one of `VOICE_OPTIONS` (`content.js:1009`). | The default Listen voice. | `background.js:10`; `options.js:3`, `:47`, `:127`, `:137`; `content.js:1008-1010` |
-| `model` | `"opus"` | `"opus"` | — | `options.js:137` | "Thorough — Opus" or "Fast — Sonnet". Sent on summarize, cached, segments and ask, but **not** on speak or preview. | Must be one of `MODELS`, or it falls back to the default (`background.js:48`, `options.js:130-131`). The server answers `400` to anything outside its allowlist. | The summary cache key, and every model call. | `background.js:10-13`, `:48`; `options.js:4`, `:9`, `:45-46`, `:130-131`, `:137` |
-| `segmentRatio` | `"auto"` | `"auto"` | — | `options.js:137` | How long Play key moments runs ("Auto", "Tight", "Balanced" or "Generous"). Sent as `segment_ratio` (summarize, cached) and as `ratio` (segments). | Stored as a **string**. The worker parses it with `parseFloat` and keeps it only if 0 < r ≤ 1, otherwise `null`; `"auto"` becomes `null`. Options keeps only the values in `RATIOS`. | Key-moments length, and the key-moments prefetch, on a cached summary (`server.py:1236-1242`, `:1364-1367`) and after a fresh one (`:1319-1323`). It is not the summary cache key, which uses `ratio` (`:748-770`). | `background.js:11`, `:46`, `:51`; `options.js:4`, `:8`, `:42-44`, `:132-133`, `:137` |
-| `whisper` | `"ask"` | `"ask"` | — | `options.js:137` | Videos with no captions: offer to transcribe, transcribe without asking, or say there is no transcript. `"always"` also selects the 40-minute worker budget. | Must be one of `WHISPER_POLICIES`, or it falls back to the default. It is sent **only** on `/summarize/stream`. | The no-captions flow. | `background.js:11`, `:15`, `:49-50`, `:144`, `:153`; `options.js:5`, `:7`, `:40-41`, `:134-137` |
-| `closeAction` | — (absent) | `"continue"` | `"continue"` (`content.js:47`) | `options.js:137` | Closing the panel mid-run either keeps the work running in the background (`continue`) or stops and discards it (`abort`). | Anything other than `"abort"` means `"continue"` (`content.js:48`, `:53`; `closePolicy`, `content.js:59-64`). The live `storage.onChanged` listener keeps it in sync, because `close()` must decide synchronously. | Background work, keepalive pings, stopping transcriptions. Guarded by `render_checks.js:117-130`. | `options.js:4`, `:38-39`, `:128-129`, `:137`; `content.js:42`, `:47-56` |
-| `sponsorDismissed` | — | — | `false` (`content.js:1195`) | `content.js:1212`, `:1216` | Hides the sponsor ask for good, after "No thanks" or after following the link. | Once true, it is never set false again. There is no Options control for it. | The sponsor box. Guarded by `render_checks.js:245-262`. | `content.js:1195-1196`, `:1212`, `:1216` |
-| `sponsorShown` | — | — | `0` (`content.js:1195`) | `content.js:1218` | After `SPONSOR_MAX_SHOWS` (3) showings, the ask stops appearing. | Goes up by one each time the box is shown, and only after `stats.videos` ≥ `SPONSOR_AFTER_VIDEOS` (25). | The sponsor box. Guarded by `render_checks.js:245-262`. | `content.js:40-41`, `:1194-1196`, `:1218` |
+| `serverUrl` | `"http://127.0.0.1:8765"` | `"http://127.0.0.1:8765"` | — | `options.js:176` | Where every request goes. The Options "Server URL" field. | Empty falls back to the default. Trailing `/` characters are stripped. The default matches `host_permissions` (see "Manifests"). | Every server call; and where the token is sent. | `background.js:10`, `:47`; `options.js:3`, `:36`, `:125`, `:137` |
+| `token` | `""` | `""` | — | `options.js:176` | When empty, every feature shows the "No server token set" message. | Sent as `Authorization: Bearer <your-token>` on every `POST`. Never on `/health` or `/voices`. | Auth for every authenticated route. | `background.js:10`, `:47`; `options.js:3`, `:37`, `:126`, `:137` |
+| `voice` | `"amy"` (**read but never used** by the worker: `getSettings` doesn't return it) | `"amy"` | `"amy"` (`content.js:1035`) | `options.js:176` | Which voice is preselected in the panel's picker and in the Options picker. Picking a voice in the panel is **not saved**. | Applied in the panel only if it is one of `VOICE_OPTIONS` (`content.js:1036`). | The default Listen voice. | `background.js:10`; `options.js:3`, `:47`, `:127`, `:137`; `content.js:1035-1037` |
+| `model` | `"opus"` | `"opus"` | — | `options.js:176` | "Thorough — Opus" or "Fast — Sonnet". Sent on summarize, cached, segments and ask, but **not** on speak or preview. | Must be one of `MODELS`, or it falls back to the default (`background.js:48`, `options.js:168-169`). The server answers `400` to anything outside its allowlist. | The summary cache key, and every model call. | `background.js:10-13`, `:48`; `options.js:4`, `:9`, `:45-46`, `:130-131`, `:137` |
+| `segmentRatio` | `"auto"` | `"auto"` | — | `options.js:176` | How long Play key moments runs ("Auto", "Tight", "Balanced" or "Generous"). Sent as `segment_ratio` (summarize, cached) and as `ratio` (segments). | Stored as a **string**. The worker parses it with `parseFloat` and keeps it only if 0 < r ≤ 1, otherwise `null`; `"auto"` becomes `null`. Options keeps only the values in `RATIOS`. | Key-moments length, and the key-moments prefetch, on a cached summary (`server.py:1236-1242`, `:1364-1367`) and after a fresh one (`:1319-1323`). It is not the summary cache key, which uses `ratio` (`:748-770`). | `background.js:11`, `:46`, `:51`; `options.js:4`, `:8`, `:42-44`, `:132-133`, `:137` |
+| `whisper` | `"ask"` | `"ask"` | — | `options.js:176` | Videos with no captions: offer to transcribe, transcribe without asking, or say there is no transcript. `"always"` also selects the 40-minute worker budget. | Must be one of `WHISPER_POLICIES`, or it falls back to the default. It is sent **only** on `/summarize/stream`. | The no-captions flow. | `background.js:11`, `:15`, `:49-50`, `:218`, `:227`; `options.js:5`, `:7`, `:40-41`, `:134-137` |
+| `closeAction` | — (absent) | `"continue"` | `"continue"` (`content.js:47`) | `options.js:176` | Closing the panel mid-run either keeps the work running in the background (`continue`) or stops and discards it (`abort`). | Anything other than `"abort"` means `"continue"` (`content.js:48`, `:53`; `closePolicy`, `content.js:73-78`). The live `storage.onChanged` listener keeps it in sync, because `close()` must decide synchronously. | Background work, keepalive pings, stopping transcriptions. Guarded by `render_checks.js:117-130`. | `options.js:4`, `:38-39`, `:128-129`, `:137`; `content.js:42`, `:47-56` |
+| `sponsorDismissed` | — | — | `false` (`content.js:1222`) | `content.js:1239`, `:1243` | Hides the sponsor ask for good, after "No thanks" or after following the link. | Once true, it is never set false again. There is no Options control for it. | The sponsor box. Guarded by `render_checks.js:245-262`. | `content.js:1222-1223`, `:1239`, `:1243` |
+| `sponsorShown` | — | — | `0` (`content.js:1222`) | `content.js:1245` | After `SPONSOR_MAX_SHOWS` (3) showings, the ask stops appearing. | Goes up by one each time the box is shown, and only after `stats.videos` ≥ `SPONSOR_AFTER_VIDEOS` (25). | The sponsor box. Guarded by `render_checks.js:245-262`. | `content.js:40-41`, `:1221-1223`, `:1245` |
 
-`options.js:137-138` writes the seven settings with **shorthand properties**: `{ serverUrl, token, voice, closeAction, model, segmentRatio, whisper }`. A storage-key extractor that reads only `key:` pairs misses them.
+| `muteWords` | — | absent means the shipped default, `TLDW_MUTE_DEFAULTS` in `mute_words.js` | read with `storage.local.get("muteWords")` at toggle-on, and applied live while on through the one `onChanged` listener (rev 5.6; this supersedes "at toggle-on only") | `options.js:181` (`set`), `:180` (`remove`) | The "Words to cover (for 'Cover listed words')" textarea. `""` turns the feature off. | **Absent** means "use the shipped default", so a later change to the default reaches the user. Save **removes** the key when the normalised box equals the normalised default, saves `""` for an empty box, and otherwise saves the normalised list (one entry per line). Both sides normalise with the single `TLDW_normaliseMuteList` from `mute_words.js`. "Restore default list" refills the box and writes nothing. **Never sent** to the worker or the server. The separate `set` and `remove` aren't atomic; the worst case is the default list. Because of that, one Save can fire two `onChanged` events; the second carries `muteWords`. | "Cover listed words" (T-020). | `options.js:28-54`, `:76-79`, `:157-160`, `:175-181`; `content.js:2746` (read), `:50-70` (live) |
+| `muteSound` | — | `"bleep"` when absent or unknown | read with `storage.local.get("muteSound")` at toggle-on, and applied live while on through the one `onChanged` listener (rev 5.6; this supersedes "at toggle-on only") | `options.js:177` | "Sound for listed words": `bleep` (the default), `mute` or `moo`. | Only a value in `MUTE_SOUND_CHOICES` is saved or used; anything else reads as `bleep`. Edits take effect right away, from the next covered spot (rev 5.6). | Which sound covers a word. | `options.js:32-37`, `:79`, `:175-177`; `content.js:2747` (read), `:2475` (resolved), `:50-70` (live) |
+
+`options.js` writes the seven settings, plus `muteSound`, with **shorthand properties** in one `set`, then writes or removes `muteWords` (T-020). The original line:
+
+`options.js:176-177` writes the seven settings with **shorthand properties**: `{ serverUrl, token, voice, closeAction, model, segmentRatio, whisper }`. A storage-key extractor that reads only `key:` pairs misses them.
 
 ## Extension in-memory state (not persisted)
 
@@ -895,9 +1008,10 @@ These are listed so no one mistakes them for storage. They all disappear when th
 |---|---|---|
 | `cache` (worker) | videoId → result event | `background.js:25` |
 | `audioCache` (worker) | `videoId` and `voice`, joined by a pipe character → mp3 `data:` URL | `background.js:26` |
-| `previewCache` (worker) | voice → `data:` URL | `background.js:449` |
+| `previewCache` (worker) | voice → `data:` URL | `background.js:523` |
 | `previewCache` (Options) | voice → `blob:` object URL | `options.js:81` |
-| `lastPayload`, `lastAudio`, `lastSegments`, `chat` (panel) | the last result, the clip, the clips and the Q&A history for this page session | `content.js:27-28`, `:35`, `:72` |
+| `lastPayload`, `lastAudio`, `lastSegments`, `chat` (panel) | the last result, the clip, the clips and the Q&A history for this page session | `content.js:27-28`, `:35`, `:86` |
+| `muteCover` (panel, T-020) | The page's one "Cover listed words" session (`createMuteCover`): the hits and active ranges, the ownership state (`owned`, `lastSet`), queued refinements, `alignPort` and its ping and 660 s safety timers, the boundary timer, the `AudioContext` and the playing sound, the pill, and the last status. It belongs to the page, not the panel, so closing the panel leaves it running; each tab is independent. | `content.js:2118-2693` (`createMuteCover`), `:2735` (the instance) |
 
 ## Manifests
 
@@ -907,7 +1021,7 @@ There are two files: `extension/manifest.json` (Chrome and other Chromium browse
 
 | Item | Invariant | Blast radius | Source |
 |---|---|---|---|
-| `activeTab` | Gives temporary access to the tab when the toolbar button is clicked. That is what lets `scripting.executeScript` inject `content.js` (`background.js:61`) and lets the worker read `tab.url` (`background.js:60`) **without a YouTube host permission**. The panel reads YouTube's transcript from inside the page for the same reason (`content.js:387-389`). | If removed, a click can't inject the panel. | `manifest.json:6`; `manifest.firefox.json:6` |
+| `activeTab` | Gives temporary access to the tab when the toolbar button is clicked. That is what lets `scripting.executeScript` inject `content.js` (`background.js:61`) and lets the worker read `tab.url` (`background.js:60`) **without a YouTube host permission**. The panel reads YouTube's transcript from inside the page for the same reason (`content.js:408-410`). | If removed, a click can't inject the panel. | `manifest.json:6`; `manifest.firefox.json:6` |
 | `scripting` | Needed for `scripting.executeScript`. | The same as `activeTab`. | `manifest.json:6`; `manifest.firefox.json:6`; `background.js:61` |
 | `storage` | Needed for `chrome.storage.local` (see "chrome.storage.local keys"). | Settings, the token, the sponsor state. | `manifest.json:6`; `manifest.firefox.json:6` |
 | `http://127.0.0.1:8765/*` (host permission) | **Coupled to the default `serverUrl`** (`background.js:10`, `options.js:3`) and to the server's default port 8765. It covers that exact origin only: not `localhost`, and not any other port. When `serverUrl` points elsewhere, the worker's fetches are outside this grant and depend on the server's CORS answer, which allows only `chrome-extension://` origins unless one is pinned (`server.py:918-924`, `:931-938`). **Whether a custom `serverUrl` then works is `UNKNOWN — needs human confirmation`.** `deployment.md`'s isolated-server test is planned to settle it. In Firefox, host access is opt-in for the user (`extension/README.md`, Setup step 2). | Every call from the worker and from Options. | `manifest.json:7`; `manifest.firefox.json:7` |
@@ -931,8 +1045,8 @@ There are two files: `extension/manifest.json` (Chrome and other Chromium browse
 | Item | Status |
 |---|---|
 | `content_scripts` | N/A. Nothing is injected automatically. `content.js` is injected only on a toolbar click, by `scripting.executeScript` (`background.js:61`), and guarded against double-install by `window.__tldwInit` (`content.js:6-7`). |
-| `content_security_policy` | N/A. The browser's default MV3 extension CSP applies. The extension loads no remote code: its only script tag is `<script src="options.js">` (`options.html:83`), and the panel is built inline in a shadow root (`content.js:136-260`). |
-| `web_accessible_resources` | N/A. The page never loads an extension file. The panel's markup and styles are inline in `content.js`, and audio plays from `data:` and `blob:` URLs (`background.js:307`, `:478`; `content.js:1142`, `:1844`). The icons are used only by the browser's own UI. |
+| `content_security_policy` | N/A. The browser's default MV3 extension CSP applies. The extension loads no remote code: its only script tag is `<script src="options.js">` (`options.html:83`), and the panel is built inline in a shadow root (`content.js:150-281`). |
+| `web_accessible_resources` | N/A. The page never loads an extension file. The panel's markup and styles are inline in `content.js`, and audio plays from `data:` and `blob:` URLs (`background.js:381`, `:552`; `content.js:1169`, `:3140`). The icons are used only by the browser's own UI. |
 | `externally_connectable` | N/A. No web page or other extension can `connect` to the worker, which is what makes the `port.name` check at `background.js:71` enough (`architecture.md` relies on this absence). |
 | `commands` | N/A. There is no keyboard shortcut for the action. The panel's keys are handled in the page (see "Keyboard and accessibility baseline"). |
 
@@ -940,47 +1054,61 @@ There are two files: `extension/manifest.json` (Chrome and other Chromium browse
 
 | Item | Invariant | Blast radius | Source |
 |---|---|---|---|
-| `background.js`, `content.js`, `options.js`, `options.html` | Copied into `dist-firefox/`. **Any new extension file not added to this line is silently left out of the Firefox build**, and the script still prints `Built dist-firefox/`. | The Firefox build. No test covers the script. | `extension/build-firefox.sh:10` |
+| `background.js`, `content.js`, `mute_words.js`, `options.js`, `options.html` | Copied into `dist-firefox/`. A new extension file must be added to this line. `test_firefox_build_copies_every_file_the_extension_loads` runs the script on a copy and fails if any file a manifest, an `executeScript` `files` array or an `options.html` `<script src>` names is missing, with a negative self-test (T-020). | The Firefox build. | `extension/build-firefox.sh:10`; `tests/test_extension_render.py` |
+
+### Injected files
+
+| Item | Invariant | Blast radius | Source |
+|---|---|---|---|
+| `mute_words.js` | Injected **first** by `executeScript({ files: ["mute_words.js", "content.js"] })`, and loaded first by `options.html` (`<script src="mute_words.js">` before `options.js`). It declares nothing at top level, only `globalThis.TLDW_MUTE_DEFAULTS ??= Object.freeze([...])` and `globalThis.TLDW_normaliseMuteList ??= function …`, because every toolbar click re-runs it and a top-level `const` would throw the second time. The default words appear **only** in this file. | Without it, the defaults are missing and an absent `muteWords` means an empty list, which is off. | `background.js:61`; `options.html:98`; `extension/mute_words.js` |
+| `content.js` | Injected second, so it can read the two globals. Guarded by `window.__tldwInit`. | Every panel feature. | `background.js:61` |
+
+`test_the_injected_files_are_the_word_list_then_content` pins both orders, and the `injected_files` extractor in `tests/test_docs_contracts.py` checks this table.
 | `icons/*.png` | Copied into `dist-firefox/icons/`. | Firefox icons. | `extension/build-firefox.sh:9`, `:11` |
 | `manifest.firefox.json` → `manifest.json` | Renamed on copy. `dist-firefox/` is deleted first (`rm -rf`) and is gitignored (`.gitignore:9`). | The Firefox build. | `extension/build-firefox.sh:7-8`, `:12` |
 
-**Firefox runtime differences in the JS:** Firefox's MSE has no `audio/mpeg`, so the panel asks for one buffered clip (`content.js:29-31`, `:1076`, `:1119-1123`). The server's default Origin allowlist accepts only `chrome-extension://` (`server.py:924`). The Firefox `moz-extension://` origin's behaviour is recorded as `UNKNOWN — needs human confirmation` in `architecture.md`.
+**Firefox runtime differences in the JS:** Firefox's MSE has no `audio/mpeg`, so the panel asks for one buffered clip (`content.js:29-31`, `:1103`, `:1146-1150`). The server's default Origin allowlist accepts only `chrome-extension://` (`server.py:924`). The Firefox `moz-extension://` origin's behaviour is recorded as `UNKNOWN — needs human confirmation` in `architecture.md`.
 
 ## YouTube page contract
 
-`content.js` reads YouTube's page from inside the page, through the DOM only. It never reads `ytInitialPlayerResponse` and never injects into the MAIN world (`content.js:375-389`; no `ytInitialPlayerResponse` appears anywhere in `extension/`).
+`content.js` reads YouTube's page from inside the page, through the DOM only. It never reads `ytInitialPlayerResponse` and never injects into the MAIN world (`content.js:396-410`; no `ytInitialPlayerResponse` appears anywhere in `extension/`).
 
-Selectors called on `root`, `c` or `box` (the panel's own shadow root and its children) are **excluded** from this inventory. They select tldw's own markup, not YouTube's. So are `e.target.closest(".ts")` (`content.js:1250`) and `el.querySelector("a")` (`content.js:1667`), whose receivers are inside the shadow root.
+Selectors called on `root`, `c` or `box` (the panel's own shadow root and its children) are **excluded** from this inventory. They select tldw's own markup, not YouTube's. So are `e.target.closest(".ts")` (`content.js:1277`) and `el.querySelector("a")` (`content.js:2963`), whose receivers are inside the shadow root.
 
 ### Page selectors
 
 | Item | Kind | Invariant | Blast radius | Source |
 |---|---|---|---|---|
-| `transcript-segment-view-model, ytd-transcript-segment-renderer` | `SEGMENT_ROWS`: the transcript rows (current and older renderers) | Rows are read **by structure, not class name**. The start is the leaf whose text matches `CLOCK` (`/^\d{1,2}(?::\d{2}){1,2}$/`). The words are the other children, minus any child whose class contains `a11y` (the English-only screen-reader twin). | If YouTube renames the elements, `status` becomes `panel-empty` and the server falls back to fetching. Guarded by `page_transcript_checks.js:104-118` and `:173-206`. | `content.js:391-392`, `:429-461`, `:471` |
-| `ytd-engagement-panel-section-list-renderer` | `PANEL`: the engagement panel holding the transcript | Chosen in this order: the panel containing rows; then one whose `target-id` matches `/transcript/i` **and** whose `visibility` contains `EXPANDED`; then any whose `target-id` matches. | If the panel can't be found, it can't be closed again, and is left open on the viewer's page. | `content.js:393`, `:466-475` |
-| `ytd-video-description-transcript-section-renderer button` | `TRANSCRIPT_BUTTON`: "Show transcript" in the description | Clicked even while the description is collapsed. If it is missing, `status` is `no-transcript-button`. | Reading the page's transcript. Guarded by `page_transcript_checks.js:216-217`. | `content.js:394`, `:522-526` |
-| `#visibility-button button` | The panel's own close button | Clicked to put the panel back, but only if tldw opened it. | If it can't be found, the transcript panel stays open. Guarded by `page_transcript_checks.js:191-201`, `:214`. | `content.js:551` |
-| `.segment-timestamp` | The older row's timestamp | Used first when present. | Row start times. | `content.js:430` |
-| `*` | Every descendant of a row, scanned for the clock leaf | — | Row start times. | `content.js:432` |
-| `.segment-text` | The older row's words | Used first when present. | Row text. | `content.js:441` |
-| `meta[name="title"]` | `attr(…, "content")`: the title | The first choice for `page.title`. | The summary title. Guarded by `page_transcript_checks.js:188`. | `content.js:491` |
-| `#above-the-fold h1, ytd-watch-metadata h1` | `text(…)`: the title, as a fallback | — | The summary title. | `content.js:492` |
-| `span[itemprop="author"] link[itemprop="name"]` | `attr(…, "content")`: the channel | The first choice for `page.channel`. | The byline. Guarded by `page_transcript_checks.js:189`. | `content.js:493` |
-| `#owner #channel-name a, ytd-channel-name a` | `text(…)`: the channel, as a fallback | — | The byline. | `content.js:494` |
-| `meta[itemprop="duration"]` | `attr(…, "content")`: ISO 8601 duration | Parsed by `isoDurationMs`, `^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$`. When it doesn't parse, `duration_ms` is left out. | Last-cue end and duration. Guarded by `page_transcript_checks.js:166-169`, `:190`, `:219-222`. | `content.js:417-422`, `:496-497` |
-| `video.html5-main-video` | The YouTube player | Tried first, with `video` as the fallback. The code uses `currentTime`, `play()`, `pause()`, `duration` and the `timeupdate` event. | Citation seeks, Play key moments, and the trimmed-length note. | `content.js:1296`, `:1549`, `:1571`, `:1676` |
-| `video` | Fallback player | — | The same. | `content.js:1297`, `:1550`, `:1572`, `:1677` |
-| `tldw-toast` | `getElementById`: tldw's own toast (`role="status"`) on the page | Only one at a time: an old toast is removed first. | Background notices. | `content.js:754-758` |
-| `tldw-pill` | `getElementById`: tldw's own skip-playback pill | — | Skip controls. | `content.js:1650`, `:1726`, `:1761`, `:1789` |
-| `tldw-pill-prev` | `getElementById`: the pill's previous button | — | Skip controls. | `content.js:1744`, `:1782` |
-| `tldw-pill-next` | `getElementById`: the pill's next button | — | Skip controls. | `content.js:1749`, `:1784` |
-| `.pill-label` | `pill.querySelector`: the pill's text | — | Skip status text. | `content.js:1652`, `:1763` |
+| `transcript-segment-view-model, ytd-transcript-segment-renderer` | `SEGMENT_ROWS`: the transcript rows (current and older renderers) | Rows are read **by structure, not class name**. The start is the leaf whose text matches `CLOCK` (`/^\d{1,2}(?::\d{2}){1,2}$/`). The words are the other children, minus any child whose class contains `a11y` (the English-only screen-reader twin). | If YouTube renames the elements, `status` becomes `panel-empty` and the server falls back to fetching. Guarded by `page_transcript_checks.js:104-118` and `:173-206`. | `content.js:412-413`, `:450-482`, `:492` |
+| `ytd-engagement-panel-section-list-renderer` | `PANEL`: the engagement panel holding the transcript | Chosen in this order: the panel containing rows; then one whose `target-id` matches `/transcript/i` **and** whose `visibility` contains `EXPANDED`; then any whose `target-id` matches. | If the panel can't be found, it can't be closed again, and is left open on the viewer's page. | `content.js:414`, `:487-496` |
+| `ytd-video-description-transcript-section-renderer button` | `TRANSCRIPT_BUTTON`: "Show transcript" in the description | Clicked even while the description is collapsed. If it is missing, `status` is `no-transcript-button`. | Reading the page's transcript. Guarded by `page_transcript_checks.js:216-217`. | `content.js:415`, `:543-547` |
+| `#visibility-button button` | The panel's own close button | Clicked to put the panel back, but only if tldw opened it. | If it can't be found, the transcript panel stays open. Guarded by `page_transcript_checks.js:191-201`, `:214`. | `content.js:572` |
+| `.segment-timestamp` | The older row's timestamp | Used first when present. | Row start times. | `content.js:451` |
+| `*` | Every descendant of a row, scanned for the clock leaf | — | Row start times. | `content.js:453` |
+| `.segment-text` | The older row's words | Used first when present. | Row text. | `content.js:462` |
+| `meta[name="title"]` | `attr(…, "content")`: the title | The first choice for `page.title`. | The summary title. Guarded by `page_transcript_checks.js:188`. | `content.js:512` |
+| `#above-the-fold h1, ytd-watch-metadata h1` | `text(…)`: the title, as a fallback | — | The summary title. | `content.js:513` |
+| `span[itemprop="author"] link[itemprop="name"]` | `attr(…, "content")`: the channel | The first choice for `page.channel`. | The byline. Guarded by `page_transcript_checks.js:189`. | `content.js:514` |
+| `#owner #channel-name a, ytd-channel-name a` | `text(…)`: the channel, as a fallback | — | The byline. | `content.js:515` |
+| `meta[itemprop="duration"]` | `attr(…, "content")`: ISO 8601 duration | Parsed by `isoDurationMs`, `^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$`. When it doesn't parse, `duration_ms` is left out. | Last-cue end and duration. Guarded by `page_transcript_checks.js:166-169`, `:190`, `:219-222`. | `content.js:438-443`, `:517-518` |
+| `video.html5-main-video` | The YouTube player | Tried first, with `video` as the fallback. The code uses `currentTime`, `play()`, `pause()`, `duration` and the `timeupdate` event. | Citation seeks, Play key moments, and the trimmed-length note. | `content.js:1323`, `:2845`, `:2867`, `:2972` |
+| `video` | Fallback player | — | The same. | `content.js:1324`, `:2846`, `:2868`, `:2973` |
+| `tldw-toast` | `getElementById`: tldw's own toast (`role="status"`) on the page | Only one at a time: an old toast is removed first. | Background notices. | `content.js:775-779` |
+| `tldw-pill` | `getElementById`: tldw's own skip-playback pill | — | Skip controls. | `content.js:2946`, `:3022`, `:3057`, `:3085` |
+| `tldw-pill-prev` | `getElementById`: the pill's previous button | — | Skip controls. | `content.js:3040`, `:3078` |
+| `tldw-pill-next` | `getElementById`: the pill's next button | — | Skip controls. | `content.js:3045`, `:3080` |
+| `.pill-label` | `pill.querySelector`: the pill's text | — | Skip status text. | `content.js:2948`, `:3059` |
+| `#movie_player` | The YouTube player element (T-020) | Read with `doc.querySelector("#movie_player")`; its `.matches(".ad-showing")` is the ad state, and it takes focus after Stop on the mute pill. | If renamed, ads are never detected (the feature would mute or sound during an ad) and Stop's focus move does nothing. | `content.js:2145-2146`, `:2548-2549` |
+| `.ad-showing` | The class `#movie_player` carries while an ad plays (T-020) | Read with `player.matches(".ad-showing")`. During an ad the feature gives up any mute it set, stops its sound and does nothing until the ad ends. | The same. | `content.js:2146` |
+| `.ytp-mute-button` | YouTube's mute button (T-020) | A capture-phase `click` on `document` whose `e.target.closest(".ytp-mute-button")` matches hands mute control back to the user. | If renamed, a mute-button click inside a range is seen only through `volumechange`, so a mute made while the feature already has the video muted is missed. | `content.js:2323-2327` |
+| `tldw-mute-pill` | `getElementById`: tldw's own "Cover listed words" pill, in its own shadow root, at `bottom: 136px` (T-020) | Built with `textContent` only; appended to `document.fullscreenElement \|\| document.body` and moved on `fullscreenchange`. `stopSkip`/`removePill` never touch it. A fading pill is removed when the feature is started again. | The covering controls. | `content.js:2061-2116` (`buildMutePill`), `:2444-2445` |
+| `video.duration === Infinity` | The live-stream signal at toggle-on (T-020). `NaN` (metadata not loaded) is **not** live. | A live stream gets the live status and no listeners. | — | `content.js:2450` |
 
 Other page-level contracts:
 
-- The panel host (`#tldw-host`) and the pill are appended to **`document.fullscreenElement || document.body`**, so they show in fullscreen too (`content.js:134-135`, `:261`, `:1757`). The toast goes to `document.body` (`content.js:775`).
+- The panel host (`#tldw-host`) and the pill are appended to **`document.fullscreenElement || document.body`**, so they show in fullscreen too (`content.js:148-149`, `:282`, `:3053`). The toast goes to `document.body` (`content.js:796`).
 - `window.__tldwInit` is the once-per-page guard (`content.js:6-7`).
-- `location.href` is the fallback URL for key moments (`content.js:1537`).
+- `location.href` is the fallback URL for key moments (`content.js:2833`).
 
 ### Watch-page URL recognition (worker)
 
@@ -991,19 +1119,19 @@ Other page-level contracts:
 
 ### Open, read, close: the transcript panel flow
 
-This is `collectPageTranscript` (`content.js:517-544`). It **always resolves**; it never throws.
+This is `collectPageTranscript` (`content.js:538-565`). It **always resolves**; it never throws.
 
-1. Read `pageMeta()` (`content.js:519`).
-2. If rows are already on the page, the viewer had the transcript open. Read it, and **leave it open** (`content.js:520`, `:534`).
-3. Otherwise, find `TRANSCRIPT_BUTTON`. If it isn't there, return `status: "no-transcript-button"` (`content.js:522-523`).
-4. Click it, then poll every `PANEL_POLL_MS` (200 ms), for up to `PANEL_WAIT_MS` (8,000 ms), until the first row appears (`content.js:526-530`).
-5. Wait until the row count stops growing, for up to `PANEL_SETTLE_MS` (5,000 ms) (`settledRows`, `content.js:503-513`, `:532`).
-6. Read the rows. If tldw opened the panel, close it with `#visibility-button button` (`restoreTranscriptPanel`, `content.js:548-554`).
-7. If there are no rows, return `panel-empty`. Otherwise return `ok-panel (N cues)` with `cues`. If anything throws, return `error-<name>` (`content.js:535-543`).
+1. Read `pageMeta()` (`content.js:540`).
+2. If rows are already on the page, the viewer had the transcript open. Read it, and **leave it open** (`content.js:541`, `:555`).
+3. Otherwise, find `TRANSCRIPT_BUTTON`. If it isn't there, return `status: "no-transcript-button"` (`content.js:543-544`).
+4. Click it, then poll every `PANEL_POLL_MS` (200 ms), for up to `PANEL_WAIT_MS` (8,000 ms), until the first row appears (`content.js:547-551`).
+5. Wait until the row count stops growing, for up to `PANEL_SETTLE_MS` (5,000 ms) (`settledRows`, `content.js:524-534`, `:553`).
+6. Read the rows. If tldw opened the panel, close it with `#visibility-button button` (`restoreTranscriptPanel`, `content.js:569-575`).
+7. If there are no rows, return `panel-empty`. Otherwise return `ok-panel (N cues)` with `cues`. If anything throws, return `error-<name>` (`content.js:556-564`).
 
 Invariants:
 
-- The flow runs **only after a cache miss** from `probeCache`, or on a refresh or an accepted transcription (`content.js:580-587`, `:655-656`).
+- The flow runs **only after a cache miss** from `probeCache`, or on a refresh or an accepted transcription (`content.js:601-608`, `:676-677`).
 - A page that tldw opened is always put back the way it was found.
 - `page_transcript_checks.js:95-98` rewrites the three timing constants by name (see "Source text tests depend on").
 
@@ -1019,78 +1147,83 @@ Facts that fall short of this invariant are recorded in the follow-ups at the en
 
 | Item | Behaviour | Invariant | Blast radius | Source |
 |---|---|---|---|---|
-| `Escape` | Closes the panel, under the `closeAction` policy. It calls `stopPropagation`, even when the key event did not come from the modal. | Works whenever the panel is mounted. | The way out of the panel. | `content.js:300` |
-| `Enter` | In the ask box (a `TEXTAREA` or `INPUT` in the modal), Enter without Shift calls `submitQuestion()`. It is handled in the window-capture `onKey`, because the shield stops the textarea's own `keydown` from ever running. | The chat input must not get a `keydown` handler of its own. Guarded by `render_checks.js:112-114`. | Sending questions. | `content.js:302-309` |
-| `Shift+Enter` | In the ask box: the default action, a newline. | — | Multi-line questions. | `content.js:308` |
-| `Tab` / `Shift+Tab` | Wraps focus between the first and last element matched by `button:not([hidden]):not([disabled]), select:not([disabled]), textarea:not([disabled]), audio` in the shadow root. **Never trapped while typing** in a text box. | Focus stays inside the modal. | Keyboard users. | `content.js:307-319` |
-| Capture-phase hotkey shield | `keydown` → `onKey`; `keyup` and `keypress` → `shieldKey`, all on **`window`, in the capture phase**. They are added in `mount()` and removed in `unmount()`. `fromModal()` uses `composedPath()`, falling back to `host.contains`, because shadow retargeting hides the real target. Only events from the modal are stopped. | Must stay on `window` in the capture phase: YouTube binds space and the arrow keys as capture listeners on `document`, and a window capture listener is the only one that runs earlier. | If the shield moves, a space typed in the ask box pauses the video. Guarded by `render_checks.js:84-114`. | `content.js:268-270`, `:274-294`, `:366-368` |
+| `Escape` | Closes the panel, under the `closeAction` policy. It calls `stopPropagation`, even when the key event did not come from the modal. | Works whenever the panel is mounted. | The way out of the panel. | `content.js:321` |
+| `Enter` | In the ask box (a `TEXTAREA` or `INPUT` in the modal), Enter without Shift calls `submitQuestion()`. It is handled in the window-capture `onKey`, because the shield stops the textarea's own `keydown` from ever running. | The chat input must not get a `keydown` handler of its own. Guarded by `render_checks.js:112-114`. | Sending questions. | `content.js:323-330` |
+| `Shift+Enter` | In the ask box: the default action, a newline. | — | Multi-line questions. | `content.js:329` |
+| `Tab` / `Shift+Tab` | Wraps focus between the first and last element matched by `button:not([hidden]):not([disabled]), select:not([disabled]), textarea:not([disabled]), audio` in the shadow root. **Never trapped while typing** in a text box. | Focus stays inside the modal. | Keyboard users. | `content.js:328-340` |
+| Capture-phase hotkey shield | `keydown` → `onKey`; `keyup` and `keypress` → `shieldKey`, all on **`window`, in the capture phase**. They are added in `mount()` and removed in `unmount()`. `fromModal()` uses `composedPath()`, falling back to `host.contains`, because shadow retargeting hides the real target. Only events from the modal are stopped. | Must stay on `window` in the capture phase: YouTube binds space and the arrow keys as capture listeners on `document`, and a window capture listener is the only one that runs earlier. | If the shield moves, a space typed in the ask box pauses the video. Guarded by `render_checks.js:84-114`. | `content.js:289-291`, `:295-315`, `:387-389` |
 
 ### Dialog semantics and focus
 
 | Item | Invariant | Blast radius | Source |
 |---|---|---|---|
-| `role="dialog"` | On `.panel`. | Screen readers announce the panel as a dialog. | `content.js:249` |
-| `aria-modal="true"` | On `.panel`. | — | `content.js:249` |
-| `aria-labelledby="tldw-h"` | Points at `<h1 id="tldw-h">TL;DW</h1>`, whose text becomes `TL;DW (cached)` for cached results. | The dialog's accessible name. | `content.js:249`, `:251`, `:930` |
-| Focus on open, and restored on close | `mount()` saves `document.activeElement` and focuses `.panel` (`tabindex="-1"`). `unmount()` restores focus to the saved element. | Keyboard users land in the panel and return to where they were. | `content.js:133`, `:249`, `:267`, `:372` |
-| Other focus moves | A new audio clip takes focus, but not when it is restored on re-open (`content.js:1881`). Opening the ask panel by click focuses the input (`content.js:1243`, `:1258`). | — | as cited |
-| `aria-expanded` | On `.asktoggle`, kept in sync with the ask panel. | — | `content.js:944`, `:1256`, `:1262` |
+| `role="dialog"` | On `.panel`. | Screen readers announce the panel as a dialog. | `content.js:270` |
+| `aria-modal="true"` | On `.panel`. | — | `content.js:270` |
+| `aria-labelledby="tldw-h"` | Points at `<h1 id="tldw-h">TL;DW</h1>`, whose text becomes `TL;DW (cached)` for cached results. | The dialog's accessible name. | `content.js:270`, `:272`, `:956` |
+| Focus on open, and restored on close | `mount()` saves `document.activeElement` and focuses `.panel` (`tabindex="-1"`). `unmount()` restores focus to the saved element. | Keyboard users land in the panel and return to where they were. | `content.js:147`, `:270`, `:288`, `:393` |
+| Other focus moves | A new audio clip takes focus, but not when it is restored on re-open (`content.js:3177`). Opening the ask panel by click focuses the input (`content.js:1270`, `:1285`). | — | as cited |
+| `aria-expanded` | On `.asktoggle`, kept in sync with the ask panel. | — | `content.js:970`, `:1283`, `:1289` |
 
 ### aria-live regions
 
 | Item | Element | Source |
 |---|---|---|
-| Transcription offer, Whisper not installed | `.status.err` with `role="status" aria-live="polite"` | `content.js:801` |
-| Transcription offer | `.status` with `role="status" aria-live="polite"` | `content.js:816` |
-| Audio and key-moments status | `.audiostatus` with `aria-live="polite"` | `content.js:867` |
-| Conversation log | `.asklog` with `role="log" aria-live="polite" aria-label="Conversation"` | `content.js:946` |
-| Ask status | `.askstatus` with `aria-live="polite"` | `content.js:952` |
-| Background toast | `#tldw-toast` with `role="status"` (implicitly polite) | `content.js:758` |
+| Transcription offer, Whisper not installed | `.status.err` with `role="status" aria-live="polite"` | `content.js:822` |
+| Transcription offer | `.status` with `role="status" aria-live="polite"` | `content.js:837` |
+| Audio and key-moments status | `.audiostatus` with `aria-live="polite"` | `content.js:889` |
+| Conversation log | `.asklog` with `role="log" aria-live="polite" aria-label="Conversation"` | `content.js:972` |
+| Ask status | `.askstatus` with `aria-live="polite"` | `content.js:978` |
+| Background toast | `#tldw-toast` with `role="status"` (implicitly polite) | `content.js:779` |
+| "Cover listed words" announcements, panel open | `.coverlive` (visually hidden) with `role="status" aria-live="polite"`; cleared, then filled 100 ms later | `content.js` `audioRowHtml`, `coverUi` |
+| "Cover listed words" announcements, panel closed | the mute pill's own visually hidden `role="status" aria-live="polite"` region, created **empty** and filled on a later tick. Each status is announced in one region only. | `content.js` `buildMutePill`, `say` |
 
 **Not live regions:**
 
-- the loading view's progress text, `content.js:676-681`;
-- the main error view, `showError`, `content.js:846`;
-- the partial-summary view, `content.js:886-892`;
-- the skip pill's label, `content.js:1745-1747`;
+- the loading view's progress text, `content.js:697-702`;
+- the main error view, `showError`, `content.js:867`;
+- the partial-summary view, `content.js:912-918`;
+- the skip pill's label, `content.js:3041-3043`;
+- the "Cover listed words" status line `.coverstatus` and the mute pill's label (T-020);
 - the Options page's `#status` and `#previewStatus`, `options.html:77-78`.
 
 ### Accessible names for icon and control buttons
 
 | Item | Visible text | Accessible name | Source |
 |---|---|---|---|
-| `.close` | `✕` | `aria-label="Close"` | `content.js:255` |
-| `.regen` | `↻` | **No `aria-label`; only `title`** ("Summarize again, ignoring the cached summary (keeps the transcript)") | `content.js:253` |
-| `.copy` | `Copy` / `Copied` | its text | `content.js:254`, `:969` |
-| `.stoptx` | `⏹ Stop transcribing` | `aria-label="Stop transcribing this video's audio"` (guarded by `render_checks.js:401-402`) | `content.js:692-694` |
-| `.transcribe` | `Transcribe the audio` | `aria-label="Transcribe this video's audio locally"` | `content.js:824` |
-| `.playkey` | `⏭ Play key moments` | `aria-label="Play just the key moments in the YouTube player"` | `content.js:856` |
-| `.listen` | `🔊 Listen to summary`, `⏹ Stop` or `🔊 Regenerate` | `aria-label="Generate spoken audio of this summary"`, or `"Stop generating audio and choose a different voice"` while generating | `content.js:857`, `:1020-1024` |
-| `.voice` (select) | — | `aria-label="Voice"` | `content.js:858` |
-| `.vpreview` | `▶ Preview` / `…` | `aria-label="Preview the selected voice"` | `content.js:859-860` |
-| `.circ` (progress ring) | — | `aria-hidden="true"` | `content.js:863` |
-| `audio` (player) | — | `aria-label="Spoken summary"` | `content.js:1863` |
-| `.dl` | `⬇` | `aria-label="Download this summary as an mp3"` | `content.js:1869-1870` |
-| `.asktoggle` | `💬 Ask about this video` / `💬 Hide questions` | its text | `content.js:944`, `:1257`, `:1263` |
-| `.askinput` (textarea) | — | `aria-label="Ask a question about this video"` | `content.js:948` |
-| `.asksend` | `Send` / `⏹ Stop` | its text | `content.js:950`, `:1400` |
-| `.ts` (citation link) | `12:34`-style label | its text, plus `title="Jump to … in the video"`, `role="button"`, `tabindex="0"` | `content.js:1289-1290` |
-| `.sdismiss` | `No thanks — don't ask again` | its text | `content.js:1207` |
-| Pill previous | `‹` | `aria-label="Previous key moment"` | `content.js:1743` |
-| Pill next | `›` | `aria-label="Next key moment"` | `content.js:1748` |
-| Pill stop | `✕` | `aria-label="Stop skipping"` | `content.js:1750` |
+| `.close` | `✕` | `aria-label="Close"` | `content.js:276` |
+| `.regen` | `↻` | **No `aria-label`; only `title`** ("Summarize again, ignoring the cached summary (keeps the transcript)") | `content.js:274` |
+| `.copy` | `Copy` / `Copied` | its text | `content.js:275`, `:995` |
+| `.stoptx` | `⏹ Stop transcribing` | `aria-label="Stop transcribing this video's audio"` (guarded by `render_checks.js:401-402`) | `content.js:713-715` |
+| `.transcribe` | `Transcribe the audio` | `aria-label="Transcribe this video's audio locally"` | `content.js:845` |
+| `.playkey` | `⏭ Play key moments` | `aria-label="Play just the key moments in the YouTube player"` | `content.js:877` |
+| `.listen` | `🔊 Listen to summary`, `⏹ Stop` or `🔊 Regenerate` | `aria-label="Generate spoken audio of this summary"`, or `"Stop generating audio and choose a different voice"` while generating | `content.js:878`, `:1047-1051` |
+| `.voice` (select) | — | `aria-label="Voice"` | `content.js:880` |
+| `.vpreview` | `▶ Preview` / `…` | `aria-label="Preview the selected voice"` | `content.js:881-882` |
+| `.circ` (progress ring) | — | `aria-hidden="true"` | `content.js:885` |
+| `audio` (player) | — | `aria-label="Spoken summary"` | `content.js:3159` |
+| `.dl` | `⬇` | `aria-label="Download this summary as an mp3"` | `content.js:3165-3166` |
+| `.asktoggle` | `💬 Ask about this video` / `💬 Hide questions` | its text | `content.js:970`, `:1284`, `:1290` |
+| `.askinput` (textarea) | — | `aria-label="Ask a question about this video"` | `content.js:974` |
+| `.asksend` | `Send` / `⏹ Stop` | its text | `content.js:976`, `:1427` |
+| `.ts` (citation link) | `12:34`-style label | its text, plus `title="Jump to … in the video"`, `role="button"`, `tabindex="0"` | `content.js:1316-1317` |
+| `.sdismiss` | `No thanks — don't ask again` | its text | `content.js:1234` |
+| Pill previous | `‹` | `aria-label="Previous key moment"` | `content.js:3039` |
+| Pill next | `›` | `aria-label="Next key moment"` | `content.js:3044` |
+| Pill stop | `✕` | `aria-label="Stop skipping"` | `content.js:3046` |
+| `.covertoggle` (T-020) | `Cover listed words`, with a `✓ ` before it while pressed (CSS, in an `aria-hidden` span, so the state isn't shown by colour alone) | its text; `aria-pressed="true"/"false"`. While the captions are read it is `aria-disabled="true"` (not `disabled`, so it keeps focus) and `.coverwrap` is `aria-busy`; a second press stops the session | `content.js` `audioRowHtml`, `coverUi` |
+| Mute pill Stop (T-020) | `Stop` | `aria-label` `Stop bleeping`, `Stop muting` or `Stop mooing`; a real `<button type="button">` at least 44×44 px with a visible focus ring, in the pill's own shadow root. Pressing it moves focus to `#movie_player`, puts the "off" status in the pill's live region, and removes the pill 1,000 ms later | `content.js` `buildMutePill`, `stop` |
 | Options `#preview` | `▶ Preview` | its text, plus `title`; every Options input and select has a `<label for>` | `options.html:29-72`, `:36` |
 
 ### Gaps against the baseline, found by reading the code
 
 None of these has been checked in a browser.
 
-- `.regen` (`↻`) has a `title` but no `aria-label` (`content.js:253`).
-- `.ts` citation links take keyboard focus (`tabindex="0"`, `role="button"`), but they have no `href` and no key handler. Only a mouse `click` on `.asklog` seeks (`content.js:1249-1252`). So, as the code reads, Enter or Space on a citation does nothing.
-- **The Tab trap's selector can pick an unfocusable last element.** `:not([hidden])` tests only the element itself. While `.askpanel` is `hidden` (`content.js:945`), `.askinput` and `.asksend` still match, so `last` is `.asksend`, which can't take focus. Tab from the real last control is then not wrapped (`content.js:312-318`).
+- `.regen` (`↻`) has a `title` but no `aria-label` (`content.js:274`).
+- `.ts` citation links take keyboard focus (`tabindex="0"`, `role="button"`), but they have no `href` and no key handler. Only a mouse `click` on `.asklog` seeks (`content.js:1276-1279`). So, as the code reads, Enter or Space on a citation does nothing.
+- **The Tab trap's selector can pick an unfocusable last element.** `:not([hidden])` tests only the element itself. While `.askpanel` is `hidden` (`content.js:971`), `.askinput` and `.asksend` still match, so `last` is `.asksend`, which can't take focus. Tab from the real last control is then not wrapped (`content.js:333-339`).
 - The Tab trap's selector has no `a`, so links (`original`, `.ts`, the sponsor link) never count as first or last.
-- The panel itself takes focus on open (`tabindex="-1"`, `content.js:267`) but is not `first`, so Shift+Tab from the panel leaves the modal (`content.js:317`).
-- The skip pill's buttons use `all:unset` (`content.js:1738`), which removes the focus ring: they can be reached by keyboard but show no visible focus.
+- The panel itself takes focus on open (`tabindex="-1"`, `content.js:288`) but is not `first`, so Shift+Tab from the panel leaves the modal (`content.js:338`).
+- The skip pill's buttons use `all:unset` (`content.js:3034`), which removes the focus ring: they can be reached by keyboard but show no visible focus.
 - The main error view and the loading progress are not live regions (see above).
 
 ## Source text tests depend on
@@ -1138,6 +1271,12 @@ The driver is `tests/test_extension_render.py`. It runs `node --check` on all th
 | `function httpError(status, detail)` → `\n}\n` | `background.js` | The signature must stay exact, and the function must end with a `}` alone on its line. | The `429` pass-through test. | `probe_checks.js:194-203` |
 | `function speakError(status, detail)` → `\n}\n` | `background.js` | The same. | The same. | `probe_checks.js:194-203` |
 | `function askError(status, detail)` → `\n}\n` | `background.js` | The same. | The same. | `probe_checks.js:194-203` |
+| `// --- T-020 cover listed words: pure logic (BEGIN)` → `// --- T-020 cover listed words: pure logic (END)` | `content.js` | Pure: no DOM, no `api`, no timers. Run in a `vm` with `mute_words.js` loaded first. | `tests/js/mute_checks.js` (9 groups, floors in `test_extension_render.py`). | `mute_checks.js:12-24` |
+| `// --- T-020 cover listed words: pure logic (BEGIN)` → `// --- T-020 cover listed words: wiring (END)` | `content.js` | The wiring takes everything it touches through `deps`; the block between the two must stay self-contained. | `tests/js/mute_wiring_checks.js` (10 groups). | `mute_wiring_checks.js:12-26` |
+| `// --- T-020 cover listed words: wiring (BEGIN)` | `content.js` | Must exist (the harness checks all three markers before slicing) and sit between the pure block's END and the wiring's END. | The same harness. | `mute_wiring_checks.js:15-17` |
+| `// T-020 status text: BEGIN` → `// T-020 status text: END` | `content.js` | One `key: "text",` per line. | The verbatim-strings check in `tests/test_docs_contracts.py`. | `tests/test_docs_contracts.py` `status_strings` |
+| `# T-020 align text: BEGIN` → `# T-020 align text: END` | `align.py` | Plain string constants only. | The verbatim-strings check and `test_no_panel_text_carries_backticks`. | `tests/test_align.py` |
+| `const ALIGN_TIMEOUT_MS` → `const PROBE_TIMEOUT_MS` | `background.js` | `handleAlign` must sit between them. | `tests/js/align_bg_checks.js`. | `align_bg_checks.js:9-11` |
 | `const MODELS = [` | `background.js`, `options.js` | Matched by `re.search(r"const MODELS = \[([^\]]*)\]", src)`. The list's quoted strings must equal `claude_client.MODELS`. | `test_extension_model_lists_match_the_server_allowlist`. | `tests/test_claude_client.py:284-294` |
 
 ### Literal source patterns the checks match
@@ -1169,10 +1308,10 @@ The server refuses anything outside its own list, so a list in the extension tha
 |---|---|---|---|---|---|
 | `MODELS` | `background.js:13`, `options.js:9`; **also the hard-coded `<option>` values in `options.html:40-43`** | `claude_client.MODELS`, `src/youtube_tldw/claude_client.py:164` | **Yes** for `background.js` and `options.js`, by `tests/test_claude_client.py:284-294`. **No** for `options.html`. | The three JS-visible lists hold the same names. | A model missing from the server gets a `400`. A model missing from `options.html` can't be picked. |
 | `WHISPER_POLICIES` | `background.js:15`, `options.js:7`; **also the `<option>` values in `options.html:59-61`** | `WHISPER_POLICIES`, `src/youtube_tldw/server.py:66` | **Partly.** `render_checks.js:422-432` checks that worker and Options agree. **Nothing checks them against the server**, and nothing checks `options.html`. | The same three values everywhere. | A drifted value gets a `400` from the server, or falls back to `"ask"` on the client. |
-| `VOICE_OPTIONS` | `content.js:78-92` (the panel's voice picker; it never asks the server) | `audio.VOICES`, `src/youtube_tldw/audio.py:44-58` (served by `/voices`, `audio.py:73-74`) | **No.** | Ids and labels match `audio.VOICES`. They match today: the same 13 ids and labels, in order. A voice added on the server **never appears in the panel**. | The panel's voice list. An id the server doesn't know gets "Unknown voice". |
+| `VOICE_OPTIONS` | `content.js:92-106` (the panel's voice picker; it never asks the server) | `audio.VOICES`, `src/youtube_tldw/audio.py:44-58` (served by `/voices`, `audio.py:73-74`) | **No.** | Ids and labels match `audio.VOICES`. They match today: the same 13 ids and labels, in order. A voice added on the server **never appears in the panel**. | The panel's voice list. An id the server doesn't know gets "Unknown voice". |
 | `VOICE_FALLBACK` | `options.js:12-26` (used only when `/voices` fails) | `audio.VOICES` | **No.** | The same as above. They match today. | The Options voice list when offline. |
 | `RATIOS` | `options.js:8`, and the `<option>` values in `options.html:49-52` | none (the worker sends any 0 < r ≤ 1, `background.js:51`) | **No.** | `options.js` and `options.html` list the same values. | A value missing from `RATIOS` is saved as `"auto"`. |
-| `sanitizeField` | `content.js:1813-1825` (the mp3 download name) | `naming.sanitize_field` (per the comment at `content.js:1813-1815`) | **Partly**: `render_checks.js:187-211` checks fixed expected outputs, not the server function. | The same file name as the server's own naming. | The names of downloaded files. |
+| `sanitizeField` | `content.js:3109-3126` (the mp3 download name) | `naming.sanitize_field` (per the comment at `content.js:3109-3111`) | **Partly**: `render_checks.js:187-211` checks fixed expected outputs, not the server function. | The same file name as the server's own naming. | The names of downloaded files. |
 
 ## Data stores
 
@@ -1198,6 +1337,7 @@ Every home-relative path below is a module constant evaluated at import time. `t
 | Temp dir `youtube-tldw-` | `tempfile.mkdtemp` in the CLI run (`cli.py:288`) | Holds the subtitle files, downloaded video or audio, clips and render intermediates for one CLI run; removed in `finally` (`cli.py:294-295`). Not matched by the startup sweep's glob, so a run killed before its `finally` leaves it behind. | Disk only. | `cli.py:288-295` |
 | Temp dir `youtube-tldw-tx-` | `tempfile.mkdtemp` in `core.fetch_transcript` (`core.py:65`) | Holds a yt-dlp subtitle download for one transcript fetch; removed in `finally` (`core.py:86-87`). Not swept at startup either. | Disk only. | `core.py:65-87` |
 | Temp dir `youtube-tldw-audio-` · `AUDIO_TMP_PREFIX` | `tempfile.mkdtemp` in the transcription thread (`server.py:236`) | Holds one video's downloaded audio for Whisper (capped by `--max-filesize`, `whisper_transcribe.py:85`, `whisper_transcribe.py:127`); removed in `finally` (`server.py:282`). Anything older than `_stale_audio_age()` (at least 6 hours, `server.py:77-86`) is swept at `tldw serve` start and by `tldw cache clean`, by age, never by "no server running" (`hygiene.py:83-111`). | A second `tldw serve` on another port must not lose a live job's download, which is why the rule is age only. | `hygiene.py:27`, `server.py:236` |
+| `~/.cache/youtube-tldw/align/` · `ALIGN_DIR` (store 13, "Alignment cache", T-020) | `align.put_window` from `_run_align` → `align.get_window` from `_run_align`; `tldw cache` reports it as "word timings" and `tldw cache clean` removes expired entries, the cleanable areas chosen **by name** (`cli.py:391-399`) | One file per window, `<video_id>-<16 hex>.json`, named from `align.cache_key`: `video_id\|start_ms\|end_ms\|whisper_model\|lang=auto\|ALIGN_FINGERPRINT`. The fingerprint (lazy, memoised; none when a library version can't be read) covers every input that shapes the result; the composition is owned by `data-model.md` § 13. **The word list is not in the key**: matching happens in the browser. Holds `saved_at`, `video_id`, `start_ms`, `end_ms` and `words` (`[[s, e, w], …]`, absolute ms). **Validated on read**: anything off, including a mismatched video or window, is a miss. TTL 14 days (`TTL_SECONDS`); its own cap `ALIGN_MAX_ENTRIES` (5,000), pruned once per request by `txcache._prune(…, cap=…)`. Atomic `.tmp` then `replace`. | `/align/stream`: a hit means no YouTube call and no CPU. A key change re-times every window once. | `align.py:28`, `align.py:143-239` |
 | `*.tmp` in the three cache directories | `txcache.put*` writes `<name>.tmp`, then `replace`s it onto `<name>.json` (`txcache.py:84-86`, `txcache.py:124-127`, `txcache.py:158-161`) | `.tmp` is reserved for in-flight writes. Pruning counts only `*.json` (`txcache.py:97`). `tldw cache clean` deletes a `.tmp` older than 1 hour (`STRAY_TMP_AGE_S`, `hygiene.py:28`, `hygiene.py:208-211`). The temp name is per key, not per writer, so two concurrent writes of the same key share one `.tmp`. | Readers never see a half-written `.json`; a race between two writers costs at most a miss. | `txcache.py:84-86` |
 
 ### On-disk stores tldw only reads
@@ -1235,7 +1375,7 @@ All server registries live in the `tldw serve` process, are shared by the per-re
 | `videomode._filter_cache` | ffmpeg filter name → bool | Process lifetime | One `ffmpeg -filters` probe per name. | CLI caption style. | `videomode.py:27-39` |
 | `_claude_slots`, `_speech_slots`, `_tx_permit` | Counted pools (6 claude, 2 speech, 1 transcription) | Process lifetime | Counts are recorded in the concurrency section (Backend). | Every slot-taking route. | `server.py:556-651`, `server.py:65` |
 | `usage._local`, `claude_client._local` | Thread-local current interaction / pinned model | Per thread | A new thread must re-enter both scopes itself, which is why the prefetch thread does (`server.py:499-501`). | Usage attribution, cache keys built from `backend_fingerprint()` (`server.py:385-388`). | `usage.py:28`, `claude_client.py:165` |
-| Extension `cache`, `audioCache`, `previewCache` (background); `previewCache` (options) | video id → summary payload; `videoId|voice` → `data:` URL; voice → `data:` URL / object URL | No TTL, no cap, no delete; live until the service worker or page goes away | The summary map is keyed by video id only, not model or ratio, so it serves its copy until a `refresh` (`background.js:131`). Detail is Frontend's. | The panel's instant re-open. | `background.js:25-26`, `background.js:449`, `options.js:81` |
+| Extension `cache`, `audioCache`, `previewCache` (background); `previewCache` (options) | video id → summary payload; `videoId|voice` → `data:` URL; voice → `data:` URL / object URL | No TTL, no cap, no delete; live until the service worker or page goes away | The summary map is keyed by video id only, not model or ratio, so it serves its copy until a `refresh` (`background.js:205`). Detail is Frontend's. | The panel's instant re-open. | `background.js:25-26`, `background.js:523`, `options.js:81` |
 
 ## Environment variables
 
@@ -1292,7 +1432,7 @@ Every subprocess goes through `proc.run` or `proc.stream_filter` (argv list, `sh
 
 | Library call | What, where | Timeout | Failure expectation | Invariant | Blast radius |
 |---|---|---|---|---|---|
-| `WhisperModel` (faster-whisper) | Loads, and on first use downloads, the model into `~/.cache/youtube-tldw/whisper/` from Hugging Face (`whisper_transcribe.py:195-210`) | `HF_HUB_DOWNLOAD_TIMEOUT` (60s default) per request; the job deadline covers transcription, not the download (`whisper_transcribe.py:195-198`) | An `ImportError` is reported with the reinstall hint (`server.py:267-273`); other errors fail the job | CPU only, int8, half the cores (`whisper_transcribe.py:201-210`) | Captionless videos |
+| `WhisperModel` (faster-whisper) | Built only in `_load_model` (`whisper_transcribe.py:184-213`), which `transcribe` and `/align/stream` both call. It loads, and for a transcription on first use downloads, the model into `~/.cache/youtube-tldw/whisper/` from Hugging Face. `/align/stream` passes `local_only=True` (`local_files_only=True`), and `model_on_disk` asks `download_model(…, local_files_only=True)`, so word timing **never** downloads a model (T-020) | `HF_HUB_DOWNLOAD_TIMEOUT` (60s default) per request; the job deadline covers transcription, not the download (`whisper_transcribe.py:195-198`) | An `ImportError` is reported with the reinstall hint (`server.py:267-273`); other errors fail the job | CPU only, int8, half the cores (`whisper_transcribe.py:201-210`) | Captionless videos |
 | `piper.PiperVoice` | Local synthesis; no network | Covered by the ffmpeg encoder's timeout | Unusable native phonemizer → a clear `TldrError` (`audio.py:187-216`) | — | Speech routes |
 
 ### Outbound network not via a subprocess
@@ -1377,7 +1517,7 @@ Each part was drafted from the code by its owning agent and re-checked by `tests
 
 - **Routes.** Read `server.py` end to end. Every route literal was found by reading `do_GET`, `do_POST`, the tuple, the dispatch, `_body_limit`, `do_OPTIONS` and `_cors_headers`. Each was matched to a `fetch(` call in `extension/background.js` and `extension/options.js`. `git grep '"/summarize"'` and `git grep '"/speak"'` outside `tests/`, `docs/reviews/` and `tasks/` found no caller of the buffered routes.
 - **Body keys, event types and payload keys.** Extracted with `grep -o 'body.get("…")'`, `'"type": "…"'` and `page.get(` over `server.py`, then reconciled against `_to_payload`, `_run_*` and the `ev.type ===` branches in `background.js`.
-- **Error strings.** Read every `_send_json(` and `emit({"type": "error"` in `server.py`. Every `raise …Error(` in `urls.py`, `metadata.py`, `transcript.py`, `core.py`, `summarize.py`, `spans.py`, `claude_client.py`, `proc.py`, `audio.py`, `whisper_transcribe.py` and `timing.py` was read and traced to the routes that reach it. The mappers were read in `background.js:440-447`, `:491-497`, `:571-581` and `options.js:102-108`.
+- **Error strings.** Read every `_send_json(` and `emit({"type": "error"` in `server.py`. Every `raise …Error(` in `urls.py`, `metadata.py`, `transcript.py`, `core.py`, `summarize.py`, `spans.py`, `claude_client.py`, `proc.py`, `audio.py`, `whisper_transcribe.py` and `timing.py` was read and traced to the routes that reach it. The mappers were read in `background.js:514-521`, `:565-571`, `:645-655` and `options.js:102-108`.
 - **Behaviour.** Confirmed against `tests/test_server.py` (fixtures, the status mapping, body caps at `:151-174`, the per-route pool matrix at `:2509-2540`, preflight at `:186` and `:792`) and `tests/test_cli.py` (exit codes at `:238`, `:251`, `:332`).
 - **Live probe.** A throwaway script in the scratchpad ran `server._Server` on loopback port 0, with `HOME` and `TMPDIR` pointed at a temp dir and no model calls. It observed:
   - `501` HTML with no CORS for `PUT`, `HEAD` and `DELETE`;
@@ -1402,7 +1542,7 @@ Each part was drafted from the code by its owning agent and re-checked by `tests
 - **Read in full:** `extension/background.js`, `content.js`, `options.js`, `options.html`, `manifest.json`, `manifest.firefox.json`, `build-firefox.sh`; `tests/js/render_checks.js`, `page_transcript_checks.js`, `probe_checks.js`; `tests/test_extension_render.py`; and the MODELS test in `tests/test_claude_client.py:284-294`.
 - **Messages:** enumerated by reading every `postMessage`, `safePost`, `send(` and `.type ===` in `extension/`. Each sender was cross-checked against its handler by line, in both directions.
 - **NDJSON fields:** taken from the `ev.` reads in the four stream loops.
-- **Storage keys:** taken from both `DEFAULTS` objects and every `storage.local.get`/`set` literal, including the shorthand object at `options.js:137-138`.
+- **Storage keys:** taken from both `DEFAULTS` objects and every `storage.local.get`/`set` literal, including the shorthand object at `options.js:176-177`.
 - **Selectors:** listed with `grep -noE '…\.(querySelector|querySelectorAll|getElementById|closest)\(…\)'`, with the `root`/`c`/`box` receivers dropped, plus every `attr(`/`text(` call in `pageMeta`.
 - **Test markers:** listed with `grep -nE 'grab\(|between\(|indexOf\("'` over `tests/js/*.js`, then read in context.
 - **Voice lists:** compared programmatically with `audio.VOICES`. All 13 ids and labels match, in order.
@@ -1437,6 +1577,7 @@ Any change to an entry above updates this file **in the same PR** (`AGENTS.md` �
 - A signature in the "Public module entry points" table changes.
 - `extension/background.js` changes `httpError`, `askError`, `speakError` or a `fetch(` call; `extension/options.js` changes a `fetch(` call.
 - `pyproject.toml` changes `[project.scripts]`.
+- `_run_align`'s check order, a `reason`, an `ALIGN_*` constant, or any text between the `# T-020 align text` markers in `align.py` changes.
 
 ### Extension (message protocol, user-facing text, storage, manifests, page contract, accessibility)
 
@@ -1444,6 +1585,7 @@ Any change to an entry above updates this file **in the same PR** (`AGENTS.md` �
 - `extension/content.js` changes: any `runtime.connect`/`postMessage`, the port `onMessage` listeners, `runtime.onMessage`, `storage.local` or `storage.onChanged`, `SEGMENT_ROWS`/`PANEL`/`TRANSCRIPT_BUTTON`, `pageMeta`, `collectPageTranscript`, `restoreTranscriptPanel`, the `video` lookups, `showError`, `trimmedNote`/`refreshTrimmedNote`, `showResult`'s heading, `mount`/`onKey`/`shieldKey`/`fromModal`/`unmount`, any `aria-*` or `role` attribute, `VOICE_OPTIONS`, or `sanitizeField`.
 - `extension/options.js` or `options.html` changes, especially `DEFAULTS`, a list, a `fetch`, the `storage.local.set` object, or an `<option>` value.
 - `extension/manifest.json`, `manifest.firefox.json` or `build-firefox.sh` changes, or a file is added to `extension/`.
+- `extension/content.js`'s "T-020 cover listed words" blocks change: a status between the `// T-020 status text` markers, a listener, a page selector, the pill, or the panel toggle; or `extension/mute_words.js` or the injected-files list changes.
 - `tests/js/*.js` or `tests/test_extension_render.py` adds, moves or rewords a marker or source pattern; or `tests/test_claude_client.py`'s MODELS regex changes.
 - On the server: `claude_client.MODELS`, `server.WHISPER_POLICIES`, `audio.VOICES`, `_page_transcript`, the `result` event's keys, any NDJSON event's fields, the Origin allowlist (`_origin_allowed`), or the default port changes.
 
@@ -1453,7 +1595,7 @@ Any change to an entry above updates this file **in the same PR** (`AGENTS.md` �
 - Any `Path.home()`, `mkdtemp(prefix=…)`, `os.environ` / `getenv` or `config.get` is added or removed anywhere in `src/youtube_tldw/`.
 - `_summary_key`, `_seg_key`, `_seg_file`, `_to_payload`, `load_or_create_token`, `startup_hygiene`, `_stale_audio_age`, or any module-level registry in `server.py` changes.
 - `claude_client._claude_argv`, `_LEAN`, `_claude_process_opts`, `_backend`, `_stream_deltas`, `_extract_result_text`, or `usage.parse_usage` changes; or `summarize.py`'s validators or line formats.
-- `audio.VOICES`, `VOICE_DIR`, `ensure_voice`, `whisper_transcribe._CACHE_DIR` / `download_audio` / `transcribe`, `metadata.py`'s yt-dlp argv, `COOKIE_BROWSERS`, `_CAPTION_HOSTS` or `MAX_CAPTION_BYTES` changes.
+- `audio.VOICES`, `VOICE_DIR`, `ensure_voice`, `whisper_transcribe._CACHE_DIR` / `download_audio` / `transcribe` / `_load_model` / `model_on_disk`, `align.py` (the store, the key, the fingerprint), `metadata.py`'s yt-dlp argv, `COOKIE_BROWSERS`, `_CAPTION_HOSTS` or `MAX_CAPTION_BYTES` changes.
 - `cli._run_config` (the `keymap` or `_check`), `_run_cache`, `_run_usage` or `_default_output_dir` changes.
 - `tests/conftest.py` `HOME_PATHS` or the registry list changes.
 
@@ -1468,18 +1610,18 @@ Each is a fact, recorded with no code changed. Each is tracked in the `proposed`
 1. **`UNKNOWN — needs human confirmation`:** does a custom `serverUrl` (another port, or `localhost`) work from the worker and from Options, given `host_permissions` of `http://127.0.0.1:8765/*` and the server's `chrome-extension://`-only CORS? It needs a browser, so it can't be settled in this docs pass. `deployment.md` § 11 records the server side as measured (a non-default port serves, and answers a `chrome-extension://` preflight) and leaves the extension side `UNKNOWN`. → [T-015](../tasks/T-015.md)
 2. `options.js:30` `fillVoices` puts `/voices` data into `innerHTML` without escaping it. → [T-006](../tasks/T-006.md)
 3. The mirrored lists have no test against the server: `WHISPER_POLICIES` (against `server.py:66`), `VOICE_OPTIONS` and `VOICE_FALLBACK` (against `audio.VOICES`), and the `<option>` values in `options.html` for models, policies and ratios. → [T-010](../tasks/T-010.md) and [T-018](../tasks/T-018.md)
-4. The panel's voice picker never asks `/voices`, so a voice added on the server can't be chosen in the panel (`content.js:1005`). → [T-014](../tasks/T-014.md)
-5. "Names a next step" is not met by: `httpError` `422` and the fallback; `askError` `413`, `422` and the fallback; `speakError` `503` and the fallback; the preview timeout (`background.js:484`); `No key moments found.`; `Couldn't find the YouTube player to control.` → [T-008](../tasks/T-008.md)
-6. `httpError` `504` says "Summarizing timed out" when key moments time out (`background.js:579`, used at `:519` and `:549`). → [T-008](../tasks/T-008.md)
+4. The panel's voice picker never asks `/voices`, so a voice added on the server can't be chosen in the panel (`content.js:1032`). → [T-014](../tasks/T-014.md)
+5. "Names a next step" is not met by: `httpError` `422` and the fallback; `askError` `413`, `422` and the fallback; `speakError` `503` and the fallback; the preview timeout (`background.js:558`); `No key moments found.`; `Couldn't find the YouTube player to control.` → [T-008](../tasks/T-008.md)
+6. `httpError` `504` says "Summarizing timed out" when key moments time out (`background.js:653`, used at `:593` and `:623`). → [T-008](../tasks/T-008.md)
 7. Backtick spans show as raw backticks outside `showError` (in the audio, ask, toast and Options surfaces). The no-token and `502` messages contain them. → [T-008](../tasks/T-008.md)
-8. Accessibility: `.regen` has no `aria-label`; `.ts` citation links can't be activated from the keyboard; the Tab trap's last element can be unfocusable while the ask panel is hidden; the trap leaves out links; the main error and progress views aren't live regions; Shift+Tab from the focused panel leaves the modal; the skip pill's buttons show no focus ring (`all:unset`, `content.js:1738`). All found by reading the code; none checked in a browser. → [T-009](../tasks/T-009.md)
+8. Accessibility: `.regen` has no `aria-label`; `.ts` citation links can't be activated from the keyboard; the Tab trap's last element can be unfocusable while the ask panel is hidden; the trap leaves out links; the main error and progress views aren't live regions; Shift+Tab from the focused panel leaves the modal; the skip pill's buttons show no focus ring (`all:unset`, `content.js:3034`). All found by reading the code; none checked in a browser. → [T-009](../tasks/T-009.md)
 9. Tests: the bare `src.indexOf()` slices in `render_checks.js` (`:136-137`, `:155-156`, `:165-166`, `:176-177`, `:234-235`, `:247-248`, `:274-275`, `:284-285`, `:314-315`, `:323-324`) don't fail when a marker is missing, so an "absent" check can pass without testing anything. Renaming the `PANEL_*_MS` constants silently disables the speed-up rewrite in `page_transcript_checks.js:96-98`. → [T-010](../tasks/T-010.md)
-10. Panel and worker timeouts tie for ask (300,000 ms) and key moments (320,000 ms), so which message the user sees depends on timing. With `whisper: "always"`, the panel's 160,000 ms summarize timer fires before the worker's 2,400,000 ms budget (`background.js:144-145`, `content.js:670`). The preview port has no panel timer at all (`content.js:1421-1438`). → [T-008](../tasks/T-008.md)
+10. Panel and worker timeouts tie for ask (300,000 ms) and key moments (320,000 ms), so which message the user sees depends on timing. With `whisper: "always"`, the panel's 160,000 ms summarize timer fires before the worker's 2,400,000 ms budget (`background.js:218-219`, `content.js:691`). The preview port has no panel timer at all (`content.js:1448-1465`). → [T-008](../tasks/T-008.md)
 11. `videoIdFromUrl` accepts any hostname that **ends with** `youtube.com` (`background.js:31`), and `content.js` is injected into whatever tab was clicked before that check runs (`background.js:61-62`). Raised for the Architect to assess. → [T-005](../tasks/T-005.md)
 12. The token is kept in plain text in `chrome.storage.local`, and it is sent to whatever `serverUrl` holds (cross-reference `architecture.md`). → [T-004](../tasks/T-004.md)
 13. The worker's `DEFAULTS.voice` is read but never used (`background.js:10`, `:47-51`). The worker's `DEFAULTS` has no `closeAction`, unlike `options.js`. → [T-014](../tasks/T-014.md)
 14. No test covers `build-firefox.sh`'s copy list or the version being equal across the manifests. → [T-010](../tasks/T-010.md)
-15. The worker's `cache`, `audioCache` and `previewCache` maps have no eviction (`background.js:25-26`, `:449`). → [T-014](../tasks/T-014.md)
+15. The worker's `cache`, `audioCache` and `previewCache` maps have no eviction (`background.js:25-26`, `:523`). → [T-014](../tasks/T-014.md)
 
 ### Data, configuration and integrations
 

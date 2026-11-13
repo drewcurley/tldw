@@ -58,7 +58,7 @@ function send(tabId, msg) {
 api.action.onClicked.addListener(async (tab) => {
   if (!tab.id) return;
   const videoId = tab.url && videoIdFromUrl(tab.url);
-  await api.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+  await api.scripting.executeScript({ target: { tabId: tab.id }, files: ["mute_words.js", "content.js"] });
   if (!videoId) {
     send(tab.id, { type: "TLDW_ERROR",
       error: "Open a YouTube video (a /watch page) first, then click TL;DW." });
@@ -78,9 +78,83 @@ api.runtime.onConnect.addListener((port) => {
     else if (msg.type === "preview") handlePreview(port, msg);
     else if (msg.type === "ask") handleAsk(port, msg);
     else if (msg.type === "stopTranscribe") handleStopTranscribe(msg);
+    else if (msg.type === "align") handleAlign(port, msg);
     // "ping" is ignored; receiving it just keeps the worker alive
   });
 });
+
+// "Cover listed words" (T-020): word timing over short windows. The panel's mute
+// session owns its own port, so closing the panel doesn't drop this request; a
+// port disconnect aborts the fetch. Every failure is one alignError carrying a
+// `reason` the panel picks its message by -- the server's own, or one of ours
+// (token, unreachable, timeout, other).
+const ALIGN_TIMEOUT_MS = 660_000;     // the server's 600 s budget plus a minute
+
+async function handleAlign(port, msg) {
+  const fail = (status, reason, error, installHint) =>
+    safePost(port, { type: "alignError", status, reason, error: error || "",
+                     installHint: installHint || "" });
+  // Listen for the page going away before the first await (rev 5.6): a live
+  // word-list change ends this port fast, and a fetch started after that would
+  // hold the server's one alignment slot for nothing.
+  const ctrl = new AbortController();
+  let gone = false;
+  try { port.onDisconnect.addListener(() => { gone = true; ctrl.abort(); }); } catch (_) {}
+  const { serverUrl, token, whisper } = await getSettings();
+  if (gone) return;
+  if (!token) { fail(0, "token", ""); return; }
+  const timer = setTimeout(() => ctrl.abort(), ALIGN_TIMEOUT_MS);
+  let gotTerminal = false;
+  try {
+    const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/align/stream", {
+      method: "POST", signal: ctrl.signal,
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({ url: msg.url, whisper, windows: msg.windows }),
+    });
+    if (!resp.ok) {
+      let body = {};
+      try { body = (await resp.json()) || {}; } catch (_) {}
+      fail(resp.status, body.reason || null, body.error, body.install_hint);
+      return;
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch (_) { continue; }
+        if (ev.type === "progress") {
+          safePost(port, { type: "alignProgress", message: ev.message });
+        } else if (ev.type === "window") {
+          safePost(port, { type: "alignWindow", i: ev.i, words: ev.words,
+                           cached: !!ev.cached });
+        } else if (ev.type === "result") {
+          gotTerminal = true;
+          safePost(port, { type: "alignDone", timed: ev.timed, cached: ev.cached,
+                           failed: ev.failed });
+        } else if (ev.type === "error") {
+          gotTerminal = true;
+          fail(ev.status, ev.reason || null, ev.error, ev.install_hint);
+        }
+      }
+    }
+    if (!gotTerminal) fail(0, "other", "");
+  } catch (e) {
+    if (gotTerminal) return;          // the result already arrived
+    if (e.name === "AbortError") fail(0, "timeout", "");
+    else fail(0, "unreachable", "");
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const PROBE_TIMEOUT_MS = 5000;
 

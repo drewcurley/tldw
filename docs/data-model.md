@@ -24,6 +24,7 @@ All examples below are invented. Video IDs are made-up 11-character strings, and
 | 10 | Claude CLI sessions | `~/.claude/projects/<encoded tldw claude dir>/` | the `claude` CLI | the `claude` CLI (`--resume`) | the CLI's own |
 | 11 | Output files | `~/Downloads/youtube-tldw/tldws/` by default | `tldw <url>` only | the user | `.md`, `.mp4`, `.mp3` |
 | 12 | Temp dirs and `*.tmp` | `$TMPDIR/youtube-tldw-*`, `<cache dir>/*.tmp` | CLI, server | the same | working files |
+| 13 | Alignment cache (T-020) | `~/.cache/youtube-tldw/align/` | `tldw serve` (`/align/stream`) | `tldw serve`, `tldw cache` | JSON per window |
 | — | Hugging Face hub cache (read only) | `$HF_HUB_CACHE` / `$HF_HOME/hub` / `~/.cache/huggingface/hub` | not tldw | `tldw cache` (lists, sizes) | not tldw's |
 | — | yt-dlp's own cache (third-party) | `UNKNOWN — needs human confirmation` | `yt-dlp`, run by tldw | `yt-dlp` | not tldw's |
 | — | Browser cookie database (third-party, read only) | `UNKNOWN — needs human confirmation` | the browser | `yt-dlp`, only when cookies are configured | not tldw's |
@@ -250,9 +251,45 @@ All examples below are invented. Video IDs are made-up 11-character strings, and
 | CLI run | `youtube-tldw-` | `cli.py:288` | `finally`, `cli.py:294-295` | No |
 | Transcript fetch | `youtube-tldw-tx-` | `core.py:65` | `finally`, `core.py:86-87` | No |
 | Transcription audio | `youtube-tldw-audio-` (`hygiene.AUDIO_TMP_PREFIX`) | `server.py:236` | `finally`, `server.py:282` | Yes, by age: at least 6 hours (`server.py:77-86`), at serve start and by `tldw cache clean` (`hygiene.py:83-111`) |
+| Word-timing audio (T-020) | `youtube-tldw-audio-` (the same prefix, on purpose) | `server.py` `_run_align` | `finally`, with the window wavs inside it | Yes, by the same age rule |
 | Cache write in flight | `<name>.tmp` in each cache dir | `txcache.py:84`, `txcache.py:124`, `txcache.py:158` | `replace` onto `.json` | Yes, by `tldw cache clean` if older than 1 hour (`hygiene.py:28`, `hygiene.py:208-211`) |
 
 The temp root is `tempfile.gettempdir()` (`hygiene.py:107`).
+
+### 13. Alignment cache (T-020)
+
+**Path:** `~/.cache/youtube-tldw/align/` (`align.ALIGN_DIR`, `align.py:28`). **Written by** `align.put_window`, **read by** `align.get_window`, both from `_run_align`. One file per time window of one video, holding the words Whisper heard in it. Used by "Cover listed words" to narrow a caption-line hit to the word.
+
+- **File name:** `<video_id>-<first 16 hex of sha256(key)>.json`, where the key is built by `align.cache_key`:
+
+  `video_id|start_ms|end_ms|whisper_model|lang=auto|ALIGN_FINGERPRINT`
+
+  - `whisper_model` is `whisper_transcribe.resolve_model()`.
+  - `lang=auto` is fixed: alignment always auto-detects (`language=None`). It is a term so that a future language hint can never share entries with it.
+  - `ALIGN_FINGERPRINT` is the first 12 hex of the sha256 of a sorted JSON object of: the transcribe keyword arguments (`TRANSCRIBE_KWARGS`: `beam_size`, `word_timestamps`, `vad_filter`, `condition_on_previous_text`, `language`); `MODEL_COMPUTE_TYPE` and `MODEL_DEVICE`; the ffmpeg cut's shape (`_CUT_SHAPE`, which a test pins to `cut_argv` with its values removed); `MAX_WORDS_PER_WINDOW`, `MAX_WORD_CHARS` and `BAD_TIMESTAMP_SLACK_MS`; the installed `faster-whisper` and `ctranslate2` versions; and **`ALIGN_SHAPE`**, the payload shape's own version (`align.py:143-169`). `cpu_threads` is left out: it changes speed, not output. A test changes each input and checks the key changes.
+  - The fingerprint is computed **lazily** and memoised, never at import. If either library version can't be read, it is `None`: nothing is looked up, and the route answers `503` `whisper_missing`. **A running server keeps its memoised fingerprint**, so after a library upgrade restart `tldw serve` before the new version changes the key.
+- **The word list is not in the key, on purpose.** The cache holds "what Whisper heard", which the list doesn't shape: matching happens in the browser. So editing the list never re-transcribes a window it already has. It can still cause new windows to be timed, because windows follow which caption lines are hits.
+- **Shape:**
+
+  ```json
+  {"saved_at": 1763000000.0, "video_id": "dQw4w9WgXcQ", "start_ms": 9000,
+   "end_ms": 15500, "words": [[10300, 10600, "blorp"], [10650, 10900, "zarf"]]}
+  ```
+
+  `words` are `[s, e, w]` in absolute media milliseconds. On the wire, `/align/stream` sends each as `{"s": …, "e": …, "w": …}`; `send_window` converts (`server.py:1959-1963`). The example's words are made up.
+- **Validated on read** (`get_window`, `_valid_words`): older than `TTL_SECONDS` (14 days); a `video_id`, `start_ms` or `end_ms` that differs from the request (a copied file or a hash collision), or one that isn't an `int`; more than 200 words; a word that isn't three items, with `int` (not `bool`) times and `start_ms ≤ s ≤ e ≤ end_ms`; text empty or over 64 characters. Any of these, and any read error, is a **miss**, never an error.
+- **On the way in**, `words_from_raw` drops a word with `e < s`, or more than 1 s outside the window, and clamps the rest; then caps at 200 words and 64 characters.
+- **Writes:** best effort, `.tmp` then `replace` (`put_window`). A window that failed is never written.
+- **Cap and TTL:** its own cap, `ALIGN_MAX_ENTRIES` (5,000 files), enforced by `txcache._prune(ALIGN_DIR, cap=…)` **once per request**, in `_run_align`'s `finally`. Requests that never take `_align_lock` (all cached, or refused early) don't prune; `tldw cache clean` still removes expired entries. `_prune`'s default cap for the other stores is unchanged (tested).
+- **Class:** personal viewing history, like store 1: text derived from public video audio, which also shows that the video was watched. **It also narrows what the list holds:** the list itself is never stored, but each window is stored because a caption line around it held a listed word, so whoever can read this directory can narrow each window to a few likely words. It keeps the process umask's mode, like stores 1–3. About 1–3 KB per window.
+- **The only schema version in any store.** `ALIGN_SHAPE` (in the fingerprint) versions this payload. A shape change bumps it, and every old entry misses.
+
+### `chrome.storage.local` keys added by T-020
+
+- `muteWords` (string): the "Words to cover" list, one normalised entry per line. **Absent means the shipped default** (`TLDW_MUTE_DEFAULTS` in `extension/mute_words.js`), and Options removes the key whenever the box equals the default, so a change to the default reaches the user. `""` means off. Class: personal (the user's own list). It is **never sent** to the worker or the server, and appears in no log or cache.
+- `muteSound` (string): `bleep` (default), `mute` or `moo`. Not personal.
+
+Their full contracts are in `contracts.md` → `chrome.storage.local` keys.
 
 ### In-memory stores
 
@@ -264,7 +301,7 @@ These are not persisted and vanish on restart. The full list, with keys, TTLs an
 - `_tx_jobs`, `_seg_prefetch_events` and `_seg_progress`, which live only while the work runs;
 - `_preview_cache`: voice model → mp3, bounded by the allowlist.
 
-In `audio.py` there are `_voice_cache` (at most 2 loaded voices) and `_piper_state`. The extension's background worker keeps three uncapped `Map`s (`background.js:25-26`, `background.js:449`).
+In `audio.py` there are `_voice_cache` (at most 2 loaded voices) and `_piper_state`. The extension's background worker keeps three uncapped `Map`s (`background.js:25-26`, `background.js:523`).
 
 ### Hugging Face hub cache (read only)
 
@@ -293,7 +330,7 @@ N/A — file-backed, with no database engine. In their place:
 
 ## What `tldw cache` covers
 
-`tldw cache` reports five areas (`cli.py:390-392`): transcripts, summaries, key moments, voices and Whisper models. It also reports Hugging Face's faster-whisper models, report-only. `tldw cache clean` (`cli.py:394-417`):
+`tldw cache` reports six areas (`cli.py:390-392`): transcripts, summaries, key moments, word timings (store 13, T-020), voices and Whisper models. The areas `tldw cache clean` expires are chosen **by name** (`cli.py:395`, used at `cli.py:399`), not by position, so adding an area can't shift which ones are cleaned (tested). It also reports Hugging Face's faster-whisper models, report-only. `tldw cache clean` (`cli.py:394-417`):
 
 | Store | Reported | Cleaned by `tldw cache clean` | Cleaned at `tldw serve` start |
 |---|---|---|---|
@@ -304,6 +341,7 @@ N/A — file-backed, with no database engine. In their place:
 | 8 Whisper models | Yes (size, configured model) | Never | Never |
 | HF hub cache | Yes, if any found | Never (prints `rm -rf` hints) | Never |
 | 12 `youtube-tldw-audio-*` temp dirs | No | Older than `_stale_audio_age()` | Older than `_stale_audio_age()` |
+| 13 Word timings | Yes ("word timings", size, count) | Expired entries and stray `.tmp` | No |
 | 4 `usage.jsonl` | No | No | No |
 | 5 `config.json` | No (that's `tldw config get`) | No | No |
 | 6 Token | No | No | No |
@@ -320,7 +358,7 @@ The Architect owns classification and encryption decisions (`.claude/agents/data
 
 - **Encryption at rest:** none, for every store. `src/` has no encryption code (grep for `encrypt`, `cipher`, `keyring`, `keychain`: no hits). Protection is the operating system's file permissions on the user's home directory.
 - **Owner-only modes:** set on the token (0600), `usage.jsonl` (0600) and `CLAUDE_DIR` (0700). Each is applied **after** the file or directory exists, and is a no-op on Windows (`config.py:44-56`). Every other store keeps the process umask's mode.
-- **Access logging:** N/A. tldw writes no access log for any store. Its server log goes to stdout and stderr only, never to a file. The stdlib request line (the default `log_message` is kept, `server.py:962-963`) records the method, the path **with its query string**, and the status; it carries no body and no token. The comment there says "no query", which is stale (Recorded facts). No `fetch(` in `extension/` sends a query string (`background.js:108`, `:149`, `:231`, `:266`, `:385`, `:466`, `:511`; `options.js:53`, `:70`, `:97`), so today the line holds only route paths. tldw's own progress lines do print video titles (`server.py:1310`).
+- **Access logging:** N/A. tldw writes no access log for any store. Its server log goes to stdout and stderr only, never to a file. The stdlib request line (the default `log_message` is kept, `server.py:962-963`) records the method, the path **with its query string**, and the status; it carries no body and no token. The comment there says "no query", which is stale (Recorded facts). No `fetch(` in `extension/` sends a query string (`background.js:182`, `:223`, `:305`, `:340`, `:459`, `:540`, `:585`; `options.js:53`, `:70`, `:97`), so today the line holds only route paths. tldw's own progress lines do print video titles (`server.py:1310`).
 - **Masking:** none. The usage log keeps only video ids, not titles.
 
 | Store | Class | What it reveals | Owner-only? |
@@ -331,17 +369,18 @@ The Architect owns classification and encryption decisions (`.claude/agents/data
 | 1 Transcripts | Personal: viewing history; the body is third-party content | Which videos were opened; their text | No |
 | 2 Summaries | Personal: viewing history | The same, as summaries | No |
 | 3 Key moments | Personal: viewing history | Which videos, and their timestamps | No |
+| 13 Alignment cache | Personal: viewing history; the words are third-party content | Which videos were watched with "Cover listed words" on, and the words around each hit (not the user's list) | No |
 | 11 Output files | Personal: viewing history, user-owned files | Titles and channels in file names; summaries and media | No |
 | 12 Temp dirs | Personal, transient | Downloaded audio, video and subtitles of one video | No |
 | 5 `config.json` | Operator config; possibly personal | `output_dir` is an absolute path that can include the OS account name; `llm_cmd` is free text the operator typed, and whether anyone puts a credential in it is `UNKNOWN — needs human confirmation`; `ytdlp_cookies` names a browser, not cookies | No |
 | 7 Voices, 8 Whisper models, HF cache | Not personal: public model files | The marker's and `.onnx` files' mtimes reveal when speech was used | No |
 | Server in-memory stores | Same classes as the disk stores they mirror. Q&A text is never in server memory beyond the request: the server keeps only the session id (`_ask_sessions`, `server.py:422-431`; the browser sends the conversation, `ask.py:3-4`). The questions and answers do persist, on disk, in the CLI session store (store 10). | — | Process memory |
-| Extension worker's in-memory `cache` and `audioCache` | Personal: viewing history (Architect's refinement) | Summaries and spoken audio, keyed by video id (`background.js:25-26`); `previewCache` is keyed by voice and is not personal (`background.js:449`) | Process memory |
+| Extension worker's in-memory `cache` and `audioCache` | Personal: viewing history (Architect's refinement) | Summaries and spoken audio, keyed by video id (`background.js:25-26`); `previewCache` is keyed by voice and is not personal (`background.js:523`) | Process memory |
 | `chrome.storage.local` | **Secret** (Architect's refinement): holds the token in plain text; see `contracts.md` | The token, which lets the holder call the server | The browser profile |
 
 ## No version markers, and how to change a format safely
 
-**No store carries a schema version**: there's no `version` or `schema` field in any record (`txcache.py`, `usage.py`, `config.py`), and no migration tooling, migrations directory or backfill job. Compatibility instead comes from four mechanisms that exist today. A format change must use one of them. A change that needs something else, such as rewriting files in place, needs its own reviewed plan, because nothing in the code supports it.
+**Only store 13 carries a schema version**, and only inside its key: `ALIGN_SHAPE` is part of `ALIGN_FINGERPRINT` (T-020). No other store has a `version` or `schema` field in any record (`txcache.py`, `usage.py`, `config.py`), and no migration tooling, migrations directory or backfill job. Compatibility instead comes from four mechanisms that exist today. A format change must use one of them. A change that needs something else, such as rewriting files in place, needs its own reviewed plan, because nothing in the code supports it.
 
 **General rules, all grounded in how the readers work:**
 - **Cache readers must stay tolerant.** Every cache read is wrapped so that any exception class it can raise on bad data is a miss (`txcache.py:57`, `txcache.py:116`, `txcache.py:150`). A new required field must not raise anything outside those `except` tuples (`OSError`, `ValueError`, `KeyError`, `TypeError`, plus `IndexError` for transcripts). The usage log and config readers are tolerant of bad lines and bad files, **not** of a wrong value type (store 4 and store 5 read rules), so the next rule matters there most.
@@ -368,7 +407,8 @@ The Architect owns classification and encryption decisions (`.claude/agents/data
 4. **Voices: the mtimes are data.** The `.onnx` mtime means "last spoken" and the marker's mtime means "tracking since". Any change that rewrites, copies or re-downloads voice files resets that information. Renaming or removing a model in `audio.VOICES` deletes its files at the next `tldw serve` start (`server.py:104-107`). That is intended, and it is a delete.
 5. **`config.json`: add keys, don't rename them, and keep every value a string.** The CLI writes only strings (`cli.py:351`). A new reader must check the type before using the value, the way `_whisper_policy` does (`isinstance`, `server.py:152-153`) and `_max_transcribe_ms` does (`server.py:125-133`); today `llm_cmd`, `ytdlp_cookies`, `whisper_model` and `output_dir` don't (store 5). A renamed key silently reverts to its default for anyone who set the old one.
 6. **Token:** changing its format or location invalidates every configured extension.
-7. **Claude sessions:** not tldw's format. Moving `CLAUDE_DIR` strands existing sessions under the old project, while `--resume` keeps working by id (`claude_client.py:117-118`).
+7. **Alignment cache (store 13): change the key, never the file.** Anything that shapes a window's words goes into `ALIGN_FINGERPRINT`, and a payload-shape change bumps `ALIGN_SHAPE`. Old files then miss, and the cost is re-timing each window once (seconds of CPU and one audio download per video). Never add the word list to the key.
+8. **Claude sessions:** not tldw's format. Moving `CLAUDE_DIR` strands existing sessions under the old project, while `--resume` keeps working by id (`claude_client.py:117-118`).
 
 ## Recorded facts and weaknesses
 
@@ -386,7 +426,7 @@ Recorded as they are; the code is not changed by this doc. Each names the task t
    - the request-log comment says the line has "no query" (`server.py:962-963`), when the stdlib line includes the query string.
 
    Tracked in T-012.
-8. **The extension's in-memory summary map is keyed by video id only** (`background.js:25`, `background.js:131`), so after a model or ratio change it serves its copy until a refresh. Frontend to confirm. Tracked in T-014.
+8. **The extension's in-memory summary map is keyed by video id only** (`background.js:25`, `background.js:205`), so after a model or ratio change it serves its copy until a refresh. Frontend to confirm. Tracked in T-014.
 9. **The summary key misses three inputs that shape a summary:** `_ratio_clause`, `_metadata_header` and `SINGLE_PASS_CHARS` (`summarize.py:17`, `:151`, `:241`; `PROMPT_FINGERPRINT` covers only the four strings at `summarize.py:144`). Editing one serves stale summaries for up to 14 days. `SEGMENT_FINGERPRINT` likewise misses `_metadata_header` and `SINGLE_PASS_CHARS` (`core.py:35-42`). Tracked in T-014.
 10. **Wrong-typed values break readers instead of falling back:**
     - a non-numeric `video_ms` or `read_ms` in one `usage.jsonl` row makes `stats()` raise (`usage.py:218-219`), uncaught at `server.py:1234`, `server.py:1328` and `server.py:1369`;
@@ -422,3 +462,4 @@ Recorded as they are; the code is not changed by this doc. Each names the task t
 - `audio.VOICES`, `VOICE_DIR` or `ensure_voice` changes; or `whisper_transcribe._CACHE_DIR` or the `WhisperModel` call.
 - `cli.py`'s `_run_cache`, `_run_usage`, `_run_config`, `_default_output_dir` or `DEFAULT_OUTPUT` changes; or `naming.py`.
 - The extension adds a persistent store or changes what it keeps in memory.
+- `align.py`'s key, fingerprint inputs, `ALIGN_SHAPE`, read validation, caps or `ALIGN_DIR` change; or `_run_align`'s prune or write rules; or `muteWords`/`muteSound` handling in `options.js` changes (T-020).

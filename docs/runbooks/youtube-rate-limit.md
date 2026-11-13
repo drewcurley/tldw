@@ -10,7 +10,11 @@ This is the YouTube rate-limit playbook. It is **not** the server's own "busy" r
 > YouTube is rate-limiting this machine (HTTP 429) after too many requests in a short time. It clears on its own — wait a few minutes and try again. Videos summarized recently are cached and unaffected.
 
 - In the panel, for a summary, key moments or a question; and in the terminal when you run the CLI (`tldw <url>`).
-- The server sends it as a **`500`**, not a `429`: it's a plain `TldrError` (`src/youtube_tldw/metadata.py:66-76`; `docs/contracts.md`, "Every status the server sends", the `500` row). The panel shows the server's text as-is for a `500` (`extension/background.js:580`, `:446`). So go by the message, not the status number.
+- The server sends it as a **`500`**, not a `429`: it's a plain `TldrError` (`src/youtube_tldw/metadata.py:66-76`; `docs/contracts.md`, "Every status the server sends", the `500` row). The panel shows the server's text as-is for a `500` (`extension/background.js:654`, `:520`). So go by the message, not the status number.
+
+**When "Cover listed words" is timing words** (T-020), the panel shows the server's own text instead, sent as an in-stream `429` with `reason` `rate_limited` (`src/youtube_tldw/align.py`), followed by " Until then, spots are covered by caption line.":
+
+> YouTube is rate-limiting tldw serve, so it couldn't get the audio. Turn this off and on again in a few minutes; the wait is at most ten.
 
 ## Why it happens
 
@@ -19,6 +23,8 @@ This is the YouTube rate-limit playbook. It is **not** the server's own "busy" r
 - The `yt-dlp` calls already retry with exponential backoff before giving up (`metadata.py:56-57`, `README.md:231-232`), so by the time you see this, retrying straight away won't help.
 - **A summary started from the extension usually doesn't ask YouTube for anything.** The panel reads the title, captions and duration from the watch page, in your own browser session (`README.md:212-217`; `extension/README.md:94-100`). The server only fetches from YouTube itself when the page couldn't supply captions, and the CLI always fetches for anything it hasn't cached (`README.md:219-221`).
 - Anything whose transcript is already cached on disk needs no fetch. How long a transcript stays cached is set in `docs/data-model.md`, store 1.
+
+- **A new trigger (T-020):** turning on "Cover listed words" for a video whose word timings aren't cached yet makes the server download that video's audio once. No cookies are passed for it. After a YouTube 429 there, the server does **no** alignment fetch for 10 minutes (`ALIGN_COOLDOWN_S`), and every attempt in that window gets the text above at once. The cooldown is held **in memory** and covers word timing only: summaries, key moments and questions are unaffected by it. A restart clears it.
 
 ## Check
 
@@ -46,6 +52,7 @@ This is the YouTube rate-limit playbook. It is **not** the server's own "busy" r
 ## Don't
 
 - **Don't retry in a loop,** from the CLI or by clicking repeatedly. More requests keep the throttle going.
+- **Don't restart `tldw serve` just to clear the word-timing cooldown.** It exists so the server stops asking YouTube while it is throttled; a restart only sends the next request straight back into the throttle.
 - **Don't treat it as a tldw bug** to reinstall or roll back: nothing in tldw is broken.
 - **Don't paste `tldw config get` output anywhere shared:** it prints home-directory paths.
 
@@ -66,4 +73,6 @@ This is the YouTube rate-limit playbook. It is **not** the server's own "busy" r
 - `_translate`, `rate_limited`, `_RETRY`, `_cookie_args` or `COOKIE_BROWSERS` changes, or the message's wording does (`src/youtube_tldw/metadata.py`);
 - the `_STATUS` map changes how a plain `TldrError` is sent (`src/youtube_tldw/server.py`), or `httpError` / `askError` stop passing a `500`'s text through (`extension/background.js`);
 - `_run_config` changes how keys are spelled or accepted (`src/youtube_tldw/cli.py`);
+- `ALIGN_RATE_LIMITED_TEXT`, `ALIGN_COOLDOWN_S` or `_run_align`'s rate-limit branch changes (T-020);
+- the panel's rebuild retry changes (`MUTE_RETRY_MS` in `extension/content.js`: 3 retries, 5/10/20 s, and only for a `busy` that came before any `alignProgress`, so never after an audio download began; `rate_limited` is never retried) (T-020 rev 5.6);
 - the README's "YouTube rate limiting" section changes, or the page-transcript path stops being the extension's default.

@@ -48,43 +48,43 @@ echo "test-ci-tldw-tests.sh"
 
 f="$tmp/junit.xml"
 
-report "$f" 723 0 0 0
-expect 0 'tests=723 failures=0 errors=0 skipped=0' "a full pass at the floor passes" -- check "$f"
+report "$f" 866 0 0 0
+expect 0 'tests=866 failures=0 errors=0 skipped=0' "a full pass at the floor passes" -- check "$f"
 
-report "$f" 760 0 0 0
+report "$f" 900 0 0 0
 expect 0 '' "more tests than the floor passes" -- check "$f"
 
-report "$f" 722 0 0 0
-expect 1 'only 722 tests ran, expected at least 723' "one test under the floor fails" -- check "$f"
+report "$f" 865 0 0 0
+expect 1 'only 865 tests ran, expected at least 866' "one test under the floor fails" -- check "$f"
 
-report "$f" 723 0 0 1
+report "$f" 866 0 0 1
 expect 1 '1 skipped' "a single skipped test fails the job" -- check "$f"
 
 report "$f" 727 0 0 4
 expect 1 '4 skipped' "skips fail even when the total is over the floor" -- check "$f"
 
-report "$f" 723 1 0 0
+report "$f" 866 1 0 0
 expect 1 '1 failures' "a failed test fails" -- check "$f"
 
-report "$f" 723 0 2 0
+report "$f" 866 0 2 0
 expect 1 '2 errors' "an errored test fails" -- check "$f"
 
 report "$f" 5 0 0 0
 expect 0 '' "the floor can be lowered for a fixture" -- check "$f" 5
 
 # Several suites: totals are summed, so a skip in any of them counts.
-printf '<testsuites><testsuite tests="361" failures="0" errors="0" skipped="0"/><testsuite tests="362" failures="0" errors="0" skipped="0"/></testsuites>\n' > "$f"
-expect 0 'tests=723' "two suites are summed to a pass" -- check "$f"
-printf '<testsuites><testsuite tests="361" failures="0" errors="0" skipped="0"/><testsuite tests="363" failures="0" errors="0" skipped="1"/></testsuites>\n' > "$f"
+printf '<testsuites><testsuite tests="433" failures="0" errors="0" skipped="0"/><testsuite tests="433" failures="0" errors="0" skipped="0"/></testsuites>\n' > "$f"
+expect 0 'tests=866' "two suites are summed to a pass" -- check "$f"
+printf '<testsuites><testsuite tests="431" failures="0" errors="0" skipped="0"/><testsuite tests="433" failures="0" errors="0" skipped="1"/></testsuites>\n' > "$f"
 expect 1 '1 skipped' "a skip in the second suite still fails" -- check "$f"
 
 # A bare <testsuite> root (older pytest junit_family) is read too.
-printf '<testsuite tests="723" failures="0" errors="0" skipped="0"/>\n' > "$f"
-expect 0 'tests=723' "a bare testsuite root is read" -- check "$f"
+printf '<testsuite tests="866" failures="0" errors="0" skipped="0"/>\n' > "$f"
+expect 0 'tests=866' "a bare testsuite root is read" -- check "$f"
 
 # Fail closed: anything unreadable is a failure, never a pass.
 expect 1 'no test report' "a missing report fails" -- check "$tmp/nope.xml"
-printf '<testsuites><testsuite tests="723"' > "$f"
+printf '<testsuites><testsuite tests="866"' > "$f"
 expect 1 "can't read the test report" "a truncated report fails" -- check "$f"
 printf '<testsuites></testsuites>\n' > "$f"
 expect 1 'no test suites' "a report with no suites fails" -- check "$f"
@@ -100,9 +100,9 @@ expect 1 'usage' "check with no report fails" -- check
 expect 1 'usage' "run with no workdir fails" -- run
 
 # A report missing one of the four counts isn't trusted (pytest always writes all four).
-printf '<testsuites><testsuite tests="723"/></testsuites>\n' > "$f"
+printf '<testsuites><testsuite tests="866"/></testsuites>\n' > "$f"
 expect 1 'has no failures= count' "a suite with no failure/error/skip counts fails" -- check "$f"
-printf '<testsuites><testsuite tests="723" failures="0" errors="0"/></testsuites>\n' > "$f"
+printf '<testsuites><testsuite tests="866" failures="0" errors="0"/></testsuites>\n' > "$f"
 expect 1 'has no skipped= count' "a suite with no skipped= count fails" -- check "$f"
 
 # --- run mode -----------------------------------------------------------------
@@ -161,11 +161,11 @@ expect_run() {
   else ok "$desc"; fi
 }
 
-clean="$tmp/clean.xml"; report "$clean" 723 0 0 0
-skips="$tmp/skips.xml"; report "$skips" 723 0 0 4
+clean="$tmp/clean.xml"; report "$clean" 866 0 0 0
+skips="$tmp/skips.xml"; report "$skips" 866 0 0 4
 short="$tmp/short.xml"; report "$short" 12 0 0 0
 
-expect_run 0 'tests=723 failures=0 errors=0 skipped=0' "run: pytest passes with a clean report -> 0" "$bin" 0 "$clean"
+expect_run 0 'tests=866 failures=0 errors=0 skipped=0' "run: pytest passes with a clean report -> 0" "$bin" 0 "$clean"
 # The pip calls are the hash-locked install, then tldw with nothing else fetched.
 if grep -q -- '--require-hashes --only-binary :all: -r scripts/requirements-ci.txt' "$log" \
    && grep -q -- '--no-deps --no-build-isolation -e .' "$log"; then
@@ -175,14 +175,14 @@ if grep -q -- '-m pytest -p no:cacheprovider -rs --junitxml=' "$log"; then ok "r
 else bad "run: pytest writes a JUnit report ($(cat "$log"))"; fi
 expect_run 1 '4 skipped' "run: pytest exits 0 but tests were skipped -> 1" "$bin" 0 "$skips"
 expect_run 1 'only 12 tests ran' "run: pytest exits 0 but too few tests ran -> 1" "$bin" 0 "$short"
-expect_run nonzero 'tests=723' "run: pytest fails with a clean-looking report -> nonzero, summary shown" "$bin" 1 "$clean"
+expect_run nonzero 'tests=866' "run: pytest fails with a clean-looking report -> nonzero, summary shown" "$bin" 1 "$clean"
 expect_run 1 'no test report' "run: pytest fails and writes no report -> 1" "$bin" 1 ""
 expect_run 1 'no test report' "run: pytest exits 0 but writes no report -> 1" "$bin" 0 ""
 expect_run 1 'node is required' "run: no node on PATH -> 1 before anything installs" "$bin_nonode" 0 "$clean"
 
 # The floor the CI job uses is today's suite size or more, never lowered quietly.
 floor=$(sed -n 's/^MIN_TESTS=//p' "$sut")
-if [ -n "$floor" ] && [ "$floor" -ge 723 ]; then ok "the CI floor is at least 723 ($floor)"; else bad "the CI floor is '$floor', below 723"; fi
+if [ -n "$floor" ] && [ "$floor" -ge 866 ]; then ok "the CI floor is at least 866 ($floor)"; else bad "the CI floor is '$floor', below 866"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

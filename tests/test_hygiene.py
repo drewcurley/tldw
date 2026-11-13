@@ -244,5 +244,16 @@ def test_a_dry_run_removes_nothing(capsys):
 def test_the_report_names_every_area(capsys):
     assert cli._run_cache([]) == 0
     out = capsys.readouterr().out
-    for area in ("transcripts", "summaries", "key moments", "voices", "whisper models"):
+    for area in ("transcripts", "summaries", "key moments", "word timings", "voices",
+                 "whisper models"):
         assert area in out
+
+
+def test_clean_removes_expired_word_timings_too(capsys):
+    """T-020: the alignment cache (store 13) is cleaned, not just reported. Areas
+    are chosen by name, so appending one can't leave it reported but never cleaned."""
+    from youtube_tldw import align
+    expired = _entry(align.ALIGN_DIR, "old", 30)
+    fresh = _entry(align.ALIGN_DIR, "fresh", 1)
+    assert cli._run_cache(["clean"]) == 0
+    assert not expired.exists() and fresh.exists()

@@ -13,7 +13,7 @@ One message is specific to updating, when the extension is reloaded while a summ
 
 > Lost connection to the extension worker. Click TL;DW to try again.
 
-- That's the panel losing its connection to the extension's worker (`extension/content.js:643-648`). Reload the YouTube tab and click TL;DW again.
+- That's the panel losing its connection to the extension's worker (`extension/content.js:664-669`). Reload the YouTube tab and click TL;DW again.
 
 ## Why it happens
 
@@ -49,7 +49,7 @@ What to know before you start:
 ## How this was verified
 
 - **Read on `a7f104c`:** `docs/deployment.md` §§ 2, 6, 10 and 12, and its Follow-ups; `docs/data-model.md`, store 6; `content.js:643-648`; `server.py:1959`.
-- **The quoted message** was checked against its string constant (`content.js:646`).
+- **The quoted message** was checked against its string constant (`content.js:667`).
 - The rollback itself was run in isolation for `docs/deployment.md` § 10, on 2026-11-12, and is recorded there; this playbook didn't re-run it.
 
 ## Update this doc when

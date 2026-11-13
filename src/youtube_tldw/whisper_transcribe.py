@@ -100,7 +100,8 @@ def estimate_seconds(duration_ms: int, model_size: str | None = None) -> int:
 
 
 def download_audio(video_id: str, workdir: Path, *,
-                   timeout: float = DOWNLOAD_TIMEOUT) -> Path:
+                   timeout: float = DOWNLOAD_TIMEOUT,
+                   max_duration_s: int | None = None) -> Path:
     """Download video_id's audio into workdir and return the file.
 
     Bounded deliberately, because unlike every other yt-dlp call in this project
@@ -118,12 +119,19 @@ def download_audio(video_id: str, workdir: Path, *,
 
     video_id is always canonical_video_id output; nothing from the request body
     reaches here. That is what makes the glob below safe.
+
+    `max_duration_s` (a server-made int, never request data) adds a length ceiling
+    to the match filter. With no `?` on `duration`, a video yt-dlp can't size is
+    skipped, so the ceiling fails closed. Absent, the argv is exactly as before.
     """
     from .metadata import watch_url
+    match = "!is_live"
+    if max_duration_s is not None:
+        match = f"!is_live & duration <= {int(max_duration_s)}"
     result = run(
         [
             "yt-dlp", "--ignore-config", "-f", "bestaudio",
-            "--no-playlist", "--match-filter", "!is_live",
+            "--no-playlist", "--match-filter", match,
             "--max-filesize", str(MAX_AUDIO_BYTES),
             "--print", "after_move:filepath", "--no-simulate",
             "-o", "%(id)s.%(ext)s",
@@ -167,6 +175,57 @@ def _collapse_repeats(cues: list[Cue]) -> list[Cue]:
     return out
 
 
+# The settings every model here is built with. Word timing (align.py) puts them in
+# its cache fingerprint, because they shape the timestamps it caches.
+MODEL_DEVICE = "cpu"
+MODEL_COMPUTE_TYPE = "int8"
+
+
+def _load_model(model_size: str, *, local_only: bool = False):
+    """Build the faster-whisper model: the one construction site for transcribe()
+    and word timing alike.
+
+    `local_only` passes `local_files_only=True`, so a caller holding the
+    transcription permit for a few seconds of work never triggers a 75MB-3.1GB
+    download inside it; a missing model raises instead.
+    """
+    from faster_whisper import WhisperModel  # type: ignore[import]
+    # The first use of a model downloads it from Hugging Face. That happens inside
+    # the constructor below, where neither the cancel check nor the deadline can
+    # reach it, so a stalled connection would hold the transcription permit for the
+    # life of the process. A per-request timeout turns that into a failure.
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    kwargs = {}
+    if local_only:
+        kwargs["local_files_only"] = True
+    return WhisperModel(
+        model_size,
+        device=MODEL_DEVICE,
+        # Leaving this at the default takes every core, so two runs oversubscribe
+        # the machine and both finish slower than they would in series. This is a
+        # laptop that is often doing something else. (It doesn't change the output,
+        # which is why word timing leaves it out of its cache fingerprint.)
+        cpu_threads=max(1, (os.cpu_count() or 4) // 2),
+        compute_type=MODEL_COMPUTE_TYPE,
+        download_root=str(_CACHE_DIR),
+        **kwargs,
+    )
+
+
+def model_on_disk(model_size: str) -> bool:
+    """Is this model already downloaded? Asks the hub's local cache only: never a
+    network call, so it can be checked before any audio is fetched."""
+    try:
+        from faster_whisper import download_model  # type: ignore[import]
+        download_model(model_size, local_files_only=True, cache_dir=str(_CACHE_DIR))
+        return True
+    except ImportError:
+        raise
+    except Exception:
+        return False
+
+
 def transcribe(
     audio_path: Path,
     model_size: str,
@@ -182,7 +241,6 @@ def transcribe(
     can be interrupted, since a single segment is indivisible.
     """
     require_whisper()
-    from faster_whisper import WhisperModel  # type: ignore[import]
 
     log = on_progress or (lambda _m, _p=None: None)
     cancelled = should_cancel or (lambda: False)
@@ -192,22 +250,7 @@ def transcribe(
     log(f"loading Whisper '{model_size}' model "
         f"({size_label} -- downloads on first use)...", None)
 
-    # The first use of a model downloads it from Hugging Face. That happens inside
-    # the constructor below, where neither the cancel check nor the deadline can
-    # reach it, so a stalled connection would hold the transcription permit for the
-    # life of the process. A per-request timeout turns that into a failure.
-    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    model = WhisperModel(
-        model_size,
-        device="cpu",
-        # Leaving this at the default takes every core, so two runs oversubscribe
-        # the machine and both finish slower than they would in series. This is a
-        # laptop that is often doing something else.
-        cpu_threads=max(1, (os.cpu_count() or 4) // 2),
-        compute_type="int8",
-        download_root=str(_CACHE_DIR),
-    )
+    model = _load_model(model_size)
     if cancelled():
         raise TldrError("Transcription cancelled.")
 

@@ -17,6 +17,7 @@ import importlib
 import os
 import stat
 import tempfile
+import threading
 import time
 
 import pytest
@@ -31,6 +32,7 @@ HOME_PATHS = [
     ("youtube_tldw.txcache", "SUMMARY_DIR", ".cache/youtube-tldw/summaries"),
     ("youtube_tldw.txcache", "SEGMENT_DIR", ".cache/youtube-tldw/segments"),
     ("youtube_tldw.whisper_transcribe", "_CACHE_DIR", ".cache/youtube-tldw/whisper"),
+    ("youtube_tldw.align", "ALIGN_DIR", ".cache/youtube-tldw/align"),
     ("youtube_tldw.audio", "VOICE_DIR", ".cache/youtube-tldw/voices"),
     ("youtube_tldw.cli", "DEFAULT_OUTPUT", "Downloads/youtube-tldw/tldws"),
     ("youtube_tldw.claude_client", "CLAUDE_DIR", ".cache/youtube-tldw/claude"),
@@ -114,6 +116,13 @@ def _fresh_server_state(_isolated_home, monkeypatch):
     pools = server._make_pools()
     monkeypatch.setattr(server, "_claude_slots", pools[0])
     monkeypatch.setattr(server, "_speech_slots", pools[1])
+    # T-020 word timing: a fresh lock, permit and cooldown per test, and the
+    # fingerprint memo cleared so a test's stubbed versions can't leak.
+    monkeypatch.setattr(server, "_align_lock", threading.Lock())
+    monkeypatch.setattr(server, "_tx_permit", threading.Semaphore(1))
+    monkeypatch.setattr(server, "_align_backoff_until", 0.0)
+    from youtube_tldw import align
+    monkeypatch.setattr(align, "_fingerprint_memo", None)
     yield
     # Polled, not checked once: a handler can still be in its `finally` after its
     # client has read the whole response.
