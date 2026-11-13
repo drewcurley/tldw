@@ -8,26 +8,13 @@
 
 | ID | Title | Owner | Tier | State | Branch | PR |
 |----|-------|-------|------|-------|--------|----|
-| _none_ | | | | | | |
+| [T-001](./T-001.md) | Bootstrap `/docs/` folder | review-coordinator | 1+2 | in-progress | chore/docs-tier1 | — |
 
 ## Backlog — Tier 1 (blocks feature work)
 
 | ID | Title | Owner | State |
 |----|-------|-------|-------|
-| [T-001](./T-001.md) | Bootstrap `/docs/` folder | review-coordinator | proposed |
-| [T-001.1](./T-001.1.md) | Draft docs index | analyst | proposed |
-| [T-001.2](./T-001.2.md) | Write `architecture.md` | architect | proposed |
-| [T-001.17](./T-001.17.md) | Write `contracts.md` ⭐ exhaustive code-grounded inventory | backend-engineer | proposed |
-| [T-001.5](./T-001.5.md) | Write `api.md` | backend-engineer | proposed |
-| [T-001.4](./T-001.4.md) | Write `data-model.md` | data-engineer | proposed |
-| [T-001.6](./T-001.6.md) | Write `stack.md` | architect | proposed |
-| [T-001.8](./T-001.8.md) | Write `testing.md` | test-engineer | proposed |
-| [T-001.9](./T-001.9.md) | Write `deployment.md` | devops | proposed |
-| [T-001.11](./T-001.11.md) | Set up `decisions/` + Architectural Decision Record 0001 | architect | proposed |
-| [T-001.12](./T-001.12.md) | Set up `reviews/` skeleton | review-coordinator | proposed |
-| [T-001.13](./T-001.13.md) | Tier 1 review + collect 9 sign-offs | review-coordinator | proposed |
-| [T-001.14](./T-001.14.md) | Write `ownership.md` (Directly Responsible Individual map) | architect | proposed |
-| [T-001.15](./T-001.15.md) | Write `onboarding.md` | analyst | proposed |
+| _none_ | | | |
 
 ## Backlog — Tier 2 (must complete by end of first feature sprint)
 
@@ -38,11 +25,44 @@
 | [T-001.10](./T-001.10.md) | Set up `runbooks/` skeleton | devops | proposed |
 | [T-001.16](./T-001.16.md) | Tier 2 review + collect 9 sign-offs | review-coordinator | proposed |
 
+## Backlog — follow-ups found by the Tier 1 bootstrap
+
+| ID | Title | Owner | State |
+|----|-------|-------|-------|
+| [T-004](./T-004.md) | Reduce token exposure (startup print, ps, file modes, child env, extension storage) | architect | proposed |
+| [T-005](./T-005.md) | Harden the server and integration trust boundaries (Origin, Host, timeouts, URL checks, redirects) | architect | proposed |
+| [T-006](./T-006.md) | Escape server data in the options page's voice list | frontend-engineer | proposed |
+| [T-007](./T-007.md) | Mark untrusted text in the summary prompt; review the open shadow root | architect | proposed |
+| [T-008](./T-008.md) | Make every user-facing error name a next step, and say what actually failed | ux-designer | proposed |
+| [T-009](./T-009.md) | Close the panel's keyboard and accessibility gaps | ux-designer | proposed |
+| [T-010](./T-010.md) | Add guarding tests for the unguarded contracts | sdet | proposed |
+| [T-011](./T-011.md) | Replace the public video ID in tests with an invented one | sdet | proposed |
+| [T-012](./T-012.md) | Fix documentation and comments outside /docs that the bootstrap found wrong | analyst | proposed |
+| [T-013](./T-013.md) | Fix server and CLI edge-case bugs the bootstrap found | backend-engineer | proposed |
+| [T-014](./T-014.md) | Make data stores and extension state robust | data-engineer | proposed |
+| [T-015](./T-015.md) | Get human answers for the docs' UNKNOWNs | analyst | proposed |
+| [T-016](./T-016.md) | Write docs/glossary.md | analyst | proposed |
+| [T-017](./T-017.md) | Record governance gaps of the solo fork | devops | proposed |
+| [T-018](./T-018.md) | Use the extension's own source of truth for model, whisper and voice lists | frontend-engineer | proposed |
+
 ## Completed
 
 | ID | Title | Owner | Tier | Branch | PR | Review |
 |----|-------|-------|------|--------|----|--------|
 | [T-003](./T-003.md) | Adopt the agentic starter (bb9406f) as this repo's playbook | review-coordinator | — | chore/adopt-playbook | [#11](https://github.com/drewcurley/tldw/pull/11) | [artifact](./T-003.md#review-artifact) |
+| [T-001.1](./T-001.1.md) | Draft docs index | analyst | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.2](./T-001.2.md) | Write `architecture.md` | architect | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.17](./T-001.17.md) | Write `contracts.md` ⭐ exhaustive code-grounded inventory | backend-engineer | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.5](./T-001.5.md) | Write `api.md` | backend-engineer | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.4](./T-001.4.md) | Write `data-model.md` | data-engineer | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.6](./T-001.6.md) | Write `stack.md` | architect | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.8](./T-001.8.md) | Write `testing.md` | sdet | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.9](./T-001.9.md) | Write `deployment.md` | devops | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.11](./T-001.11.md) | Set up `decisions/` + Architectural Decision Record 0001 | architect | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.12](./T-001.12.md) | Set up `reviews/` skeleton | review-coordinator | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.13](./T-001.13.md) | Tier 1 review + collect 9 sign-offs | review-coordinator | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.14](./T-001.14.md) | Write `ownership.md` (Directly Responsible Individual map) | architect | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001.15](./T-001.15.md) | Write `onboarding.md` | analyst | 1 | chore/docs-tier1 | — | [artifact](../docs/reviews/T-001-tier-1/final.md) |
 
 ## Cancelled / Superseded
 
