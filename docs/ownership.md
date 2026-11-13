@@ -30,8 +30,8 @@ This mirrors `.github/CODEOWNERS`. GitHub uses the **last** matching pattern for
 | Agent briefs and Claude settings | `.claude/agents/*.md`, `.claude/settings.json` | `/.claude/` (line 18) | `@drewcurley` | none |
 | Conventions | `AGENTS.md`; `CLAUDE.md`; `ADOPTING.md` | `/AGENTS.md` (line 16); `/CLAUDE.md` (line 17); `*` (line 13) for `ADOPTING.md`, which has no line | `@drewcurley` | none |
 | Tasks ledger | `tasks/` | `/tasks/` (line 35) | `@drewcurley` | none |
-| Docs with their own line | `docs/architecture.md`, `docs/stack.md`, `docs/data-model.md`, `docs/api.md`, `docs/testing.md`, `docs/deployment.md`, `docs/decisions/`, `docs/ownership.md`, `docs/onboarding.md`; and, once they exist, `docs/ux.md` and `docs/runbooks/` | their own lines (lines 39-49) | `@drewcurley` | none |
-| Other docs | `docs/README.md`, `docs/contracts.md`, `docs/reviews/`; and, once they exist, `docs/domain.md` and `docs/glossary.md` | `/docs/` (line 38): there is no `/docs/contracts.md` line | `@drewcurley` | none |
+| Docs with their own line | `docs/architecture.md`, `docs/stack.md`, `docs/data-model.md`, `docs/api.md`, `docs/testing.md`, `docs/deployment.md`, `docs/decisions/`, `docs/ownership.md`, `docs/onboarding.md`, `docs/ux.md` and `docs/runbooks/` | their own lines (lines 39-49) | `@drewcurley` | none |
+| Other docs | `docs/README.md`, `docs/contracts.md`, `docs/reviews/`, `docs/domain.md` and `docs/glossary.md` | `/docs/` (line 38): there is no `/docs/contracts.md` line | `@drewcurley` | none |
 | Packaging and repo files | `pyproject.toml`, `uv.lock`, `README.md`, `.gitignore`, `.pre-commit-config.yaml` | `*` (line 13) | `@drewcurley` | none |
 
 **What `CODEOWNERS` leaves to the defaults.** It has no line for `src/`, `extension/`, `tests/` or `/docs/contracts.md`:
@@ -80,7 +80,7 @@ The 9 roles in `AGENTS.md` § 1 (`AGENTS.md:80-96`) run as Claude Code subagents
 - each user runs their own `tldw serve` on their own machine, with their own model plan (`README.md:432-435`, `extension/README.md:110-115`);
 - the server refuses to bind any host but loopback (`src/youtube_tldw/server.py:1935-1938`).
 
-There is no production deployment for anyone to be paged about. A problem with one user's install is that user's to fix, with the procedures in `docs/runbooks/` once they exist (pending, tracked as T-001.10).
+There is no production deployment for anyone to be paged about. A problem with one user's install is that user's to fix, with the procedures in `docs/runbooks/` (start at `docs/runbooks/README.md`; why there is no rotation, paging or escalation is `docs/runbooks/on-call.md`).
 
 These are `UNKNOWN — needs human confirmation`:
 - **How to report a security problem.** The repo has no `SECURITY.md`, and no file names a contact.

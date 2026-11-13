@@ -49,13 +49,13 @@ The workspace model's `docs/repos/**` carve-out (`AGENTS.md:334-336`) is N/A her
 
 `AGENTS.md` § 0 Step 3 (`AGENTS.md:65-69`) says that when `/docs` is empty or missing, building it is the first and only task. For tldw:
 
-- **Until T-001's Tier 1 PR merges into `hackathon/demo`,** `docs/` on that branch holds only the 13 legacy files in `docs/reviews/` (listed [below](#legacy-review-files-pre-playbook-history)). The folder is not empty, but Tier 1 is **missing in substance**, so Step 3 applies: the bootstrap (T-001) is the only work, and no feature work starts.
-- **Once it merges,** every Tier 1 doc is present and Step 3 no longer applies. Feature work may begin (`AGENTS.md:206`).
-- **Tier 2 being open does not block feature work.** Tier 2 has the same consensus rule and protocol, and differs only in timing (`AGENTS.md:208-210`). The owner deferred it under `AGENTS.md` § 12 Knob 3 (`AGENTS.md:538-539`) on 2026-11-12, with a target of the end of the hackathon's first feature PR (`tasks/T-001.md:59`, `tasks/T-001.md:315`). It stays tracked: T-001 stays `in-progress` until Tier 2 completes.
+- **Before T-001's Tier 1 PR (#14, `tasks/T-001.md:8`) merged into `hackathon/demo`,** `docs/` on that branch held only the 13 legacy files in `docs/reviews/` (listed [below](#legacy-review-files-pre-playbook-history)). The folder was not empty, but Tier 1 was **missing in substance**, so Step 3 applied: the bootstrap (T-001) was the only work, and no feature work started.
+- **Since it merged,** every Tier 1 doc is present and Step 3 no longer applies. Feature work may begin (`AGENTS.md:206`).
+- **Tier 2 lands with the T-001 Tier 2 PR** (branch `chore/docs-tier2`). Tier 2 has the same consensus rule and protocol as Tier 1, and differs only in timing (`AGENTS.md:208-210`). The owner first deferred it under `AGENTS.md` § 12 Knob 3 (`AGENTS.md:538-539`) on 2026-11-12, with a target of the end of the hackathon's first feature PR (`tasks/T-001.md:59`, `tasks/T-001.md:451`), then asked for it the same day (`tasks/T-001.md:455`). `domain.md`, `ux.md`, `glossary.md` and `runbooks/` are now present, reviewed by all 9 agents (`reviews/T-001-tier-2/`). With both tiers done, that PR moves T-001 to `completed` (`tasks/T-001.md:406`).
 
 ## What goes here
 
-Every file `/docs/` contains or will contain is listed below and mapped to the `T-001` subtask that delivers it, so coverage can be audited against `tasks/T-001.md`. The skeleton is the one in `AGENTS.md` § 6 (`AGENTS.md:220-243`), with nothing renamed and nothing omitted. What it leaves out because this is a single repo is listed under [Not in this repo](#not-in-this-repo).
+Every file `/docs/` contains is listed below and mapped to the `T-001` subtask that delivers it, so coverage can be audited against `tasks/T-001.md`. The skeleton is the one in `AGENTS.md` § 6 (`AGENTS.md:220-243`), with nothing renamed and nothing omitted. What it leaves out because this is a single repo is listed under [Not in this repo](#not-in-this-repo).
 
 ### Tier 1 — required before any feature work begins
 
@@ -73,8 +73,8 @@ Tier 1 includes the **contract-critical docs** (`contracts.md`, `api.md`, `data-
 | `deployment.md` | DevOps | T-001.9 | present | Environments (the user's machine, and this fork); install; secret management; the CI/CD pipeline on GitHub Actions (`.github/workflows/checks.yml`), with `azure-pipelines.yml` kept but inert; the promotion path; versions; and a tested rollback. |
 | `ownership.md` | Architect + Analyst | T-001.14 | present | The Directly Responsible Individual map. Solo: one owner for everything, no backup, no on-call. Mirrors `.github/CODEOWNERS`, and says what changes when a second maintainer joins. |
 | `onboarding.md` | Analyst | T-001.15 | present | The first-30-minutes path for a hackathon audience, then the read order, development setup, tests, hooks, CI output, and the first PR under this playbook. |
-| `decisions/` | Architect | T-001.11 | present | `README.md` (numbering, status lifecycle; an Architectural Decision Record is never edited, only superseded), `_TEMPLATE.md`, `0001-foundational-stack.md` (local-only, on the user's own Claude plan), `0002-hackathon-fork-departures.md` (where this fork departs from the starter, from T-003), and `0003-local-security-model.md` (plain HTTP on loopback against the "TLS everywhere" redline). Each record states its own status. |
-| `reviews/` | Review Coordinator | T-001.12 | present | `README.md` (where review artifacts go and how folders are named) and `_TEMPLATE.md`. Artifacts live in `reviews/<folder>/`, one file per round plus `final.md`. This bootstrap's are in `reviews/T-001-tier-1/`, including the plan review `plan.md`. Also holds the [legacy files](#legacy-review-files-pre-playbook-history). |
+| `decisions/` | Architect | T-001.11 | present | `README.md` (numbering, status lifecycle; an Architectural Decision Record is never edited, only superseded), `_TEMPLATE.md`, `0001-foundational-stack.md` (local-only, on the user's own Claude plan), `0002-hackathon-fork-departures.md` (where this fork departs from the starter, from T-003), `0003-local-security-model.md` (plain HTTP on loopback against the "TLS everywhere" redline), and `0004-accept-gpl-tts-dependency.md` (the owner's acceptance of piper-tts's GPL-3.0-or-later license for the optional `[tts]` extra, from T-015). Each record states its own status. |
+| `reviews/` | Review Coordinator | T-001.12 | present | `README.md` (where review artifacts go and how folders are named) and `_TEMPLATE.md`. Artifacts live in `reviews/<folder>/`, one file per round plus `final.md`. This bootstrap's are in `reviews/T-001-tier-1/` (Tier 1) and `reviews/T-001-tier-2/` (Tier 2), each including its plan review, `plan.md`. Also holds the [legacy files](#legacy-review-files-pre-playbook-history). |
 
 The Tier 1 review itself, with all 9 sign-offs and the § 6.0 grounding check, is **T-001.13**. Its artifact is `reviews/T-001-tier-1/final.md` (`tasks/T-001.md:10`).
 
@@ -82,18 +82,18 @@ The Tier 1 review itself, with all 9 sign-offs and the § 6.0 grounding check, i
 
 | File | Owner (lead author) | Task | State | Purpose |
 |------|---------------------|------|-------|---------|
-| `domain.md` | Data Engineer + Analyst | T-001.3 | pending, tracked as T-001.3 | The domain: its entities and their key relationships. |
-| `ux.md` | UX Designer | T-001.7 | pending, tracked as T-001.7 | Personas, primary journeys, design-system pointers, accessibility baseline. |
-| `glossary.md` | Analyst | [T-016](../tasks/T-016.md) | pending, tracked as T-016 | Every term used in the codebase, defined once. `AGENTS.md` § 6 item 14 (`AGENTS.md:214`) calls for it, but no `T-001` subtask was seeded for it, so follow-up task T-016 tracks it (`tasks/T-001.md:60`). |
-| `runbooks/` | DevOps | T-001.10 | pending, tracked as T-001.10 | One file per operating procedure, for a user's own install. There is no on-call (see `ownership.md`). |
+| `domain.md` | Data Engineer + Analyst | T-001.3 | present | The domain: its entities, their relationships and cardinality, the constraints (cited from `data-model.md`), and the vocabulary reconciled across the code, the UI copy and the READMEs. |
+| `ux.md` | UX Designer | T-001.7 | present | Personas, primary journeys, design-system pointers (N/A, with the reason), the accessibility baseline, i18n, and the microcopy voice. |
+| `glossary.md` | Analyst | [T-016](../tasks/T-016.md) | present | Every term used across `docs/`, the code identifiers the docs cite, and the UI, each defined once with where it lives. `AGENTS.md` § 6 item 14 (`AGENTS.md:214`) calls for it, but no `T-001` subtask was seeded for it, so follow-up task T-016 tracked it (`tasks/T-001.md:60`). |
+| `runbooks/` | DevOps | T-001.10 | present | One file per operating procedure, for a user's own install: `README.md` (the index, by the message you see), `_TEMPLATE.md`, `incident-severity.md` (Sev1 to Sev3), `on-call.md` (N/A: there is no on-call, see `ownership.md`), and five playbooks: `unreachable-or-token-mismatch.md`, `model-failing.md`, `youtube-rate-limit.md`, `server-busy.md` and `rollback.md`. |
 
-The Tier 2 review, with all 9 sign-offs, is **T-001.16**. Its artifact will be `reviews/T-001-tier-2/final.md` (`tasks/T-001.md:51`).
+The Tier 2 review, with all 9 sign-offs, is **T-001.16**. Its artifacts are in `reviews/T-001-tier-2/`: `plan.md`, `round-1-analysis.md`, `round-2-implementation.md`, `round-3-verification.md` and `final.md` (`tasks/T-001.md:51`).
 
 > **Tier 1 vs. Tier 2 is a discipline tool, not a license to skip.** Both tiers carry the unanimous 9-agent consensus rule. Tier 2 past its target is a process failure that should be retrospected, and missing it past one quarter is a flag (`AGENTS.md:539`).
 
 ### Follow-up tasks from the Tier 1 bootstrap
 
-The Tier 1 docs record weaknesses and `UNKNOWN`s as facts, without changing code (`tasks/T-001.md`, plan rules 2 and 9). Each one is tracked in one of these `proposed` tasks, and each doc's follow-up list names the task for every item:
+The Tier 1 docs record weaknesses and `UNKNOWN`s as facts, without changing code (`tasks/T-001.md`, plan rules 2 and 9). Each one is tracked in one of these tasks, and each doc's follow-up list names the task for every item. All are `proposed` and deferred by the owner (`tasks/T-001.md:314`), except T-016, which Tier 2 completes:
 
 - [T-004](../tasks/T-004.md): Reduce token exposure (startup print, ps, file modes, child env, extension storage)
 - [T-005](../tasks/T-005.md): Harden the server and integration trust boundaries (Origin, Host, timeouts, URL checks, redirects)
@@ -107,7 +107,7 @@ The Tier 1 docs record weaknesses and `UNKNOWN`s as facts, without changing code
 - [T-013](../tasks/T-013.md): Fix server and CLI edge-case bugs the bootstrap found
 - [T-014](../tasks/T-014.md): Make data stores and extension state robust
 - [T-015](../tasks/T-015.md): Get human answers for the docs' UNKNOWNs
-- [T-016](../tasks/T-016.md): Write docs/glossary.md
+- [T-016](../tasks/T-016.md): Write docs/glossary.md (done in Tier 2: `glossary.md` is present)
 - [T-017](../tasks/T-017.md): Record governance gaps of the solo fork
 - [T-018](../tasks/T-018.md): Use the extension's own source of truth for model, whisper and voice lists
 
@@ -150,7 +150,7 @@ Rules for these files:
 
 1. Say that this is a single repo (`AGENTS.md` § 0 Step 0; `CLAUDE.md:19`).
 2. List every file under `/docs/`.
-3. **Read every file, except the 13 legacy files in `docs/reviews/` listed above.** tldw is small enough that nothing else is skipped. Never skip `architecture.md`, `contracts.md`, `data-model.md` or `stack.md`, nor `domain.md` and `glossary.md` once they exist.
+3. **Read every file, except the 13 legacy files in `docs/reviews/` listed above.** tldw is small enough that nothing else is skipped. Never skip `architecture.md`, `contracts.md`, `data-model.md`, `stack.md`, `domain.md` or `glossary.md`.
 4. Say what you loaded in one line, for example: *"Single repo. Loaded N docs: README.md, architecture.md, contracts.md, …"*.
 5. Read `tasks/INDEX.md` and any relevant in-flight task (`AGENTS.md` § 0 Step 2).
 6. **Before changing anything, check `contracts.md`.** If your change touches a documented route, message type, storage key, store format, public signature, integration, env var or config key, treat it as a contract change: run the regression-safety check (`AGENTS.md` § 7 step 8, made concrete in `testing.md`) and update `contracts.md` in the same pull request.
@@ -176,14 +176,15 @@ Rules for these files:
 - **The doc list and task mapping:** checked against `AGENTS.md:191-243` (the Tier 1 and Tier 2 lists and the skeleton), `tasks/T-001.md` (the plan's "Docs and drafters" table and the subtask list, `tasks/T-001.md:105-189`, `:282-303`), and each seeded `tasks/T-001.*.md`. Every T-001 subtask appears exactly once.
 - **The legacy files:** `git ls-files docs` and `git ls-tree --name-only hackathon/demo docs/reviews/` both list exactly the 13 files above. The "what it covers" column paraphrases each file's first heading. `grep -rn 'PLAN-extension' src extension tests scripts` finds only `server.py:3` and `server.py:1938`.
 - **Enforcement claims:** read `.githooks/commit-msg:24-37`, `scripts/ci-checks.sh:112`, `scripts/ci-checks.sh:167`, and `.placeholder-allow`, which does not list `docs/README.md`, so the gate scans this file.
-- **The index against the tree:** `ls -R docs` lists exactly the files and folders named in the Tier 1 table, the 13 legacy files, and the T-001 review folder (`reviews/T-001-tier-1/plan.md`); nothing in the tree is missing from this index, and every Tier 1 row marked `present` exists under the name given, including the five files in `decisions/`. Not yet present, as stated: the Tier 2 files, and `reviews/T-001-tier-1/final.md`, which T-001.13 writes. T-001.13's final review re-runs this check on the assembled tree.
+- **The index against the tree:** `ls -R docs` lists exactly the files and folders named in the Tier 1 and Tier 2 tables, the 13 legacy files, and the two T-001 review folders; nothing in the tree is missing from this index, and every row marked `present` exists under the name given, including the six files in `decisions/` (0001 to 0004, `README.md`, `_TEMPLATE.md`) and the nine in `runbooks/`. `reviews/T-001-tier-1/` holds its five files. When this was drafted, `reviews/T-001-tier-2/` held only `plan.md`; its round files and `final.md` are written by T-001.16, whose final review re-runs this check on the assembled tree.
 - **The follow-up task list:** each of `tasks/T-004.md` to `tasks/T-018.md` exists, and each title below is copied from that file's frontmatter `title`.
 
 ## Update this doc when
 
 - a file or folder is added to, removed from, or renamed in `docs/`;
 - a `T-001` subtask changes ID or state, or a follow-up task (T-004 to T-018) is added, renamed, split or closed;
-- Tier 2 lands (the State column, and the § 0 Step 3 section);
+- a playbook is added to, removed from or renamed in `runbooks/`, or an ADR is added to `decisions/` (the rows that list them);
+- T-001 or a Tier 2 subtask changes state (the State columns, and the § 0 Step 3 section);
 - `AGENTS.md` § 0, § 6, § 6.0 or § 12 changes;
 - `.githooks/commit-msg` or `scripts/ci-checks.sh` changes how the consensus or placeholder gate works;
 - `src/youtube_tldw/server.py`'s docstring or `serve()`'s refusal message stops pointing at `docs/reviews/PLAN-extension.md`, or a new code reference to a legacy file appears;

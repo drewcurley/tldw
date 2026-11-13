@@ -69,7 +69,7 @@ Read `docs/README.md` first: it lists every doc and what it is for. Then:
 
 1. `architecture.md`: the components, how data flows, and the trust boundaries.
 2. `stack.md`: what tldw is built with, and why.
-3. `domain.md`: **pending T-001.3.** Until it lands, `README.md` and `extension/README.md` describe what the product does.
+3. `domain.md`: what the product reasons about (videos, transcripts, summaries, key moments, questions), how those relate, and which word the docs use for each. Keep `glossary.md` open beside it: every term the docs use, defined once.
 4. Then by area:
    - **any change at all:** `contracts.md`, the full inventory of what a change can break;
    - **routes and the server:** `api.md`;
@@ -78,9 +78,11 @@ Read `docs/README.md` first: it lists every doc and what it is for. Then:
    - **install, CI, versions and rollback:** `deployment.md`;
    - **past decisions:** `decisions/`;
    - **who owns what:** `ownership.md`;
-   - **review artifacts:** `reviews/README.md`.
+   - **review artifacts:** `reviews/README.md`;
+   - **the panel, the Options page and who uses them:** `ux.md`;
+   - **something stopped working on your machine:** `runbooks/README.md`, which starts from the message you see.
 
-`ux.md`, `glossary.md` and `runbooks/` are Tier 2 and still pending (see `docs/README.md`). The 13 flat files in `docs/reviews/` are pre-playbook history, not part of this read.
+The 13 flat files in `docs/reviews/` are pre-playbook history, not part of this read.
 
 ## Dev setup
 
@@ -209,5 +211,5 @@ Whether hackathon participants without push access can contribute through fork P
 - `.github/workflows/checks.yml`'s jobs, job names or PR-body headings, `scripts/ci-*.sh`, or `MIN_TESTS` change, or a suite is added to `scripts/test/`;
 - the `hackathon/demo` ruleset changes;
 - `AGENTS.md` § 0, § 5, § 7 or § 8 changes;
-- a pending doc (`domain.md`, `ux.md`, `glossary.md`, `runbooks/`) lands;
+- a doc in the read order (including `domain.md`, `ux.md`, `glossary.md` or `runbooks/README.md`) is added, renamed or removed, or changes what it covers;
 - a second maintainer joins, or the fork-PR or issues question is settled.

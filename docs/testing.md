@@ -9,12 +9,12 @@ How tldw is tested: the levels, the tools, the gates, the test data, and how a c
 | | |
 |---|---|
 | Test runner | pytest (`pyproject.toml:13`, `dev = ["pytest>=8"]`; config at `pyproject.toml:23-32`) |
-| Suite size | 717 tests: 660 before this change, plus 57 in `tests/test_docs_contracts.py` (JUnit count, 2026-11-12) |
+| Suite size | 723 tests: 660 before the Tier 1 docs, plus 63 in `tests/test_docs_contracts.py` (57 from Tier 1, 6 from Tier 2: the runbook-message and manifest-name guards) |
 | JavaScript | No JS test runner. The extension's real functions run in node, driven from pytest (`tests/test_extension_render.py`, `tests/js/*.js`) |
 | End-to-end tool | None. N/A: there is no browser automation tool in the repository |
 | Contract-test tool | None separate. `tests/test_server.py` runs the real HTTP server; `tests/test_docs_contracts.py` checks `docs/contracts.md` against the code |
 | CI | GitHub Actions, `.github/workflows/checks.yml`, job `tldw` ("tldw tests (pytest + extension)", `checks.yml:115-129`), which runs `sh scripts/ci-tldw-tests.sh run` |
-| Gate | Full pass, zero skips, at least `MIN_TESTS=717` tests (`scripts/ci-tldw-tests.sh:27`). No coverage-percentage gate |
+| Gate | Full pass, zero skips, at least `MIN_TESTS=723` tests (`scripts/ci-tldw-tests.sh:27`). No coverage-percentage gate |
 
 ## Test levels
 
@@ -71,7 +71,7 @@ The harnesses run the extension's **real** functions, cut out of the source file
 ### Procedure: hook and CI-script fixture suites (`scripts/test/*.sh`, 16 suites)
 These are shell fixture suites for the git hooks and CI scripts (`.githooks/`, `scripts/*.sh`). CI's `scripts` job runs each one by name (`.github/workflows/checks.yml:30-109`), and `scripts/test/test-ci-wiring.sh` fails if a suite isn't wired in. They test the procedure gates, not tldw. `scripts/test/test-ci-tldw-tests.sh` (32 cases) tests the floor and the zero-skip check of `ci-tldw-tests.sh` itself.
 
-### Docs-contract check: `tests/test_docs_contracts.py` (57 tests)
+### Docs-contract check: `tests/test_docs_contracts.py` (63 tests)
 - **What it checks.**
   - It extracts 23 categories of contract from the code: routes, methods, NDJSON types, `partial` kinds, request and response keys, port messages and names, status codes, CLI subcommands, flags and exit codes, env vars, config keys, storage keys, home paths, temp prefixes, executables, `urlopen` sites, model downloads, manifest permissions, page selectors and thread starts.
   - Each item must appear in `docs/contracts.md` as an exact backticked token.
@@ -81,6 +81,9 @@ These are shell fixture suites for the git hooks and CI scripts (`.githooks/`, `
   - `EXCLUDED` maps every deliberate omission to a reason; an empty reason or a stale entry fails.
   - Every `querySelector` receiver must be classified as page or non-page.
   - A negative test removes `/ask/stream` from a copy of the doc, adds a route that doesn't exist, and asserts that both are reported.
+- **The Tier 2 guards.**
+  - **Runbook messages:** every `> ` quote under a runbook's `## What you see` must equal a whole fixed string in the code. Python strings are found with `ast`, and extension strings with a small JS tokenizer. Messages with variable parts are cited, not quoted. A floor (`RUNBOOK_QUOTE_FLOOR`, 16 today) means a renamed heading can't silently drop a file's quotes, and a negative test checks that a made-up quote fails.
+  - **The manifest name:** `test_manifest_names_match_contracts_md` checks that both manifests' `name` equal each other and the `name` row in `contracts.md`'s manifest keys (T-019).
 - **Where its conventions live.** The module docstring documents the token conventions and how a category's section is found (by heading).
 - **The leak check.** The file also holds the deterministic leak check for `docs/` and new task files: home-directory paths, the secret patterns read from `scripts/ci-checks.sh`, and the template-placeholder marker.
 
@@ -119,9 +122,9 @@ Every test runs with these autouse fixtures. Each guard exists because the thing
 There are **no coverage-percentage gates** at any level: no coverage tool is configured. The only automated gates are these, all in `scripts/ci-tldw-tests.sh`:
 1. pytest must exit 0;
 2. the JUnit report must show **0 failures, 0 errors and 0 skips** (`scripts/ci-tldw-tests.sh:58-62`);
-3. at least `MIN_TESTS` (717) tests must run (`:27`, `:59-60`), so a deleted or uncollected test file fails CI.
+3. at least `MIN_TESTS` (723) tests must run (`:27`, `:59-60`), so a deleted or uncollected test file fails CI.
 
-`MIN_TESTS` is raised by hand when tests are added, and `scripts/test/test-ci-tldw-tests.sh:185` fails if it ever drops below 717. Beyond that, "every contract has a guarding test" is enforced by review (Test Engineer redlines in `.claude/agents/sdet.md`) and by the mapping table below, not by a tool.
+`MIN_TESTS` is raised by hand when tests are added, and `scripts/test/test-ci-tldw-tests.sh:185` fails if it ever drops below 723. Beyond that, "every contract has a guarding test" is enforced by review (Test Engineer redlines in `.claude/agents/sdet.md`) and by the mapping table below, not by a tool.
 
 ## Skips: `skipif(node)` versus CI's zero-skip rule
 `tests/test_extension_render.py` marks all of its tests `skipif(shutil.which("node") is None)` (`:21`, `:34`, `:45`, `:56`). That covers 6 tests, counting the 3 parametrized parse checks.
@@ -185,7 +188,7 @@ There is **no mutation-testing tool**.
 | On-disk stores and home paths | `test_isolation.py:18` (every `Path.home()` constant is redirected); per-store tests in `test_server.py`, `test_usage.py`, `test_hygiene.py`; token file mode (`test_server.py:771-790`); `test_docs_contracts.py[home_paths, temp_prefixes]` | unit and contract | — |
 | `chrome.storage.local` keys and defaults | `test_docs_contracts.py[storage_keys]` (inventory, both directions); `render_checks.js` (`closePolicy`, sponsor counters) | inventory plus a partial harness | `options.js` load/save (`load`, the save handler at `extension/options.js:124-141`) and the differing `DEFAULTS` in `options.js` and `background.js` have no behavioural test (FU-5, [T-010](../tasks/T-010.md)) |
 | Lists copied from the server | `MODELS`: `test_claude_client.py:284`; `WHISPER_POLICIES`: options vs worker only (`render_checks.js:422-432`) | unit / harness | `WHISPER_POLICIES` isn't compared with `server.py:66`; `VOICE_FALLBACK`/`VOICE_OPTIONS` aren't compared with `audio.VOICES` (FU-6, [T-010](../tasks/T-010.md)) |
-| Manifests and the Firefox build | `test_docs_contracts.py[manifest_permissions]` (inventory only) | inventory | **Unguarded:** both manifests (versions kept equal, `host_permissions` tied to port 8765), and `extension/build-firefox.sh`'s copy list (FU-7, [T-010](../tasks/T-010.md)) |
+| Manifests and the Firefox build | `test_docs_contracts.py[manifest_permissions]` (inventory); `test_manifest_names_match_contracts_md` (the `name` key) | inventory; `name` guarded | **Unguarded:** the rest of both manifests (versions kept equal, `host_permissions` tied to port 8765), and `extension/build-firefox.sh`'s copy list (FU-7, [T-010](../tasks/T-010.md)) |
 | YouTube page contract (selectors, transcript panel) | `tests/js/page_transcript_checks.js` (segment rows, panel, transcript button, `#visibility-button`, `meta[itemprop=…]`); `test_docs_contracts.py[page_selectors]` | extension harness | `video.html5-main-video` (seek and play) has no harness test (FU-2, [T-010](../tasks/T-010.md)) |
 | Subprocess integrations and the model I/O contract | `test_proc.py`, `test_claude_client.py` (stream-json parsing, watchdog, env), `test_metadata.py`, `test_videomode.py`, `test_audio.py`, `test_whisper_transcribe.py`; `test_isolation.py:36-46` (real binaries refused); `test_docs_contracts.py[executables, urlopen_sites, model_download_sites]` | unit | Against stubs only. A real `claude`, `yt-dlp` or `ffmpeg` release that changes its output is caught only by use, never in CI (by design: no network, no quota) |
 | Background jobs and threads | conftest's "background work outlived the test" check; `test_server.py` transcription and prefetch tests (`:1541-1664`, `:2663-2976`); `test_docs_contracts.py[thread_starts]` | contract | — |
@@ -198,7 +201,7 @@ There is **no mutation-testing tool**.
 ## What to run before a commit
 From the repository root, in the dev venv:
 1. **The whole tldw suite:** `.venv/bin/python -m pytest -p no:cacheprovider -rs`.
-   - Expect 0 failures and 0 skips, and at least 717 tests.
+   - Expect 0 failures and 0 skips, and at least 723 tests.
    - It includes `tests/test_docs_contracts.py`, so any change to a contract surface also needs `docs/contracts.md` updated.
    - Never run a subset alone before committing a contract-touching change.
 2. **The extension tests are not optional.** With node installed, `-rs` must show no skips; without node, the extension tests did not run.

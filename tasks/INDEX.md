@@ -8,7 +8,7 @@
 
 | ID | Title | Owner | Tier | State | Branch | PR |
 |----|-------|-------|------|-------|--------|----|
-| [T-001](./T-001.md) | Bootstrap `/docs/` folder | review-coordinator | 1+2 | in-progress | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) |
+| _none_ | | | | | | |
 
 ## Backlog — Tier 1 (blocks feature work)
 
@@ -20,12 +20,9 @@
 
 | ID | Title | Owner | State |
 |----|-------|-------|-------|
-| [T-001.3](./T-001.3.md) | Write `domain.md` | data-engineer | proposed |
-| [T-001.7](./T-001.7.md) | Write `ux.md` | ux-designer | proposed |
-| [T-001.10](./T-001.10.md) | Set up `runbooks/` skeleton | devops | proposed |
-| [T-001.16](./T-001.16.md) | Tier 2 review + collect 9 sign-offs | review-coordinator | proposed |
+| _none_ | | | |
 
-## Backlog — follow-ups found by the Tier 1 bootstrap
+## Backlog — follow-ups found by the docs bootstrap (deferred by the owner, 2026-11-12)
 
 | ID | Title | Owner | State |
 |----|-------|-------|-------|
@@ -41,7 +38,6 @@
 | [T-013](./T-013.md) | Fix server and CLI edge-case bugs the bootstrap found | backend-engineer | proposed |
 | [T-014](./T-014.md) | Make data stores and extension state robust | data-engineer | proposed |
 | [T-015](./T-015.md) | Get human answers for the docs' UNKNOWNs | analyst | proposed |
-| [T-016](./T-016.md) | Write docs/glossary.md | analyst | proposed |
 | [T-017](./T-017.md) | Record governance gaps of the solo fork | devops | proposed |
 | [T-018](./T-018.md) | Use the extension's own source of truth for model, whisper and voice lists | frontend-engineer | proposed |
 
@@ -63,6 +59,13 @@
 | [T-001.13](./T-001.13.md) | Tier 1 review + collect 9 sign-offs | review-coordinator | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
 | [T-001.14](./T-001.14.md) | Write `ownership.md` (Directly Responsible Individual map) | architect | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
 | [T-001.15](./T-001.15.md) | Write `onboarding.md` | analyst | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
+| [T-001](./T-001.md) | Bootstrap `/docs/` folder for tldw | review-coordinator | 1+2 | chore/docs-tier1, chore/docs-tier2 | [#14](https://github.com/drewcurley/tldw/pull/14), — | [T1](../docs/reviews/T-001-tier-1/final.md), [T2](../docs/reviews/T-001-tier-2/final.md) |
+| [T-001.3](./T-001.3.md) | Write `domain.md` | data-engineer | 2 | chore/docs-tier2 | — | [artifact](../docs/reviews/T-001-tier-2/final.md) |
+| [T-001.7](./T-001.7.md) | Write `ux.md` | ux-designer | 2 | chore/docs-tier2 | — | [artifact](../docs/reviews/T-001-tier-2/final.md) |
+| [T-001.10](./T-001.10.md) | Set up `runbooks/` skeleton | devops | 2 | chore/docs-tier2 | — | [artifact](../docs/reviews/T-001-tier-2/final.md) |
+| [T-001.16](./T-001.16.md) | Tier 2 review + collect 9 sign-offs | review-coordinator | 2 | chore/docs-tier2 | — | [artifact](../docs/reviews/T-001-tier-2/final.md) |
+| [T-016](./T-016.md) | Write docs/glossary.md | analyst | 2 | chore/docs-tier2 | — | [artifact](../docs/reviews/T-001-tier-2/final.md) |
+| [T-019](./T-019.md) | Name the hackathon extension "TL;DW — Hackathon" | frontend-engineer | — | chore/docs-tier2 | — | [artifact](../docs/reviews/T-001-tier-2/final.md) |
 
 ## Cancelled / Superseded
 

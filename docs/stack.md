@@ -115,7 +115,7 @@ tldw itself has **no license file**. The starter's MIT license was deliberately 
 | Other transitive packages in `uv.lock` | Transitive | `UNKNOWN — needs human confirmation`; not audited | not checked |
 
 **Posture, as facts:**
-- piper-tts is GPL-3.0-or-later and is imported in-process by an optional extra, while tldw has no license of its own. What that means for distributing tldw: `UNKNOWN — needs human confirmation`.
+- piper-tts is GPL-3.0-or-later and is imported in-process by an optional extra, while tldw has no license of its own. The license is **accepted for piper-tts — ADR 0004** (`decisions/0004-accept-gpl-tts-dependency.md`), for 1.4.2 as the optional `[tts]` extra only. What that means for distributing tldw: still `UNKNOWN — needs human confirmation`; ADR 0004 doesn't settle it.
 - `ffmpeg` and `yt-dlp` are run as separate programs, never linked.
 - There is no SBOM, no license scan and no dependency-vulnerability scan in CI. The only supply-chain controls are the hash-locked CI install (`scripts/requirements-ci.txt`) and SHA-pinned actions.
 - Whether any dependency has a known critical vulnerability (CVSS ≥ 9.0): `UNKNOWN — needs human confirmation`. Nothing checks for one.
