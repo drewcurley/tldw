@@ -15,28 +15,28 @@ The extension can't reach the server:
 > That question is taking too long. Is `tldw serve` running?
 > Finding key moments is taking too long. Is `tldw serve` running?
 
-- The first is the panel, when a summary's request fails to connect (`extension/background.js:220`). The second is the same failure for Listen, a question, a voice preview or key moments (`background.js:332`, `:433`, `:485`, `:560`). The third is the Options page's voice preview (`extension/options.js:115`).
-- The last four are the panel's own safety timers, when no answer comes back at all (`extension/content.js:667`, `:1113`, `:1391`, `:1533`).
+- The first is the panel, when a summary's request fails to connect (`extension/background.js:294`). The second is the same failure for Listen, a question, a voice preview or key moments (`background.js:406`, `:507`, `:559`, `:634`). The third is the Options page's voice preview (`extension/options.js:115`).
+- The last four are the panel's own safety timers, when no answer comes back at all (`extension/content.js:688`, `:1140`, `:1418`, `:2829`).
 
 The token doesn't match:
 
 > Token mismatch. Re-check the token in the extension's Options.
 > Token mismatch — check the token from `tldw serve`.
 
-- The first is the panel, for a summary, key moments, a question or Listen (`background.js:572`, `:441`, `:492`). The second is the Options page's voice preview (`options.js:105-106`). Both replace the server's own `missing or invalid token` text, which you never see (`server.py:991`, `:1021`, `:1107`; `docs/contracts.md`, "What the extension does with a status").
+- The first is the panel, for a summary, key moments, a question or Listen (`background.js:646`, `:515`, `:566`). The second is the Options page's voice preview (`options.js:105-106`). Both replace the server's own `missing or invalid token` text, which you never see (`server.py:991`, `:1021`, `:1107`; `docs/contracts.md`, "What the extension does with a status").
 
 No token has been saved at all:
 
 > No server token set. Open the extension's Options and paste the token from `tldw serve`.
 > Paste the token first.
 
-- The first is the panel (`background.js:102`, `:138`, `:252`, `:372`, `:460`, `:504`), the second the Options page's preview button (`options.js:90`).
+- The first is the panel (`background.js:176`, `:212`, `:326`, `:446`, `:534`, `:578`), the second the Options page's preview button (`options.js:90`).
 
 The full list of these messages, with every source line, is in `docs/contracts.md`, "User-facing message contracts".
 
 ## Why it happens
 
-**Can't reach** means the browser's request to the server failed before any answer came back (`background.js:218-221`). Either:
+**Can't reach** means the browser's request to the server failed before any answer came back (`background.js:292-295`). Either:
 1. `tldw serve` isn't running;
 2. it couldn't start, most often because the port is already taken (below);
 3. the extension's **Server URL** in Options points somewhere else. It defaults to `http://127.0.0.1:8765` (`options.js:3`, `background.js:10`).
@@ -70,7 +70,7 @@ The full list of these messages, with every source line, is in `docs/contracts.m
 
 3. **Fix a token mismatch, or a missing token,** by copying the server's token into Options:
    - Copy the token from `~/.config/youtube-tldw/token`. On macOS, `pbcopy < ~/.config/youtube-tldw/token` puts it on the clipboard without showing it on screen.
-   - Open the extension's Options, paste it into **Token**, and click **Save**. "Saved" confirms it (`options.js:137-141`). The next request uses it; nothing needs reloading (`background.js:43-44` reads the settings on every request).
+   - Open the extension's Options, paste it into **Token**, and click **Save**. "Saved" confirms it (`options.js:176-186`). The next request uses it; nothing needs reloading (`background.js:43-44` reads the settings on every request).
    - Paste it **only** into the extension's Options. Never into a chat, an issue, a screenshot, or a file.
    - If you started the server with `--token` or `TLDW_TOKEN`, either paste that value instead, or restart with plain `tldw serve` so the file's token is used. A token on the command line is visible to other local users in `ps` (`docs/deployment.md` § 5; T-004).
    - If you have both the normal and the hackathon extension installed, each keeps its own token in its own Options (T-019, T-004). Paste it into the one you're using.

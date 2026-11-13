@@ -14,7 +14,7 @@ Paths are relative to the repo root. `server.py` means `src/youtube_tldw/server.
 
 | Caller | Routes it uses | Source |
 |---|---|---|
-| The extension's background script | `/summarize/cached`, `/summarize/stream`, `/transcribe/stop`, `/speak/stream`, `/ask/stream`, `/preview`, `/segments/stream` | `extension/background.js:108`, `:149`, `:231`, `:266`, `:385`, `:466`, `:511` |
+| The extension's background script | `/summarize/cached`, `/summarize/stream`, `/transcribe/stop`, `/speak/stream`, `/ask/stream`, `/preview`, `/segments/stream` | `extension/background.js:182`, `:223`, `:305`, `:340`, `:459`, `:540`, `:585` |
 | The extension's Options page (it calls the server directly; it does not message the background script) | `/health`, `/voices`, `/preview` | `extension/options.js:53`, `:70`, `:97` |
 | Tests only | `/summarize` (buffered), `/speak` (buffered) | `tests/test_server.py`; no other caller in the repo. Callers outside the repo: `UNKNOWN — needs human confirmation` |
 
@@ -56,7 +56,7 @@ The content script never talks to the server. It talks to the background script 
 
 - **Default:** `http://127.0.0.1:8765`. The port comes from `--port`, default `8765` (`cli.py:305`), and the host from `--host`, default `127.0.0.1` (`cli.py:304`). There is no path prefix and no version segment.
 - **Allowed hosts:** `serve` refuses any host but `127.0.0.1`, `localhost` and `::1` (`server.py:1935-1939`). `::1` passes that check but fails to bind today; see section 11.
-- **The extension's view:** the base URL is the `serverUrl` setting, default `http://127.0.0.1:8765` (`extension/background.js:10`). Trailing slashes are stripped before a path is appended (`extension/background.js:108`).
+- **The extension's view:** the base URL is the `serverUrl` setting, default `http://127.0.0.1:8765` (`extension/background.js:10`). Trailing slashes are stripped before a path is appended (`extension/background.js:182`).
   - Both manifests grant `host_permissions` for `http://127.0.0.1:8765/*` only (`extension/manifest.json:7`, `extension/manifest.firefox.json:7`).
   - So a different port or host in `serverUrl` is outside the extension's granted hosts. That coupling is documented in `contracts.md` (data and extension sections) and `deployment.md`.
 
@@ -93,7 +93,8 @@ There is **no per-client rate limit**: on loopback, the only client is the user.
   |---|---|---|---|
   | `claude` | 6 | summaries, key moments, questions, and the background prefetch | `server.py:560` |
   | `speech` | 2 | reading aloud, and synthesizing a voice preview | `server.py:561` |
-  | transcription permit | 1 | transcriptions, machine-wide | `server.py:65` |
+  | transcription permit | 1 | transcriptions, machine-wide; also word timing (`/align/stream`), which waits for it at most 20 s | `server.py:65` |
+  | `_align_lock` | 1 | word timing (`/align/stream`, T-020), process-wide; taken only when a window misses the cache | `server.py:72` |
 
   Rules that keep the pools from starving each other:
   - The prefetch never takes the last 2 claude slots, or the last 1 when the caller is handing over its own slot (`keep_free=1`) (`server.py:562`, `server.py:465-466`).
@@ -115,6 +116,7 @@ There is **no per-client rate limit**: on loopback, the only client is the user.
   - the voice (`audio.py:64-70`).
 
   The backend command is operator config, never request-controlled (`claude_client.py:9-10`, `:205-213`). No subprocess uses a shell (`proc.py:1-6`).
+- **Word timing** (`/align/stream`, T-020): at most 200 windows of at most 12 s (40 minutes of audio); one alignment at a time; a 600 s budget for the whole request, download included; a 15 s cap on each ffmpeg cut; never a model download; and after a YouTube 429 a 10-minute in-memory cooldown with no fetch. The extension sends one request per toggle-on and never retries on its own.
 - **CPU guard:** a captionless video longer than the transcription ceiling is refused before any audio is fetched. The ceiling is 2 h by default, or the `whisper_max_minutes` config key. It is checked against yt-dlp's duration, never the client's (`server.py:70`, `server.py:125-133`, `server.py:1382-1400`).
 - **Timeouts:** every subprocess and model call has one (`server.py:682-687`, `server.py:549`, `proc.py:66-102`, `claude_client.py:370-392`).
 - **Not present:**
@@ -145,7 +147,7 @@ Errors come in **three layers**. Every status, and every error string the server
 The speech routes differ: a timeout is `504` and any other `TldrError` is `502` (`server.py:1711`, `server.py:1889`). **`429` always means the server's own concurrency limit**, never YouTube's.
 
 **Rules the code follows:**
-- **`TldrError` text is interface copy.** It is sent verbatim (`str(exc)`), and for most statuses the extension shows it verbatim (`httpError`, `askError` and `speakError` in `extension/background.js:440-447`, `:491-497`, `:571-581`). Rewording a `TldrError` message anywhere in `src/youtube_tldw/` changes what users read.
+- **`TldrError` text is interface copy.** It is sent verbatim (`str(exc)`), and for most statuses the extension shows it verbatim (`httpError`, `askError` and `speakError` in `extension/background.js:514-521`, `:565-571`, `:645-655`). Rewording a `TldrError` message anywhere in `src/youtube_tldw/` changes what users read.
 - **Internals never reach the client.** Anything that isn't a `TldrError` becomes `500` `internal error`, and its detail goes to the server log only (`server.py:1306-1309` and the other `except Exception` blocks).
 - **Validation that can fail happens before the stream starts**, so the client gets a real status rather than a `200` followed by an error line (`server.py:1017-1035`, `server.py:1745-1764`, `server.py:1653-1655`). The exceptions are listed in `contracts.md`: an unknown `whisper` value, a URL that fails the allowlist on `/summarize/stream` and `/segments/stream` (an in-stream `400`, because `_validate` checks only the type), and anything only discovered while working (`server.py:1219-1223`).
 - **A message should name a next step.** That invariant is UX's, recorded in `contracts.md` alongside the extension's copy. Server strings the user can see that name none are listed there as a follow-up.
@@ -172,7 +174,10 @@ The speech routes differ: a timeout is `504` and any other `TldrError` is `502` 
   - **`/ask/stream`:**
     - non-terminal: `delta`;
     - terminal: `answer_done` or `error`.
-- **One terminal event per stream** is the contract the extension relies on. A stream that closes without one is reported as "ended unexpectedly" (`extension/background.js:210-212`, `:321-323`, `:423-425`, `:553-555`). The server ends a stream without a terminal event only when the client has already gone.
+  - **`/align/stream`** (T-020):
+    - non-terminal: `progress` (`message` only), `window` (one per request index, cached ones first);
+    - terminal: `result` (`timed`, `cached`, `failed`) or `error`, which also carries `reason`.
+- **One terminal event per stream** is the contract the extension relies on. A stream that closes without one is reported as "ended unexpectedly" (`extension/background.js:284-286`, `:395-397`, `:497-499`, `:627-629`). The server ends a stream without a terminal event only when the client has already gone.
 - **Liveness:**
   - waiting on a prefetch sends a heartbeat every 2 s, only when it changes (`server.py:1517-1536`);
   - a transcription is narrated every 0.5 s (`server.py:1427-1445`);
@@ -181,6 +186,40 @@ The speech routes differ: a timeout is `504` and any other `TldrError` is `502` 
   - `/speak/stream` and `/ask/stream` guard their writes, and stop the synthesis or the model process when the client leaves (`server.py:1674-1686`, `server.py:1821-1824`).
   - `/summarize/stream` and `/segments/stream` do not guard their writes. That is why a transcription runs outside the request: a closed socket must not throw away minutes of work (`server.py:52-63`).
 - **Ordering:** lines arrive in the order emitted. The speak stream writes from two threads; the speak and ask streams both serialize their writes under one lock, so lines never interleave (`server.py:1670-1686`, `server.py:1775-1786`). On `/ask/stream`, the deltas and the progress both run on the request thread (`claude_client.py:577-579`), so its lock is defensive.
+
+### 7.1 `POST /align/stream` (T-020): word timing for "Cover listed words"
+
+The panel finds the caption lines that hold listed words; this route times the words inside short windows around them. **The word list is never sent**: the server returns every word Whisper heard in each window, and the browser matches them.
+
+**Request** (bearer token, JSON, at most 16 KiB):
+
+```json
+{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "whisper": "ask",
+ "windows": [{"start_ms": 9000, "end_ms": 15500}, {"start_ms": 29000, "end_ms": 35500}]}
+```
+
+- `windows`: 1–200 objects; whole-number (not `bool`) `start_ms < end_ms`, at most 12,000 ms apart. Overlaps are allowed; exact duplicates are timed once and answered for each index.
+- `whisper`: the user's setting, through the same policy as `/summarize/stream`. `off` (sent, or pinned on the server) refuses with `503` `whisper_off`; `ask` and `always` both allow it, because turning the feature on is the consent.
+
+**Response** (`200`, NDJSON):
+
+```
+{"type": "progress", "message": "Fetching the video's audio…"}
+{"type": "progress", "message": "Got the audio. Timing the words…"}
+{"type": "window", "i": 0, "start_ms": 9000, "end_ms": 15500, "words": [{"s": 10300, "e": 10600, "w": "blorp"}], "cached": false}
+{"type": "window", "i": 1, "start_ms": 29000, "end_ms": 35500, "words": [], "cached": false}
+{"type": "result", "timed": 2, "cached": 0, "failed": 0}
+```
+
+(The words are made up.) `s` and `e` are absolute media milliseconds.
+
+**Errors.** Every refusal after the body is validated carries `reason`, as plain JSON before the stream or as an in-stream `error` after it; the `400`s, the `401`, the `411`/`415` and an oversized-body `413` carry none. The order of checks, every `reason` and every text are in `contracts.md` → "Word timing (`/align/stream`, T-020)". In short: `400` bad body; `401`; `413` `too_long` (a window past the Whisper ceiling; an oversized body is a `413` with no `reason`); `503` `whisper_off` / `whisper_missing`; then, only if some window isn't cached, `503` `ffmpeg_missing` / `model_missing`, `429` `busy` / `rate_limited`, `502` `download_failed`, `504` `timeout`, `500` `other`. A failed window is counted in `failed` and the rest continue.
+
+**Behaviour worth knowing before changing it:**
+- **Cache first.** Cached windows are answered before anything is required, so a re-toggle on a seen video needs no ffmpeg, no YouTube call and no CPU, even while another alignment holds the lock.
+- **Full audio once, not sections.** One yt-dlp extraction per request (the same rate-limit cost as `--download-sections`), through the already-hardened `download_audio` with `max_duration_s` set to the ceiling. Then ffmpeg cuts each window locally.
+- **A closed client** is noticed at the next write and stops the loop after the current window, which stays cached. Unlike a transcription, this is not a background job.
+- **Compatibility.** A new route, not a flag, so an older server answers `404` and the panel keeps every hit on its caption-line range ("this tldw serve can't time words"). An older extension never calls it.
 
 ## 8. Versioning, compatibility and deprecation
 
@@ -195,14 +234,14 @@ The speech routes differ: a timeout is `504` and any other `TldrError` is `502` 
 
 **The compatibility procedure, as it works today:**
 1. **Add, don't change.** New behaviour goes on a **new route**, or behind an **opt-in body flag** whose absence means exactly the old behaviour.
-   - Route example: `/summarize/cached` is a separate route rather than a flag on `/summarize/stream`. An older server answers `404`, which the extension already treats as a cache miss, instead of running a summary without the page's transcript (`server.py:1341-1343`, `extension/background.js:113-126`).
+   - Route examples: `/align/stream` (T-020) is new, and an older server's `404` leaves the extension on caption-line ranges. `/summarize/cached` is a separate route rather than a flag on `/summarize/stream`. An older server answers `404`, which the extension already treats as a cache miss, instead of running a summary without the page's transcript (`server.py:1341-1343`, `extension/background.js:118-131`).
    - Flag examples:
      - `stream_audio`: without it, `/speak/stream` sends the single `audio` event older extensions expect (`server.py:1657-1658`);
      - `whisper`: absent means `off`, the pre-transcription behaviour (`server.py:136-160`);
      - `transcribe` (`server.py:1380`).
 2. **Keep reading old request shapes.** `page.captions` is still parsed for extensions older than `page.cues` (`server.py:815-821`).
 3. **Unknown keys are ignored, so a newer client can send fields an older server doesn't know.** The exceptions are the refused values in section 2. Sending a new `model` name to an older server is a `400` `unknown model`, so a new model must reach the server before the extension offers it. `tests/test_claude_client.py:284-294` keeps the extension's `MODELS` lists equal to the server's.
-4. **Clients tolerate the unknown.** The extension skips unparseable lines and event types it doesn't know (`extension/background.js:174-209`), and shows the server's `429` text whatever it says (`extension/background.js:575-577`). A new **non-terminal** event type is therefore safe for old clients. A new **terminal** type is not: an old client reports "ended unexpectedly".
+4. **Clients tolerate the unknown.** The extension skips unparseable lines and event types it doesn't know (`extension/background.js:248-283`), and shows the server's `429` text whatever it says (`extension/background.js:649-651`). A new **non-terminal** event type is therefore safe for old clients. A new **terminal** type is not: an old client reports "ended unexpectedly".
 5. **Removing or renaming a route or field** has no precedent and no defined window. Until the owner defines one: keep the old name working alongside the new one, ship the extension change that stops using it, and record the removal as a decision.
 
 ## 9. Machine-readable schema
@@ -272,7 +311,7 @@ Each one has a follow-up task. The code is unchanged in this pull request.
 - **`--host ::1` passes the loopback check but can't bind.** `ThreadingHTTPServer` is IPv4 by default, so `_Server(("::1", …))` raises `socket.gaierror`, which `cli.py` doesn't catch: a traceback and exit `1` (`server.py:1935`, `server.py:1941`, `cli.py:601-608`).
 - **A JSON body that isn't an object crashes `/speak` and `/speak/stream`.** For example `[1]`: `_validate_speak` calls `body.get` on it (`server.py:1465`). The client gets a closed connection with no response, and the server log gets a traceback.
 - **An empty body is answered `413` `request body too large`** (`server.py:1142-1144`).
-- **The transcription-specific `504` texts never reach the user.** `httpError` replaces every `504` with its summarizing copy (`server.py:1429-1431`, `whisper_transcribe.py:231-233`; `extension/background.js:579`).
+- **The transcription-specific `504` texts never reach the user.** `httpError` replaces every `504` with its summarizing copy (`server.py:1429-1431`, `whisper_transcribe.py:231-233`; `extension/background.js:653`).
 - **A stop during transcription is a `500`**, unless the job was still waiting for the permit. `whisper_transcribe` raises a plain `TldrError("Transcription cancelled.")`, while the server maps only its own `_Cancelled` to `499` (`whisper_transcribe.py:190`, `:212`, `:229`, `:280`, `:292`; `server.py:265-277`).
 - **If the `claude` executable is missing, a streamed call fails with `internal error`.** `subprocess.Popen` raises `FileNotFoundError`, which is not a `TldrError` (`claude_client.py:333-343`). This is derived from the code; no test exercises it.
 - **Unauthenticated callers can map the `POST` routes.** Unknown `POST` paths get `404` before the token check (`server.py:1017-1019`).
@@ -305,7 +344,8 @@ Each one has a follow-up task. The code is unchanged in this pull request.
   - `_authorized`, `_origin_allowed`, `_read_body`, `_validate`, `_model` or `_guarded`;
   - `_STATUS`, the pools, limits or timeouts;
   - any stream's framing or terminal events;
-  - `serve`, `load_or_create_token` or `TOKEN_FILE`.
+  - `serve`, `load_or_create_token` or `TOKEN_FILE`;
+  - `_run_align`'s body, check order, events or reasons (T-020).
 - `src/youtube_tldw/cli.py` changes the `serve` parser or the `--host`/`--port` defaults.
 - `extension/background.js` or `extension/options.js` changes a `fetch(` call, `serverUrl` handling, or a status mapper.
 - Either manifest changes `host_permissions`.

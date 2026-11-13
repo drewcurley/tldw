@@ -77,7 +77,7 @@ There is no secret manager. The seeded T-001.9 criterion carries a template plac
 | tldw token, from the environment | `TLDW_TOKEN`. Used when `--token` is absent. Not written to the file. | Explicit token wins over the file. | Same as above. | `cli.py:603`; `server.py:698-699` |
 | tldw token, from the command line | `--token`. It is in the process's argv, so `ps` shows it to every local user. | — (weakness, recorded) | Any local user. | `cli.py:306` |
 | Token printed at startup | `tldw serve` prints `token: <value>` on **every** start, whichever source it came from. | — (weakness, recorded) | Screen shares, terminal scrollback, pasted logs and issues. Never paste raw `tldw serve` output. | `server.py:1959` |
-| Token in the extension | `chrome.storage.local` key `token`, in plain text. Only `background.js` and `options.js` read it on purpose; `content.js`'s code never reads `token`, but the storage area isn't restricted to trusted contexts (no `setAccessLevel`), and `content.js`'s `onChanged` listener is handed the new token whenever Options saves one. | — (weakness, recorded: `architecture.md` § 7, items 6 and 13) | Anything that can read the browser profile, and the content-script world on the YouTube tab where the panel is open. | `extension/options.js:137`; `extension/background.js:44`; `extension/content.js:50-55` |
+| Token in the extension | `chrome.storage.local` key `token`, in plain text. Only `background.js` and `options.js` read it on purpose; `content.js`'s code never reads `token`, but the storage area isn't restricted to trusted contexts (no `setAccessLevel`), and `content.js`'s `onChanged` listener is handed the new token whenever Options saves one. | — (weakness, recorded: `architecture.md` § 7, items 6 and 13) | Anything that can read the browser profile, and the content-script world on the YouTube tab where the panel is open. | `extension/options.js:176`; `extension/background.js:44`; `extension/content.js:50-55` |
 | The `claude` CLI's own login | The CLI's keychain login, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY` in the environment `tldw serve` runs in. tldw never reads a keychain. At startup it prints only *which variables are set*, never their values. | tldw does not store or forward these. | The user's Claude plan or API billing. | `server.py:660-679`; `README.md:73-74` |
 | CI | No secrets at all. | No job needs or receives a credential. | — | `checks.yml:11-16`, `:111-113`, `:129-130`; `scripts/ci-tldw-tests.sh:20-22` |
 
@@ -167,6 +167,24 @@ All three are bypassable (`--no-verify`, or hooks not installed in a given check
 
 No store needs migrating or restoring: config, the token, caches and `usage.jsonl` are all read tolerantly by both versions tested (below). There is no backup or restore step, because there is no data that a rollback damages.
 
+### What rolling back past T-020 ("Cover listed words") changes
+
+Not tested end to end; each point is from the code.
+
+- **The route is gone.** An extension that has the feature, talking to an older server, gets `404` from `/align/stream` and shows "this tldw serve can't time words…": every hit stays covered by caption line. An older extension has no toggle.
+- **`~/.cache/youtube-tldw/align/` is left behind** (store 13). The older `tldw cache` doesn't know it, so it neither reports nor cleans it. Delete it by hand: `rm -rf ~/.cache/youtube-tldw/align`.
+- **Leftover `muteWords` and `muteSound` keys** in `chrome.storage.local` are harmless: nothing older reads them.
+- **An open tab's session** keeps running with the content script it was injected with until that tab is reloaded. Reload the extension, then the tab (step 5).
+
+### Demo readiness for "Cover listed words" (hackathon fork, T-020)
+
+Checked before a demo, not by CI:
+- `ffmpeg` is on the `PATH` of the shell that runs the demo's `tldw serve` (word timing reports `ffmpeg_missing` otherwise).
+- A faster-whisper model is already in the demo `HOME`'s `~/.cache/youtube-tldw/whisper/`: word timing never downloads one. Transcribing any captionless video once fetches it.
+- Reload in this order after any change: `tldw serve`, then the extension card, then the YouTube tab.
+- Keep the Options page's word list off a shared screen.
+- Mute the browser tab while rehearsing.
+
 ### Tested rollback record (2026-11-12)
 
 **Isolation protocol.** The owner's install and data were not touched:
@@ -234,7 +252,7 @@ curl -s http://127.0.0.1:8799/health
 | `POST /transcribe/stop`, no token | 401 | **404**: route absent at v1.3.0 | 401 |
 
 **What a rollback from HEAD to v1.3.0 changes.** These come from the code at the two refs. Only the rows marked "measured" were exercised.
-- Server routes absent at v1.3.0: `/summarize/cached` and `/transcribe/stop`. Measured 404 for `/transcribe/stop`. The HEAD extension calls both (`extension/background.js:108`, `:231`). It treats any non-OK probe as a cache miss (`background.js:113-126`) and ignores a failed stop (`background.js:230-240`). A HEAD extension against a v1.3.0 server therefore degrades silently: every open re-summarizes, and Stop-transcription does nothing. This is one more reason a rollback moves both halves.
+- Server routes absent at v1.3.0: `/summarize/cached` and `/transcribe/stop`. Measured 404 for `/transcribe/stop`. The HEAD extension calls both (`extension/background.js:182`, `:305`). It treats any non-OK probe as a cache miss (`background.js:187-200`) and ignores a failed stop (`background.js:304-314`). A HEAD extension against a v1.3.0 server therefore degrades silently: every open re-summarizes, and Stop-transcription does nothing. This is one more reason a rollback moves both halves.
 - **Summary cache keys differ.** HEAD adds the transcript `source` to the key (`server.py:748-770`). v1.3.0's key has no source (`server.py:278-290` at the tag). Summaries written by one version are misses for the other, so each re-opened video costs one model call after a rollback, and again after rolling forward.
 - v1.3.0 has no on-disk key-moments store (`txcache.py` at the tag defines only `CACHE_DIR` and `SUMMARY_DIR`). HEAD's `segments/` files are ignored and are still there on roll-forward (measured).
 - Startup cleanup (`hygiene.py`) doesn't exist at v1.3.0. HEAD's `voices/.spoken-tracking-since` marker is left alone, and HEAD reuses it on roll-forward.
@@ -246,7 +264,7 @@ curl -s http://127.0.0.1:8799/health
 | Fact | Invariant | Blast radius | Source |
 |---|---|---|---|
 | Default port `8765`, loopback only | The bind refuses any host other than `127.0.0.1`, `localhost` or `::1`. | The extension's defaults and host permissions assume it. | `cli.py:304-305`; `server.py:1933-1939` |
-| `host_permissions` is exactly `http://127.0.0.1:8765/*` in **both** manifests | It is coupled to the default port and to the literal `127.0.0.1`. A `localhost` URL or any other port isn't covered. | Every background fetch, and the options page's `/health`, `/voices` and `/preview` fetches. | `extension/manifest.json:7`; `extension/manifest.firefox.json:7`; `extension/background.js:108-511`; `extension/options.js:53`, `:70`, `:97` |
+| `host_permissions` is exactly `http://127.0.0.1:8765/*` in **both** manifests | It is coupled to the default port and to the literal `127.0.0.1`. A `localhost` URL or any other port isn't covered. | Every background fetch, and the options page's `/health`, `/voices` and `/preview` fetches. | `extension/manifest.json:7`; `extension/manifest.firefox.json:7`; `extension/background.js:182-585`; `extension/options.js:53`, `:70`, `:97` |
 | A custom `serverUrl` / port | **Server side, measured:** `--port 8799` serves normally. The server answers a CORS preflight from a `chrome-extension://` origin on any port (`OPTIONS` → 204 with `Access-Control-Allow-Origin` echoed, `Allow-Headers: authorization,content-type`, `Allow-Methods: POST,GET,OPTIONS`). The server never checks its own port. **Extension side:** `UNKNOWN — needs human confirmation`. Whether Chromium's extension fetches to a port outside `host_permissions` succeed on CORS alone, or fail, wasn't tested in a browser. It needs a browser, so it can't be settled in this docs pass → [T-015](../tasks/T-015.md). | Anyone running a second server or a non-default port. | `server.py:932-940`, `:966-970` |
 | Firefox's origin | **Measured:** with no `--allow-origin`, an `Origin: moz-extension://…` request gets no `Access-Control-Allow-Origin` header, and neither does a web origin. Only the `chrome-extension://` prefix passes (`server.py:924`). Whether Firefox's extension fetches send that origin and are blocked, or are exempted by host permissions, is `UNKNOWN — needs human confirmation`. `--allow-origin` can pin one exact origin. | Firefox users. | `server.py:917-924`; `cli.py:307-308` |
 | Logs | No log file and no rotation. Status lines go to **stdout** through `print`. Per-request lines (the request line as sent, so the method, the path including any query string, and the HTTP version, plus the status; no body or headers, so never the token. The extension sends no query strings) go to **stderr** through the stdlib's default `log_message`. Model calls are appended to `~/.config/youtube-tldw/usage.jsonl` (owner-only, append-only; `tldw cache clean` doesn't touch it). | Capture both streams when you report a problem, and strip the `token:` line first. | `server.py:962-963`, `:1942-1963`; `usage.py:26`, `:184-189` |

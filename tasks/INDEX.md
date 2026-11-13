@@ -45,6 +45,7 @@
 
 | ID | Title | Owner | Tier | Branch | PR | Review |
 |----|-------|-------|------|--------|----|--------|
+| [T-020](./T-020.md) | Bleep (or mute, or moo) listed words in a YouTube video, timed to the word | frontend-engineer | — | feat/profanity-mute | [#17](https://github.com/drewcurley/tldw/pull/17) | [artifact](../docs/reviews/T-020/build-5.6.md) |
 | [T-003](./T-003.md) | Adopt the agentic starter (bb9406f) as this repo's playbook | review-coordinator | — | chore/adopt-playbook | [#11](https://github.com/drewcurley/tldw/pull/11) | [artifact](./T-003.md#review-artifact) |
 | [T-001.1](./T-001.1.md) | Draft docs index | analyst | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |
 | [T-001.2](./T-001.2.md) | Write `architecture.md` | architect | 1 | chore/docs-tier1 | [#14](https://github.com/drewcurley/tldw/pull/14) | [artifact](../docs/reviews/T-001-tier-1/final.md) |

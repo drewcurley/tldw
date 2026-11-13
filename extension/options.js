@@ -25,6 +25,34 @@ const VOICE_FALLBACK = [
   { id: "northern", label: "Northern — male (UK)" },
 ];
 
+// --- T-020 options: cover listed words (BEGIN) -----------------------------------
+// Pure, so tests/js/options_mute_checks.js can run it. The normaliser and the
+// defaults come from mute_words.js (loaded first by options.html), the same single
+// copy content.js uses.
+const MUTE_SOUND_CHOICES = ["bleep", "mute", "moo"];
+
+function muteSoundValue(v) {
+  return MUTE_SOUND_CHOICES.includes(v) ? v : "bleep";
+}
+
+// What the textarea shows: the stored list, or the default when never set.
+function muteWordsText(stored, defaults) {
+  if (typeof stored === "string") return stored;
+  return Array.isArray(defaults) ? defaults.join("\n") : "";
+}
+
+// What Save does with the textarea: an empty box saves "" (off); a list equal to
+// the default removes the key, so a later change to the shipped default reaches
+// this user; anything else saves the normalised list.
+function muteWordsSave(text, defaults, normalise) {
+  const mine = normalise(text);
+  if (!mine.length) return { set: "" };
+  const def = normalise(Array.isArray(defaults) ? defaults.join("\n") : "");
+  if (mine.join("\n") === def.join("\n")) return { remove: true };
+  return { set: mine.join("\n") };
+}
+// --- T-020 options: cover listed words (END) -------------------------------------
+
 function fillVoices(list, selected) {
   const sel = document.getElementById("voice");
   sel.innerHTML = list.map((v) => `<option value="${v.id}">${v.label}</option>`).join("");
@@ -45,6 +73,10 @@ async function load() {
   document.getElementById("model").value =
     MODELS.includes(s.model) ? s.model : DEFAULTS.model;
   fillVoices(VOICE_FALLBACK, s.voice);
+  const mute = await api.storage.local.get(["muteWords", "muteSound"]);
+  document.getElementById("muteWords").value =
+    muteWordsText(mute.muteWords, globalThis.TLDW_MUTE_DEFAULTS);
+  document.getElementById("muteSound").value = muteSoundValue(mute.muteSound);
   // The model picker is Claude-CLI specific. Ask the server what it's actually
   // talking to rather than assuming, so a bring-your-own-model setup doesn't show
   // a control that does nothing.
@@ -121,6 +153,12 @@ async function preview() {
 
 document.getElementById("preview").addEventListener("click", preview);
 
+// Restore refills the box and writes nothing; Save then removes the key.
+document.getElementById("muteRestore").addEventListener("click", () => {
+  document.getElementById("muteWords").value =
+    muteWordsText(undefined, globalThis.TLDW_MUTE_DEFAULTS);
+});
+
 document.getElementById("save").addEventListener("click", async () => {
   const serverUrl = document.getElementById("serverUrl").value.trim() || DEFAULTS.serverUrl;
   const token = document.getElementById("token").value.trim();
@@ -134,11 +172,18 @@ document.getElementById("save").addEventListener("click", async () => {
   const whisperPick = document.getElementById("whisper").value;
   const whisper = WHISPER_POLICIES.includes(whisperPick) ? whisperPick
                                                          : DEFAULTS.whisper;
+  const muteSound = muteSoundValue(document.getElementById("muteSound").value);
   await api.storage.local.set({ serverUrl, token, voice, closeAction, model,
-                                segmentRatio, whisper });
+                                segmentRatio, whisper, muteSound });
+  const words = muteWordsSave(document.getElementById("muteWords").value,
+    globalThis.TLDW_MUTE_DEFAULTS, globalThis.TLDW_normaliseMuteList);
+  if (words.remove) await api.storage.local.remove("muteWords");
+  else await api.storage.local.set({ muteWords: words.set });
   const status = document.getElementById("status");
-  status.textContent = "Saved";
-  setTimeout(() => (status.textContent = ""), 1500);
+  // Cover listed words picks up muteSound and muteWords while on (rev 5.6), and
+  // this tab is where the user is when that happens.
+  status.textContent = "Saved. Videos where Cover listed words is on use the new settings right away.";
+  setTimeout(() => (status.textContent = ""), 4000);
 });
 
 load();

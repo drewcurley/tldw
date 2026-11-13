@@ -14,14 +14,14 @@ The code, the UI copy and the docs sometimes use different words for the same th
 
 | Words | The one thing | Where it lives |
 |---|---|---|
-| **tldw**, **TL;DW**, **youtube-tldw** | `tldw` is the command and the name `/health` reports (`server.py:975`). `TL;DW` is the product's name in UI copy (`content.js:251`, `options.html:27`), and also names its output, a "text TL;DW" or "video TL;DW" (`README.md:105-108`). `youtube-tldw` is the Python distribution (`pyproject.toml:6`) and the name of its directories (`~/.cache/youtube-tldw/`, `~/.config/youtube-tldw/`). `youtube_tldw` is the import package (`src/youtube_tldw/`). | `architecture.md` § 1 |
-| **key moments**, **segments**, **selection**, **skip playback** | The parts of a video the model picks for playback. The UI says "key moments" (`content.js:856`); the routes, events and caches say "segments" (`/segments/stream`, `segment_added`, `SEGMENT_DIR`); the code that makes them says "selection" (`core.select_segments`, `core.py:90-151`); playing them in the YouTube player is "skip playback" (`contracts.md`, "Background → content port messages"). | `contracts.md`, "NDJSON events" |
-| **Listen**, **read aloud**, **speak**, **speech**, **TTS** | Turning a summary into spoken mp3 audio with Piper. The button says "Listen to summary" (`content.js:857`); the routes are `/speak` and `/speak/stream`; the pool is `speech`. | `architecture.md` § 3.2 |
-| **Ask**, **questions**, **Q&A** | Follow-up questions about a video, answered from its transcript. The UI says "Ask about this video" (`content.js:944`); the route is `/ask/stream`; the code module is `ask.py`. | `contracts.md`, "HTTP routes" |
+| **tldw**, **TL;DW**, **youtube-tldw** | `tldw` is the command and the name `/health` reports (`server.py:975`). `TL;DW` is the product's name in UI copy (`content.js:272`, `options.html:27`), and also names its output, a "text TL;DW" or "video TL;DW" (`README.md:105-108`). `youtube-tldw` is the Python distribution (`pyproject.toml:6`) and the name of its directories (`~/.cache/youtube-tldw/`, `~/.config/youtube-tldw/`). `youtube_tldw` is the import package (`src/youtube_tldw/`). | `architecture.md` § 1 |
+| **key moments**, **segments**, **selection**, **skip playback** | The parts of a video the model picks for playback. The UI says "key moments" (`content.js:877`); the routes, events and caches say "segments" (`/segments/stream`, `segment_added`, `SEGMENT_DIR`); the code that makes them says "selection" (`core.select_segments`, `core.py:90-151`); playing them in the YouTube player is "skip playback" (`contracts.md`, "Background → content port messages"). | `contracts.md`, "NDJSON events" |
+| **Listen**, **read aloud**, **speak**, **speech**, **TTS** | Turning a summary into spoken mp3 audio with Piper. The button says "Listen to summary" (`content.js:878`); the routes are `/speak` and `/speak/stream`; the pool is `speech`. | `architecture.md` § 3.2 |
+| **Ask**, **questions**, **Q&A** | Follow-up questions about a video, answered from its transcript. The UI says "Ask about this video" (`content.js:970`); the route is `/ask/stream`; the code module is `ask.py`. | `contracts.md`, "HTTP routes" |
 | **captions**, **subtitles**, **auto-captions** | The timed text YouTube serves for a video. The code says `captions` (`txcache.py:36`); the UI copy and some error text say "subtitles" or "auto-captions" (`options.html:57`, `metadata.py:121-124`). | `contracts.md`, "Pass-through `TldrError` text" |
 | **Whisper**, **faster-whisper**, **transcription** | Making a transcript from a video's audio, on the user's machine, with the faster-whisper library (optional `[whisper]` extra, `pyproject.toml:14-15`). "Whisper" is the UI's and the config key's name for it. | `architecture.md` § 2.1 |
 | **worker**, **background worker**, **service worker**, **event page**, `background.js` | The extension's background script. Chrome runs it as an MV3 service worker; Firefox runs the same file as an event page (`manifest.json:8`, `manifest.firefox.json:8`). | `contracts.md`, "Manifest keys" |
-| **panel**, **popup**, **modal** | The summary UI drawn on the YouTube page. The Options copy calls it "the popup" (`options.html:76`) and the READMEs "the modal"; the code, the docs and the tasks call it the panel; its accessibility role is a modal dialog (`content.js:249`). | `contracts.md`, "Dialog semantics and focus" |
+| **panel**, **popup**, **modal** | The summary UI drawn on the YouTube page. The Options copy calls it "the popup" (`options.html:76`) and the READMEs "the modal"; the code, the docs and the tasks call it the panel; its accessibility role is a modal dialog (`content.js:270`). | `contracts.md`, "Dialog semantics and focus" |
 | **the owner**, **the user**, **the operator** | One person in this repo: the solo maintainer, who is also the only known user (`ownership.md`). "The operator" is whoever configures the server (`TLDW_LLM_CMD`, `config.json`), as opposed to a request. | `ownership.md`; `ux.md` (personas) |
 | **busy**, **`429`** | tldw's own concurrency limit refusing work. It never means YouTube's rate limit, which tldw reports as a `500` (`metadata.py:66-76`). | `api.md` § 6 |
 
@@ -38,29 +38,29 @@ The entities here are defined in full, with their relationships and cardinality,
 | **transcript** | A video's text as timed cues, with the metadata it came with and its source. An entity. | `domain.md`; `data-model.md` § 1 |
 | **cue** | One timed line of a transcript. On disk it is a `[start_ms, end_ms, text]` triple (`data-model.md` § 1); in the page payload it is `{start_ms, text}` (`transcript.py:104-140`). | `data-model.md` § 1 |
 | **transcript source** | Where a transcript came from: `captions` or `audio:<model>` (for example `audio:small`) (`txcache.py:36-46`). A page-read transcript is stored as `captions` (`server.py:1311-1316`). It is part of the summary and segment keys. | `contracts.md`, "Cross-cutting data invariants" |
-| **page transcript**, **page payload**, `page` | The transcript, title, channel and duration the extension reads from the YouTube page itself and sends with `summarize`, so the server needn't ask YouTube (`content.js:517-544`, `server.py:785-834`). Untrusted and bounded (I-15). | `contracts.md`, "The `summarize` message's `page` payload" |
-| **transcript panel** | YouTube's own "Show transcript" engagement panel, which the extension opens, reads and closes (`content.js:517-554`). | `contracts.md`, "Open, read, close: the transcript panel flow" |
+| **page transcript**, **page payload**, `page` | The transcript, title, channel and duration the extension reads from the YouTube page itself and sends with `summarize`, so the server needn't ask YouTube (`content.js:538-565`, `server.py:785-834`). Untrusted and bounded (I-15). | `contracts.md`, "The `summarize` message's `page` payload" |
+| **transcript panel** | YouTube's own "Show transcript" engagement panel, which the extension opens, reads and closes (`content.js:538-575`). | `contracts.md`, "Open, read, close: the transcript panel flow" |
 | **captionless video** | A video with no captions or auto-captions, so its transcript can only come from its audio. | `architecture.md` § 3.2 |
 | **summary** | The model's condensed version of a video: key points, a markdown body and a rationale. An entity. | `domain.md`; `contracts.md`, "Summary payload" |
 | **summary payload**, `_to_payload` | The dict a summary travels as: returned by `/summarize`, carried by the `result` event, stored in the summary cache (`server.py:1904-1921`). Its keys are interface. | `contracts.md`, "Summary payload" |
 | **key points**, `key_points` | The summary's list of short takeaway strings. | `contracts.md`, "Summary payload" |
-| `summary_md` | The summary's markdown body. Sent to `/speak*` as `summary` (`background.js:271`). | `contracts.md`, "Summary payload" |
+| `summary_md` | The summary's markdown body. Sent to `/speak*` as `summary` (`background.js:345`). | `contracts.md`, "Summary payload" |
 | **rationale** | The model's note on how much it compressed and why (`rationale`, also `chosen_ratio`, which is parsed but never shown; `summarize.py:174-184`, `domain.md`). | `contracts.md`, "Model I/O contract" |
 | **original length**, `original_length` | The video's length, formatted `12m34s`-style (`timing.format_length`, `timing.py:68-79`). | `data-model.md` § 2 |
 | **length label**, `length_label` | The summary's reading time, formatted `2m`-style (`timing.read_time_label`, `timing.py:82-85`). The CLI also puts it in output file names. | `data-model.md` § 2 |
 | **ratio**, **summary ratio** | The target fraction of the original length, a number in `(0, 1]` (`server.py:1155-1162`). Absent, or "Auto" in the UI, means the model chooses (`cli.py:57-59`, `options.html:49`). | `contracts.md`, "Request body keys" |
-| **segment ratio**, `segment_ratio`, `segmentRatio` | The ratio used for key moments, set by the Options "Key moments length" picker (Auto, Tight, Balanced, Generous; `options.html:47-52`). Stored as a string, sent as `segment_ratio` to summarize and as `ratio` to `/segments/stream` (`background.js:514`). | `contracts.md`, "chrome.storage.local keys" |
+| **segment ratio**, `segment_ratio`, `segmentRatio` | The ratio used for key moments, set by the Options "Key moments length" picker (Auto, Tight, Balanced, Generous; `options.html:47-52`). Stored as a string, sent as `segment_ratio` to summarize and as `ratio` to `/segments/stream` (`background.js:588`). | `contracts.md`, "chrome.storage.local keys" |
 | **single pass**, **map-reduce** | How a long transcript is summarized: in one model call up to `SINGLE_PASS_CHARS`, otherwise in chunks then combined (`summarize.py:17`). The browser routes refuse anything that would need map-reduce (`413`). | `contracts.md`, "Limits, pools and slots" |
 | **key moments** | See section 1. An entity: a video's segment selection. | `domain.md` |
 | **segment** | One key moment as the server sends it: `{start, end, label}`, in seconds, with an `m:ss` label (`core.py:132-136`, `:148-150`). | `contracts.md`, "NDJSON events" |
 | **cue range** | The model's pick, as a pair of cue indexes `first_cue`, `last_cue` (`summarize.py:205-231`). `VideoSelection.ranges` holds them (`summarize.py:182-185`). | `contracts.md`, "Model I/O contract" |
 | **span**, `Span` | A cue range turned into milliseconds, merged and padded, ready to cut (`spans.py:15-31`, `spans_from_cue_ranges`, `spans.py:33`). `MIN_CLIP_MS` and `BOUNDARY_PAD_MS` shape it (`core.py:22-23`). | `domain.md` (CLI output) |
-| **clip** | UI copy for one segment while skip playback plays it ("Clip 2/5", `content.js:1779`). In CLI video mode, one cut span (`MIN_CLIP_MS`). | `domain.md` § 5 |
+| **clip** | UI copy for one segment while skip playback plays it ("Clip 2/5", `content.js:3075`). In CLI video mode, one cut span (`MIN_CLIP_MS`). | `domain.md` § 5 |
 | **key-moment prefetch**, **prefetch** | A background segment selection started after a summary, so "Play key moments" is instant (`server.py:434-522`). It spends a model call whether or not the key moments are played. | `contracts.md`, "Threads"; `architecture.md` § 3.5 |
 | `max_length`, `--max-length` | A hard cap on the selection's length, as a duration string such as `90s` or `5m` (`cli.py:60-62`). A capped request is never cached (`server.py:1554-1558`). | `contracts.md`, "Request body keys" |
 | **question**, **history**, **turn** | A Q&A request carries the new question and the earlier turns as `{role, content}` items, trimmed by `ask.py:17-19`. | `contracts.md`, "Request body keys" |
 | **Q&A session**, **session id** | The `claude` CLI's own conversation for one video, so a follow-up needn't re-send the transcript. tldw keeps only the id, in memory (`_ask_sessions`, `server.py:45`), and passes it as `--resume`. An entity. | `domain.md`; `data-model.md` § 10 |
-| **citation** | A `12:34`-style timestamp in an answer that seeks the player (`.ts`, `content.js:1289-1290`). | `contracts.md`, "Accessible names" |
+| **citation** | A `12:34`-style timestamp in an answer that seeks the player (`.ts`, `content.js:1316-1317`). | `contracts.md`, "Accessible names" |
 | **voice** | One of the allowlisted Piper voice models in `audio.VOICES` (`audio.py:44-58`), with `female` and `male` aliases (`audio.py:59-70`). The default is `amy`. | `contracts.md`, "Lists mirrored from the server" |
 | **voice preview** | A short sample of a voice, from the panel or the Options page, through `/preview` (`server.py:1857-1901`). It takes no slot when memoized. | `contracts.md`, "HTTP routes" |
 | **spoken script** | The speakable text built from a summary's fields, with no markdown or URLs (`audio.build_spoken_script`, `audio.py:353`). | `architecture.md` § 3.2 |
@@ -104,7 +104,7 @@ The TL;DW output is an entity in [`domain.md`](domain.md).
 | **definition sites** | The places in `server.py` that must agree for a route to work: `do_GET`, the `do_POST` chain, the "not one of ours" tuple, the in-slot dispatch, `_body_limit`, `do_OPTIONS` (`server.py:966-1049`). | `api.md` § 10.1; `contracts.md`, "Where routes are defined" |
 | **buffered route**, **stream route** | `/<action>` answers in one JSON or mp3 body; `/<action>/stream` sends NDJSON as the work proceeds. | `api.md` § 2 |
 | **open GETs** | `GET /health` and `GET /voices`, the only routes with no token (`server.py:972-980`). Security invariant I-3. | `architecture.md` § 6 |
-| **probe**, **cache probe** | `POST /summarize/cached` and the `probeCache`/`probe` port messages: ask for a cached summary before reading the page. Any failure is a miss, so an older server's `404` reads as a miss (`server.py:1330-1369`, `background.js:92-127`). | `contracts.md`, "HTTP routes" |
+| **probe**, **cache probe** | `POST /summarize/cached` and the `probeCache`/`probe` port messages: ask for a cached summary before reading the page. Any failure is a miss, so an older server's `404` reads as a miss (`server.py:1330-1369`, `background.js:166-201`). | `contracts.md`, "HTTP routes" |
 | **hit**, **miss** | A cache read that found a usable entry, or didn't. A bad, expired or older-shape entry is a miss, never an error. | `data-model.md`, "No version markers" |
 | **NDJSON** | Newline-delimited JSON, `application/x-ndjson`: one JSON object per line, flushed one at a time, ending when the socket closes. | `api.md` § 7 |
 | **event**, **stream event**, `type` | One NDJSON line. Every one carries a `type`. Not the same as a port message, even where the spelling matches. | `contracts.md`, "NDJSON events" |
@@ -154,35 +154,43 @@ Journeys through these controls are in [`ux.md`](ux.md).
 | **toolbar action**, **"TL;DW this video"** | The toolbar button, the extension's only entry point; its tooltip is `default_title` (`manifest.json:9-12`, `background.js:58`). There is no keyboard shortcut. | `contracts.md`, "Manifest keys" |
 | **content script**, `content.js` | The script injected into the YouTube tab on a click. It draws the panel and reads the page, and never calls the server. | `contracts.md`, "Extension message protocol" |
 | **Options page** | `options.html` / `options.js`: the extension's settings, saved to `chrome.storage.local`. It calls the server directly. | `contracts.md`, "Extension → server HTTP calls" |
-| **shadow root** | The panel lives in an open shadow root under `#tldw-host` (`content.js:136`). Open means YouTube's scripts can read it (architecture § 7, item 9). | `architecture.md` § 5 |
-| **toast** | tldw's own one-line notice on the page (`#tldw-toast`, `role="status"`), used when the panel was closed mid-run (`content.js:754-775`). | `contracts.md`, "Fixed messages from the panel and Options" |
-| **skip pill** | The small floating control (`#tldw-pill`) with previous, next and stop buttons during skip playback (`content.js:1650-1789`). | `contracts.md`, "Page selectors" |
+| **shadow root** | The panel lives in an open shadow root under `#tldw-host` (`content.js:150`). Open means YouTube's scripts can read it (architecture § 7, item 9). | `architecture.md` § 5 |
+| **toast** | tldw's own one-line notice on the page (`#tldw-toast`, `role="status"`), used when the panel was closed mid-run (`content.js:775-796`). | `contracts.md`, "Fixed messages from the panel and Options" |
+| **skip pill** | The small floating control (`#tldw-pill`) with previous, next and stop buttons during skip playback (`content.js:2946-3085`). | `contracts.md`, "Page selectors" |
 | **port**, **port name** `tldw` | A long-lived `runtime.connect` channel from the content script to the worker; each piece of work opens its own. The worker drops any port not named `tldw` (`background.js:71`). | `contracts.md`, "Port name" |
 | **port message** | One message on a port, such as `summarize`, `probe`, `askDelta`. The extension's internal protocol, not the server's NDJSON. | `contracts.md`, "Content → background port messages" |
 | `TLDW_INVOKE`, `TLDW_ERROR` | The two one-shot `tabs.sendMessage` messages the worker sends after a toolbar click (`background.js:54-68`). | `contracts.md`, "Background → content via `tabs.sendMessage`" |
 | **ping**, **keepalive** | A port message sent every 20 s and ignored on purpose; it keeps the MV3 worker alive through a long fetch (`background.js:81`). | `contracts.md`, "Content → background port messages" |
 | **safety timer**, **panel timer** | The panel's own timeout, so it can say something if the worker goes quiet. | `contracts.md`, "Matching timeouts between panel and worker" |
 | **worker budget** | The worker's own timeout per request (`CLIENT_TIMEOUT_MS`, `TRANSCRIBE_TIMEOUT_MS` and the others, `background.js:16-23`). It should run out before the panel timer. | `contracts.md`, "Matching timeouts between panel and worker" |
-| **close action**, `closeAction`, **close policy** | What closing the panel mid-run does: `continue` ("Keep working in the background") or `abort` ("Stop and discard") (`options.html:68-71`; `closePolicy`, `content.js:59-64`). | `contracts.md`, "chrome.storage.local keys" |
+| **close action**, `closeAction`, **close policy** | What closing the panel mid-run does: `continue` ("Keep working in the background") or `abort` ("Stop and discard") (`options.html:68-71`; `closePolicy`, `content.js:73-78`). | `contracts.md`, "chrome.storage.local keys" |
 | **backgrounded run** | A run whose panel was closed under `continue`; it finishes and announces itself with a toast. | `contracts.md`, "Fixed messages from the panel and Options" |
-| **Regenerate**, `refresh` | The `↻` control: summarize again, ignoring the cached summary but keeping the transcript (`content.js:253`; `refresh`, `server.py:1217`). | `contracts.md`, "Accessible names" |
-| **" (cached)"** | The heading suffix meaning "not freshly generated for this click" (`content.js:930`). | `contracts.md`, "Text the code depends on" |
-| **"transcribed from audio" note** | The panel's provenance note, shown when `transcript_source` starts with `audio:` (`content.js:1895-1897`). | `contracts.md`, "Result payload keys the panel reads" |
-| **"trimmed video" note** | The header note giving the key moments' total length (`trimmedNote`, `content.js:1666`, `:1680`). | `contracts.md`, "Text the code depends on" |
-| **Play key moments** | The `⏭` control that starts skip playback (`.playkey`, `content.js:856`). | `contracts.md`, "Accessible names" |
-| **Listen**, **Stop**, **download** | The speech controls: generate audio, stop generating, save the mp3 (`.listen`, `.dl`; `content.js:857`, `:1869-1870`). | `contracts.md`, "Accessible names" |
-| **Transcribe the audio**, **Stop transcribing** | Accept a transcription offer, or stop a running transcription (`.transcribe`, `.stoptx`; `content.js:824`, `:692-694`). | `contracts.md`, "Accessible names" |
+| **Regenerate**, `refresh` | The `↻` control: summarize again, ignoring the cached summary but keeping the transcript (`content.js:274`; `refresh`, `server.py:1217`). | `contracts.md`, "Accessible names" |
+| **" (cached)"** | The heading suffix meaning "not freshly generated for this click" (`content.js:956`). | `contracts.md`, "Text the code depends on" |
+| **"transcribed from audio" note** | The panel's provenance note, shown when `transcript_source` starts with `audio:` (`content.js:3191-3193`). | `contracts.md`, "Result payload keys the panel reads" |
+| **"trimmed video" note** | The header note giving the key moments' total length (`trimmedNote`, `content.js:2962`, `:2976`). | `contracts.md`, "Text the code depends on" |
+| **Play key moments** | The `⏭` control that starts skip playback (`.playkey`, `content.js:877`). | `contracts.md`, "Accessible names" |
+| **Listen**, **Stop**, **download** | The speech controls: generate audio, stop generating, save the mp3 (`.listen`, `.dl`; `content.js:878`, `:3165-3166`). | `contracts.md`, "Accessible names" |
+| **Transcribe the audio**, **Stop transcribing** | Accept a transcription offer, or stop a running transcription (`.transcribe`, `.stoptx`; `content.js:845`, `:713-715`). | `contracts.md`, "Accessible names" |
 | **sponsor ask** | The panel's occasional request for sponsorship, shown after enough summaries and a limited number of times (`sponsorShown`, `sponsorDismissed`; `SPONSOR_AFTER_VIDEOS`, `SPONSOR_MAX_SHOWS`, `content.js:40-41`). | `contracts.md`, "chrome.storage.local keys" |
 | `serverUrl` | The Options "Server URL" setting: where every request, and the token, goes (`background.js:10`, `options.js:3`). | `contracts.md`, "chrome.storage.local keys" |
 | **host permission** | The manifest's `host_permissions`, exactly `http://127.0.0.1:8765/*`, coupled to the default `serverUrl` and port (`manifest.json:7`). | `contracts.md`, "Manifest permissions" |
 | `DEFAULTS` | The settings defaults, defined in three places that differ: `background.js`, `options.js` and `content.js`'s inline defaults. | `contracts.md`, "chrome.storage.local keys" |
 | **mirrored lists** | Extension copies of a server list: `MODELS`, `WHISPER_POLICIES`, `VOICE_OPTIONS`, `VOICE_FALLBACK`, `RATIOS`, `sanitizeField`. Some are test-guarded and some are not. | `contracts.md`, "Lists mirrored from the server" |
-| **hotkey shield** | Window-level capture listeners that stop keystrokes in the panel reaching YouTube's shortcuts (`onKey`, `shieldKey`, `content.js:268-294`). | `contracts.md`, "Keys" |
-| **Tab trap** | Tab and Shift+Tab wrapping focus inside the panel (`content.js:307-319`); its known gaps are T-009's. | `contracts.md`, "Keys" |
+| **hotkey shield** | Window-level capture listeners that stop keystrokes in the panel reaching YouTube's shortcuts (`onKey`, `shieldKey`, `content.js:289-315`). | `contracts.md`, "Keys" |
+| **Tab trap** | Tab and Shift+Tab wrapping focus inside the panel (`content.js:328-340`); its known gaps are T-009's. | `contracts.md`, "Keys" |
 | **keyboard and accessibility baseline** | The invariant that every panel control works from the keyboard, keys never reach YouTube, and the panel is announced as a modal dialog. The target standard is `ux.md`'s. | `contracts.md`, "Keyboard and accessibility baseline"; `ux.md` |
 | **Firefox build**, `dist-firefox/` | The copy `extension/build-firefox.sh` makes for Firefox, with the Firefox manifest renamed (`build-firefox.sh:7-12`). It copies a fixed file list. | `contracts.md`, "build-firefox.sh copy list" |
 | **reload** | After an extension change: reload the extension at `chrome://extensions`, then the YouTube tab, or Chrome keeps the old content script (`extension/README.md:8-11`). | `onboarding.md`, "Dev setup" |
 | **persona**, **journey** | Who uses tldw and the paths they take through it. | `ux.md` |
+| **Cover listed words** | The panel toggle (`.covertoggle`) and the feature behind it (T-020): it silences the video for each listed word and, by default, plays a bleep over it. It runs on after the panel is closed. | `ux.md`, Journey 8; `contracts.md`, "Word timing (`/align/stream`, T-020)" |
+| **listed words**, `muteWords` | The user's list for "Cover listed words", edited in Options as "Words to cover"; absent means the shipped default in `extension/mute_words.js`, `""` means off. Never sent anywhere. | `domain.md` 2.15 |
+| **hit** | One caption line that holds a listed word, or YouTube's `[ __ ]` marker. | `domain.md` 2.15 |
+| **mute range**, **line range**, **word range** | A span of media time the video is silenced for: a whole caption line (up to 8 s), or narrowed to one word (at least 0.3 s). | `domain.md` 2.15 |
+| **word-timed**, **by caption line** | Whether a hit has been narrowed to its word by Whisper, or is still covered for its whole caption line (the fallback, which always works). | `domain.md` 2.15 |
+| **alignment window**, **word timing**, **alignment** | A few seconds of audio around a hit, sent (as times only) to `POST /align/stream`, where Whisper times every word in it; and that process. | `api.md` § 7.1; `data-model.md` store 13 |
+| **cover sound**, `muteSound` | Bleep (default), mute or moo. Every mode silences the video; bleep and moo also play a generated sound for at most 1.5 s. | `contracts.md`, `chrome.storage.local` keys |
+| **mute pill** | tldw's on-player control while covering is on (`#tldw-mute-pill`), in its own shadow root, with a Stop button. Not the skip pill. | `contracts.md`, "Page selectors" |
 
 ## 7. Errors and messages
 
@@ -193,15 +201,16 @@ Journeys through these controls are in [`ux.md`](ux.md).
 | **in-stream error** | An NDJSON `error` event sent after a `200`, carrying the status the same failure would have had before the stream. | `contracts.md`, "The three layers" |
 | **interface copy**, **interface text** | Any string a user can read. `TldrError` text is sent as-is, so rewording one changes what users read. | `api.md` § 6 |
 | **pass-through** | A status for which the extension shows the server's own text, rather than fixed copy. | `contracts.md`, "What the extension does with a status" |
-| **mapper**, `httpError`, `askError`, `speakError` | The worker's three functions that turn a status into user text, plus the Options page's own mapping (`background.js:440-447`, `:491-497`, `:571-581`; `options.js:105-107`). Their `(status, detail)` signature is a test contract. | `contracts.md`, "User-facing message contracts" |
+| **mapper**, `httpError`, `askError`, `speakError` | The worker's three functions that turn a status into user text, plus the Options page's own mapping (`background.js:514-521`, `:565-571`, `:645-655`; `options.js:105-107`). Their `(status, detail)` signature is a test contract. | `contracts.md`, "User-facing message contracts" |
 | **"names a next step"** | The invariant that every message tells the user what to do next. Its current exceptions are listed, and tracked in T-008. | `contracts.md`, "Every message names a next step" |
-| **"ended unexpectedly"** | The worker's message when a stream closes with no terminal event (`background.js:210-212`). | `contracts.md`, "Fixed messages from the worker" |
+| **"ended unexpectedly"** | The worker's message when a stream closes with no terminal event (`background.js:284-286`). | `contracts.md`, "Fixed messages from the worker" |
 | **YouTube rate-limiting** | YouTube refusing a burst of requests from the machine. tldw surfaces it as a `500` with its own text, not a `429` (`metadata.py:66-76`). | `contracts.md`, "Pass-through `TldrError` text"; [`runbooks/youtube-rate-limit.md`](runbooks/youtube-rate-limit.md) |
+| `reason` | On `/align/stream` errors (T-020): a machine-readable cause (`whisper_off`, `busy`, `rate_limited`, …) the panel picks its message by. | `contracts.md`, "Word timing (`/align/stream`, T-020)" |
 | `internal error` | What any non-`TldrError` exception becomes; its detail goes only to the server log (`server.py:1306-1309`). | `contracts.md`, "Errors" |
 
 ## 8. Storage and data
 
-Every store is described in [`data-model.md`](data-model.md), which numbers them 1 to 12 and owns their TTLs and caps.
+Every store is described in [`data-model.md`](data-model.md), which numbers them 1 to 13 and owns their TTLs and caps.
 
 | Term | Meaning | Where it lives |
 |---|---|---|
@@ -213,7 +222,8 @@ Every store is described in [`data-model.md`](data-model.md), which numbers them
 | **write-through** | The in-memory transcript and segment registries also write their disk store (`server.py:317`, `:405`). | `contracts.md`, "In-memory stores" |
 | **best effort** | A cache or usage write that fails never fails the request (`txcache.py:88-92`). | `contracts.md`, "Cross-cutting data invariants" |
 | **tolerant read** | A cache read treats any bad, expired or older-shape file as a miss. Usage and config reads tolerate bad lines and files, but not wrong value types. | `data-model.md`, "No version markers" |
-| **version marker** | A schema version in a record. No tldw store has one. | `data-model.md`, "No version markers" |
+| **alignment cache**, **word timings** | Store 13 (T-020), `~/.cache/youtube-tldw/align/`: the words Whisper heard in each alignment window, keyed without the word list; `tldw cache` calls it "word timings". | `data-model.md` § 13 |
+| **version marker** | A schema version in a record. Only store 13 has one, inside its key (`ALIGN_SHAPE`). | `data-model.md`, "No version markers" |
 | **config**, `config.json`, **config key** | Store 5, `~/.config/youtube-tldw/config.json`, re-read on every call. `tldw config set` accepts any key; only the keys `contracts.md` lists are read. | `contracts.md`, "Config keys" |
 | **hyphen spelling**, **keymap** | `tldw config set` turns `-` into `_`, and validates only the hyphen spellings `whisper`, `whisper-max-minutes` and `whisper-model` (`cli.py:318-337`). | `contracts.md`, "`config` behaviour" |
 | **token file** | Store 6, `~/.config/youtube-tldw/token`: the bearer token in plain text, mode 0600 applied after the write. | `data-model.md` § 6 |

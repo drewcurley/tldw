@@ -79,22 +79,28 @@ EXCLUDED: dict[str, str] = {
     "box.querySelector*": "the sponsor box inside the shadow root",
     "pill.querySelector*": "tldw's own injected pill, not YouTube's page",
     "el.querySelector*": "the panel's `.meta` element inside the shadow root",
+    ".ts": "tldw's own timestamp links in the panel's answers (`e.target.closest(\".ts\")`), "
+           "rendered by renderAnswer; not YouTube markup",
 }
 
 # Receivers whose querySelector* arguments are YouTube page selectors.
 # `p` is a page panel (`panels.find((p) => p.querySelector(SEGMENT_ROWS))`);
 # `d`/`doc` are pageMeta's and the transcript reader's document.
-_PAGE_RECEIVERS = {"document", "d", "doc", "panel", "row", "p", "(doc || document)"}
+# T-020: `target` is a page event's target (`e.target.closest(".ytp-mute-button")`)
+# and `player` is `#movie_player` (`player.matches(".ad-showing")`).
+_PAGE_RECEIVERS = {"document", "d", "doc", "panel", "row", "p", "(doc || document)",
+                   "target", "player"}
 
-# Set to what each extractor finds today (2026-11-12). Raise with the code.
+# Set to what each extractor finds today (2026-11-12; T-020 raised several and added
+# align_reasons and injected_files). Raise with the code.
 FLOORS = {
-    "routes": 11,
+    "routes": 12,
     "http_methods": 3,
-    "ndjson_types": 16,
+    "ndjson_types": 17,
     "partial_kinds": 2,
-    "request_keys": 28,
+    "request_keys": 30,
     "response_keys": 19,
-    "port_message_types": 35,
+    "port_message_types": 40,
     "port_names": 1,
     "status_codes": 7,
     "cli_subcommands": 8,
@@ -102,15 +108,17 @@ FLOORS = {
     "cli_exit_codes": 4,
     "env_vars": 10,
     "config_keys": 9,
-    "storage_keys": 9,
-    "home_paths": 11,
+    "storage_keys": 11,
+    "home_paths": 12,
     "temp_prefixes": 3,
     "executables": 5,
     "urlopen_sites": 1,
     "model_download_sites": 2,
     "manifest_permissions": 4,
-    "page_selectors": 13,
+    "page_selectors": 16,
     "thread_starts": 12,
+    "align_reasons": 12,
+    "injected_files": 2,
 }
 
 # --- helpers ------------------------------------------------------------------
@@ -282,10 +290,11 @@ def request_keys() -> dict[str, str]:
     """Every key read from a request body: `body.get("k")`, `body["k"]`, the
     `for k in ("a", "b")` form, the `page` payload's `page.get`, a panel row's
     `row.get` (transcript.parse_panel_rows) and a history turn's `msg.get`
-    (ask.trim_history)."""
+    (ask.trim_history), and an align window's `win.get` (align.parse_windows)."""
     scopes = [("server.py", {"body", "page"}, None),
               ("transcript.py", {"row"}, "parse_panel_rows"),
-              ("ask.py", {"msg"}, "trim_history")]
+              ("ask.py", {"msg"}, "trim_history"),
+              ("align.py", {"win"}, "parse_windows")]
     found = {}
     for module, names, only_in in scopes:
         tree = _tree(module)
@@ -478,20 +487,36 @@ def storage_keys() -> dict[str, str]:
     found = {}
     for path in _js_files():
         text = path.read_text(encoding="utf-8")
-        where = lambda i: f"{_rel(path)}:{_line(text, i)}"  # noqa: E731
-        for m in re.finditer(r"\bconst DEFAULTS\s*=\s*", text):
-            for k in _js_literal_keys(text, m.end()):
-                found.setdefault(k, where(m.start()))
-        for m in re.finditer(r"storage\.local\.(?:get|set)\(\s*", text):
-            if text[m.end()] == "{":
-                for k in _js_literal_keys(text, m.end()):
-                    found.setdefault(k, where(m.start()))
-            else:
-                arg = re.match(r"[\w$]+", text[m.end():]).group(0)
-                assert arg == "DEFAULTS", f"{where(m.start())}: storage call with {arg!r}"
-        for m in re.finditer(r"\bchanges\.(\w+)", text):
-            found.setdefault(m.group(1), where(m.start()))
+        for k, i in _storage_keys_in(text, _rel(path)):
+            found.setdefault(k, f"{_rel(path)}:{_line(text, i)}")
     return found
+
+
+def _storage_keys_in(text: str, name: str) -> list[tuple[str, int]]:
+    """(key, offset) for one file. `get`/`set`/`remove` take an object literal, a
+    string, an array of strings, or `DEFAULTS`; any other argument is a form this
+    extractor can't read, and raises rather than going unseen (T-020)."""
+    out = []
+    for m in re.finditer(r"\bconst DEFAULTS\s*=\s*", text):
+        out += [(k, m.start()) for k in _js_literal_keys(text, m.end())]
+    for m in re.finditer(r"storage\.local\.(?:get|set|remove)\(\s*", text):
+        rest = text[m.end():]
+        if rest[0] == "{":
+            out += [(k, m.start()) for k in _js_literal_keys(text, m.end())]
+            continue
+        lit = re.match(r"\"([^\"]+)\"\s*\)", rest)
+        arr = re.match(r"\[((?:\s*\"[^\"]+\"\s*,?)+)\]\s*\)", rest)
+        if lit:
+            out.append((lit.group(1), m.start()))
+        elif arr:
+            out += [(k, m.start()) for k in re.findall(r"\"([^\"]+)\"", arr.group(1))]
+        else:
+            arg = re.match(r"[\w$]+", rest)
+            arg = arg.group(0) if arg else rest[:20]
+            assert arg == "DEFAULTS", f"{name}:{_line(text, m.start())}: storage call with {arg!r}"
+    for m in re.finditer(r"\bchanges\.(\w+)", text):
+        out.append((m.group(1), m.start()))
+    return out
 
 
 def _home_path(node) -> str | None:
@@ -607,12 +632,13 @@ def _selector_constants(text: str) -> dict[str, str]:
             for m in re.finditer(r"\bconst ([A-Z][A-Z0-9_]*)\s*=\s*\"([^\"]+)\"", text)}
 
 
-_QS = re.compile(r"(\([^()]*\)|[A-Za-z_$][\w$]*)\s*\.\s*querySelector(?:All)?\(\s*")
+_QS = re.compile(r"(\([^()]*\)|[A-Za-z_$][\w$]*)\s*\.\s*(?:querySelector(?:All)?|closest|matches)\(\s*")
 _STRING = re.compile(r"\"([^\"]*)\"|'([^']*)'|`([^`$]*)`")
 
 
 def _selector_calls():
-    """(receiver, argument, where) for every querySelector* call in extension/."""
+    """(receiver, argument, where) for every querySelector*, closest and matches call
+    in extension/ (T-020 added the last two: the mute button and the ad state)."""
     for path in _js_files():
         text = path.read_text(encoding="utf-8")
         consts = _selector_constants(text)
@@ -677,12 +703,36 @@ def thread_starts() -> dict[str, str]:
     return found
 
 
+def align_reasons() -> dict[str, str]:
+    """Every `reason` a word-timing failure can carry (T-020): the second argument
+    of `_run_align`'s `refuse(status, "x", ...)` / `fail(status, "x", ...)` in
+    server.py, and of handleAlign's own `fail(0, "x", ...)` in background.js."""
+    found = {}
+    pat = re.compile(r"\b(?:fail|refuse)\(\s*[\w.]+\s*,\s*\"([a-z_]+)\"")
+    for path in (SRC / "server.py", SRC / "align.py", EXT / "background.js"):
+        text = path.read_text(encoding="utf-8")
+        for m in pat.finditer(text):
+            found.setdefault(m.group(1), f"{_rel(path)}:{_line(text, m.start())}")
+    return found
+
+
+def injected_files() -> dict[str, str]:
+    """The files `executeScript` injects into a YouTube tab, in background.js (T-020:
+    the word list goes in ahead of content.js)."""
+    found = {}
+    text = _js("background.js")
+    for m in re.finditer(r"executeScript\([^)]*files:\s*\[([^\]]*)\]", text):
+        for f in re.findall(r"\"([^\"]+)\"", m.group(1)):
+            found.setdefault(f, f"extension/background.js:{_line(text, m.start())}")
+    return found
+
+
 EXTRACTORS = {f.__name__: f for f in (
     routes, http_methods, ndjson_types, partial_kinds, request_keys, response_keys,
     port_message_types, port_names, status_codes, cli_subcommands, cli_flags,
     cli_exit_codes, env_vars, config_keys, storage_keys, home_paths, temp_prefixes,
     executables, urlopen_sites, model_download_sites, manifest_permissions,
-    page_selectors, thread_starts)}
+    page_selectors, thread_starts, align_reasons, injected_files)}
 
 # Categories whose doc token may run past the item (see the module docstring).
 _PREFIX_OK = {"home_paths": "/", "temp_prefixes": "*"}
@@ -931,7 +981,7 @@ def test_docs_and_new_task_files_carry_no_leaks():
 # placeholders by design.
 
 RUNBOOKS = ROOT / "docs" / "runbooks"
-RUNBOOK_QUOTE_FLOOR = 16  # today's count of quoted messages across the runbooks; raise with them.
+RUNBOOK_QUOTE_FLOOR = 19  # today's count of quoted messages across the runbooks; raise with them.
 # A floor of 1 let a renamed "What you see" heading silently drop a file's quotes
 # (Test Engineer mutant, Tier 2 Round 3).
 _WHAT_YOU_SEE = re.compile(r"^##\s+what you see\b", re.I)
@@ -1253,3 +1303,84 @@ def test_manifest_names_match_contracts_md():
              for f in ("manifest.json", "manifest.firefox.json")}
     assert names["manifest.json"] == names["manifest.firefox.json"], names
     assert names["manifest.json"] == row.group(1), (names, row.group(1))
+
+
+# --- T-020: extractor self-tests and the verbatim status strings ----------------
+
+def test_storage_keys_reads_every_call_form():
+    text = ('api.storage.local.get("alpha");\n'
+            'api.storage.local.get(["beta", "gamma"]);\n'
+            'api.storage.local.remove("delta");\n'
+            'api.storage.local.set({ epsilon: 1 });\n'
+            'api.storage.local.get(DEFAULTS);\n')
+    assert sorted(k for k, _ in _storage_keys_in(text, "x.js")) == [
+        "alpha", "beta", "delta", "epsilon", "gamma"]
+
+
+def test_storage_keys_refuses_a_form_it_cannot_read():
+    with pytest.raises(AssertionError, match="storage call with 'someKey'"):
+        _storage_keys_in("api.storage.local.get(someKey);", "x.js")
+
+
+def test_new_selector_forms_are_seen():
+    found = {(r, a) for r, a, _ in _selector_calls()}
+    assert ("target", ".ytp-mute-button") in found
+    assert ("player", ".ad-showing") in found
+
+
+def _marked_block(text: str, begin: str, end: str) -> str:
+    i, j = text.find(begin), text.find(end)
+    assert 0 <= i < j, f"markers {begin!r} / {end!r} not found"
+    return text[i:j]
+
+
+def status_strings() -> dict[str, str]:
+    """Every user-visible "Cover listed words" string (T-020), each defined once
+    between marker comments: content.js's MUTE_TEXT, align.py's text constants,
+    and the Whisper select's word-timing hint in options.html."""
+    found = {}
+    block = _marked_block(_js("content.js"), "// T-020 status text: BEGIN",
+                          "// T-020 status text: END")
+    for m in re.finditer(r"^\s+(\w+): \"((?:[^\"\\]|\\.)*)\",$", block, re.M):
+        found[f"content.js MUTE_TEXT.{m.group(1)}"] = m.group(2).replace('\\"', '"')
+    src = (SRC / "align.py").read_text(encoding="utf-8")
+    block = _marked_block(src, "# T-020 align text: BEGIN", "# T-020 align text: END")
+    for node in ast.parse(block).body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            found[f"align.{node.targets[0].id}"] = node.value.value
+    page = (EXT / "options.html").read_text(encoding="utf-8")
+    m = re.search(r'<span id="whisperCoverHint">([^<]+)</span>', page)
+    assert m, "options.html lost #whisperCoverHint"
+    found["options.html #whisperCoverHint"] = m.group(1)
+    # Rev 5.6 (AC18): Save's text says edits apply at once.
+    m = re.search(r'status\.textContent = "(Saved[^"]*)";', _js("options.js"))
+    assert m, "options.js lost its Saved text"
+    found["options.js Saved"] = m.group(1)
+    return found
+
+
+def _flat(t: str) -> str:
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _missing_strings(strings: dict[str, str], doc: str) -> list[str]:
+    flat = _flat(doc)
+    return sorted(k for k, v in strings.items() if _flat(v) not in flat)
+
+
+def test_status_strings_extractor_still_finds_its_floor():
+    assert len(status_strings()) >= 50, sorted(status_strings())
+
+
+def test_contracts_md_quotes_every_status_string_verbatim():
+    missing = _missing_strings(status_strings(), _doc())
+    assert not missing, ("docs/contracts.md must quote these strings verbatim: "
+                         + ", ".join(missing))
+
+
+def test_the_verbatim_check_catches_a_changed_string():
+    strings = status_strings()
+    doc = "\n".join(strings.values())
+    assert _missing_strings(strings, doc) == []
+    key = "content.js MUTE_TEXT.noMatches"
+    assert _missing_strings({**strings, key: strings[key] + " Changed."}, doc) == [key]

@@ -47,13 +47,27 @@
   api.storage.local.get({ closeAction: "continue" })
     .then((s) => { closeAction = s.closeAction === "abort" ? "abort" : "continue"; })
     .catch(() => {});
+  // --- settings listener (BEGIN) ------------------------------------------------
+  // The only storage.onChanged listener. It is handed every changed key (the
+  // token too, architecture.md risk 13), so it reads only the keys it uses and
+  // passes on nothing else. onMuteSettings is set once "Cover listed words"
+  // exists (rev 5.6); a change before then is a no-op.
+  let onMuteSettings = null;
   if (api.storage.onChanged) {
     api.storage.onChanged.addListener((changes, area) => {
-      if (area === "local" && changes.closeAction) {
+      if (area !== "local" || !changes) return;
+      if (changes.closeAction) {
         closeAction = changes.closeAction.newValue === "abort" ? "abort" : "continue";
+      }
+      if ((changes.muteSound || changes.muteWords) && onMuteSettings) {
+        const live = {};
+        if (changes.muteSound) live.sound = { newValue: changes.muteSound.newValue };
+        if (changes.muteWords) live.words = { newValue: changes.muteWords.newValue };
+        onMuteSettings(live);
       }
     });
   }
+  // --- settings listener (END) --------------------------------------------------
 
   // The one decision close() makes, kept pure so it can be tested directly.
   function closePolicy(opts, pref) {
@@ -244,6 +258,13 @@
           transition: stroke-dashoffset .4s ease; }
         .circ.indet .circ-fg { stroke-dasharray: 24 74; stroke-dashoffset: 0; transition: none; }
         @keyframes circspin { to { transform: rotate(360deg); } }
+        .covertoggle[aria-pressed="true"] { border-color: #c00; }
+        .covertoggle[aria-pressed="true"] .covercheck::before { content: "✓ "; }
+        .coverstatus { font-size: 12px; color: #767676; margin: 0 0 10px; }
+        @media (prefers-color-scheme: dark) { .coverstatus { color: #888; } }
+        .coverstatus:empty { margin: 0; }
+        .sr { position: absolute; width: 1px; height: 1px; overflow: hidden;
+          clip: rect(0 0 0 0); white-space: nowrap; }
       </style>
       <div class="backdrop" part="backdrop">
         <div class="panel" role="dialog" aria-modal="true" aria-labelledby="tldw-h" tabindex="-1">
@@ -855,6 +876,7 @@
       <div class="audiorow">
         <button class="playkey"${off} aria-label="Play just the key moments in the YouTube player">⏭ Play key moments</button>
         <button class="listen"${off} aria-label="Generate spoken audio of this summary">🔊 Listen to summary</button>
+        <button class="covertoggle"${off} aria-pressed="false"><span class="covercheck" aria-hidden="true"></span>Cover listed words</button>
         <select class="voice"${off} aria-label="Voice"></select>
         <button class="vpreview"${off} title="Hear a sample of this voice"
           aria-label="Preview the selected voice">▶ Preview</button>
@@ -865,6 +887,10 @@
           <circle class="circ-fg" cx="18" cy="18" r="15.5"></circle>
         </svg>
         <span class="audiostatus" aria-live="polite"></span>
+      </div>
+      <div class="coverwrap">
+        <div class="coverstatus"></div>
+        <div class="coverlive sr" role="status" aria-live="polite"></div>
       </div>
       <div class="audioslot"></div>`;
   }
@@ -994,6 +1020,7 @@
       }
     }
     root.querySelector(".playkey").onclick = requestSegments;
+    setupCover();
     // Restore a previously generated clip for this video this session.
     if (lastAudio && lastAudio.videoId === p.video_id && lastAudio.dataUrl) {
       renderAudio(lastAudio.dataUrl, true);
@@ -1463,6 +1490,1275 @@
     if (status) status.textContent = "";
     hideCircle();
   }
+
+  // --- T-020 cover listed words: pure logic (BEGIN) ------------------------------
+  // Everything between BEGIN and END is pure (no DOM, no api, no timers), so
+  // tests/js/mute_checks.js can lift it out and run it in node. All times are
+  // media milliseconds; currentTime × 1000 is converted once, at the edge.
+  const MUTE_LINE_LEAD_MS = 200, MUTE_LINE_TAIL_MS = 1000, MUTE_LINE_CAP_MS = 8000;
+  const MUTE_WIN_LEAD_MS = 1000, MUTE_WIN_TAIL_MS = 500, MUTE_WIN_MAX_MS = 12000;
+  const MUTE_WIN_MAX_COUNT = 200;
+  const MUTE_WORD_LEAD_MS = 150, MUTE_WORD_TAIL_MS = 100;
+  const MUTE_WORD_MIN_MS = 300, MUTE_WORD_MAX_MS = 2000;
+  const MUTE_SOUND_CAP_MS = 1500;
+  const MUTE_MARKER_SRC = "\\[\\s*_+\\s*\\]";
+  const MUTE_MASKED_RE = /^\p{L}?\*+\p{L}*$/u;
+  const MUTE_MARKER_WORD_RE = /^\[?_+\]?$/u;
+
+  // Absent (never set) gives the shipped default; "" is off; else the user's list.
+  function resolveMuteList(stored, defaults, normalise) {
+    if (typeof normalise !== "function") return [];
+    if (stored === undefined || stored === null || typeof stored !== "string") {
+      return Array.isArray(defaults) ? normalise(defaults.join("\n")) : [];
+    }
+    return normalise(stored);
+  }
+
+  // One case-insensitive, whole-word alternation (Unicode boundaries), plus
+  // YouTube's [ __ ] marker, or null for an empty list (which means off).
+  function muteWordsPattern(list) {
+    if (!Array.isArray(list)) return null;
+    const words = [...new Set(list.map((w) => String(w).trim().toLowerCase())
+      .filter((w) => w && w.length <= 64))].slice(0, 200);
+    if (!words.length) return null;
+    const esc = words.map((w) => w.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&"));
+    return new RegExp(
+      `(?<![\\p{L}\\p{N}])(?:${esc.join("|")})(?![\\p{L}\\p{N}])|${MUTE_MARKER_SRC}`,
+      "giu");
+  }
+
+  function muteMatches(text, pattern) {
+    if (!pattern) return [];
+    return String(text || "").match(pattern) || [];
+  }
+
+  // Merge overlapping or touching ranges; a merged range is "line" if any part is.
+  function mergeMuteRanges(list) {
+    const sorted = list.filter((r) => r.e > r.s).sort((a, b) => a.s - b.s || a.e - b.e);
+    const out = [];
+    for (const r of sorted) {
+      const last = out[out.length - 1];
+      if (last && r.s <= last.e) {
+        last.e = Math.max(last.e, r.e);
+        for (const h of r.hits) if (!last.hits.includes(h)) last.hits.push(h);
+        if (r.timed === "line") last.timed = "line";
+      } else {
+        out.push({ s: r.s, e: r.e, hits: r.hits.slice(), timed: r.timed });
+      }
+    }
+    return out;
+  }
+
+  // The active ranges: each hit's word ranges once applied, else its line range.
+  function buildMuteRanges(hits) {
+    const parts = [];
+    for (const h of hits) {
+      if (h.applied && h.applied.length) {
+        for (const [s, e] of h.applied) parts.push({ s, e, hits: [h.id], timed: "word" });
+      } else {
+        parts.push({ s: h.line[0], e: h.line[1], hits: [h.id], timed: "line" });
+      }
+    }
+    return mergeMuteRanges(parts);
+  }
+
+  function muteTotals(hits, ranges) {
+    return {
+      n: hits.length,
+      k: hits.filter((h) => h.applied && h.applied.length).length,
+      totalMs: ranges.reduce((t, r) => t + (r.e - r.s), 0),
+    };
+  }
+
+  // Caption cues → hits. Each hit starts as a caption-line range.
+  function muteRanges(cues, pattern, durationMs) {
+    const dur = Number.isFinite(durationMs) && durationMs > 0 ? Math.floor(durationMs) : null;
+    const rows = (Array.isArray(cues) ? cues : [])
+      .filter((c) => c && typeof c.text === "string" && c.text.trim()
+        && Number.isFinite(c.start_ms))
+      .map((c) => ({ start: Math.max(0, Math.floor(c.start_ms)), text: c.text }))
+      .sort((a, b) => a.start - b.start);
+    const hits = [];
+    if (pattern) {
+      for (let i = 0; i < rows.length; i++) {
+        const m = muteMatches(rows[i].text, pattern);
+        if (!m.length) continue;
+        const cueStart = rows[i].start;
+        let next = null;
+        for (let j = i + 1; j < rows.length; j++) {
+          if (rows[j].start > cueStart) { next = rows[j].start; break; }
+        }
+        const cap = cueStart + MUTE_LINE_CAP_MS;
+        let end = next !== null ? Math.min(next + MUTE_LINE_TAIL_MS, cap) : cap;
+        if (dur !== null) end = Math.min(end, dur);
+        const start = Math.max(0, cueStart - MUTE_LINE_LEAD_MS);
+        if (end <= start) continue;
+        let cueEnd = next !== null ? next : cap;
+        if (dur !== null) cueEnd = Math.min(cueEnd, dur);
+        const markers = m.filter((x) => x.charAt(0) === "[").length;
+        hits.push({ id: hits.length, cueStart, cueEnd, kind: markers ? "marker" : "word",
+          count: m.length, line: [start, end], words: null, applied: null });
+      }
+    }
+    const ranges = buildMuteRanges(hits);
+    return { hits, ranges, ...muteTotals(hits, ranges) };
+  }
+
+  // Time windows for Whisper, one per hit, joined while ≤ 12 s, ordered so the
+  // ones still ahead of the playhead go first. Every value is a whole number.
+  function alignWindows(hits, nowMs, durationMs) {
+    const dur = Number.isFinite(durationMs) && durationMs > 0 ? Math.floor(durationMs) : null;
+    const clamp = (v) => Math.max(0, dur !== null ? Math.min(v, dur) : v);
+    const joined = [];
+    for (const h of [...hits].sort((a, b) => a.cueStart - b.cueStart)) {
+      const s = clamp(h.cueStart - MUTE_WIN_LEAD_MS);
+      let e = clamp(h.cueEnd + MUTE_WIN_TAIL_MS);
+      e = Math.min(e, s + MUTE_WIN_MAX_MS);
+      if (e <= s) continue;
+      const last = joined[joined.length - 1];
+      if (last && s <= last.end_ms && Math.max(last.end_ms, e) - last.start_ms <= MUTE_WIN_MAX_MS) {
+        last.end_ms = Math.max(last.end_ms, e);
+        last.hits.push(h.id);
+      } else {
+        joined.push({ start_ms: s, end_ms: e, hits: [h.id] });
+      }
+    }
+    const now = Number.isFinite(nowMs) ? nowMs : 0;
+    const ahead = joined.filter((w) => w.end_ms >= now);
+    const behind = joined.filter((w) => w.end_ms < now);
+    return ahead.concat(behind).slice(0, MUTE_WIN_MAX_COUNT);
+  }
+
+  function normMuteWord(w) {
+    return String(w ?? "").normalize("NFC").trim()
+      .replace(/^[^\p{L}\p{N}$@*_]+|[^\p{L}\p{N}$@*_]+$/gu, "");
+  }
+
+  // Give each Whisper word in a window to the hit it most likely belongs to: the
+  // latest-starting hit in that window whose span (with the window's padding)
+  // holds the word's start.
+  function assignWindowWords(win, hits, words) {
+    const own = hits.filter((h) => win.hits.includes(h.id))
+      .sort((a, b) => a.cueStart - b.cueStart);
+    const byHit = new Map(own.map((h) => [h.id, []]));
+    for (const it of Array.isArray(words) ? words : []) {
+      if (!it || !Number.isInteger(it.s)) continue;
+      let pick = null;
+      for (const h of own) {
+        if (it.s >= h.cueStart - MUTE_WIN_LEAD_MS && it.s < h.cueEnd + MUTE_WIN_TAIL_MS) pick = h;
+      }
+      if (pick) byHit.get(pick.id).push(it);
+    }
+    return byHit;
+  }
+
+  // A hit's word ranges from Whisper's words, or [] to keep the line range. It
+  // only refines when Whisper found at least as many listed words as the line has.
+  function refineHit(hit, windowWords, pattern, win) {
+    const ranges = [];
+    for (const it of Array.isArray(windowWords) ? windowWords : []) {
+      if (!it || !Number.isInteger(it.s) || !Number.isInteger(it.e) || it.e < it.s) continue;
+      const w = normMuteWord(it.w);
+      if (!w) continue;
+      const listed = muteMatches(w, pattern).length > 0;
+      const masked = hit.kind === "marker"
+        && (MUTE_MASKED_RE.test(w) || MUTE_MARKER_WORD_RE.test(w));
+      if (!listed && !masked) continue;
+      if (win && (it.s < win.start_ms || it.e > win.end_ms)) continue;
+      if (it.e - it.s >= MUTE_WORD_MAX_MS) continue;
+      const s = Math.max(0, it.s - MUTE_WORD_LEAD_MS);
+      let e = it.e + MUTE_WORD_TAIL_MS;
+      if (e - s < MUTE_WORD_MIN_MS) e = s + MUTE_WORD_MIN_MS;
+      ranges.push([s, e]);
+    }
+    return ranges.length >= hit.count ? ranges : [];
+  }
+
+  function rangeAt(ranges, nowMs) {
+    for (const r of ranges) if (nowMs >= r.s && nowMs < r.e) return r;
+    return null;
+  }
+
+  // Apply a hit's refinement, or queue it while the playhead is inside the merged
+  // range that holds the hit, so a range never shrinks under the listener.
+  function applyRefinement(state, hitId, wordRanges, nowMs) {
+    const hit = state.hits.find((h) => h.id === hitId);
+    if (!hit) return state;
+    hit.words = wordRanges.slice();
+    if (!wordRanges.length) return state;
+    const cur = rangeAt(state.ranges, nowMs);
+    if (cur && cur.hits.includes(hitId)) {
+      state.pending = (state.pending || []).filter((p) => p.hitId !== hitId);
+      state.pending.push({ hitId, ranges: wordRanges.slice() });
+      return state;
+    }
+    hit.applied = wordRanges.slice();
+    state.ranges = buildMuteRanges(state.hits);
+    return state;
+  }
+
+  // Apply queued refinements whose range the playhead has left.
+  function flushRefinements(state, nowMs) {
+    if (!state.pending || !state.pending.length) return state;
+    const cur = rangeAt(state.ranges, nowMs);
+    const keep = [];
+    let changed = false;
+    for (const p of state.pending) {
+      if (cur && cur.hits.includes(p.hitId)) { keep.push(p); continue; }
+      const hit = state.hits.find((h) => h.id === p.hitId);
+      if (hit) { hit.applied = p.ranges; changed = true; }
+    }
+    state.pending = keep;
+    if (changed) state.ranges = buildMuteRanges(state.hits);
+    return state;
+  }
+
+  // One decision per tick. input: {nowMs, videoMuted, videoVolume, videoId,
+  // adShowing, paused, userSignal}. The feature only ever unmutes a mute it set.
+  function muteStep(state, input) {
+    const st = { ...state };
+    const out = (action, sound) => ({ action, sound, state: st });
+    if (input.videoId !== st.videoId) {
+      const had = st.soundOn;
+      st.soundOn = false;
+      return out("teardown", had ? "stop" : "none");
+    }
+    let action = "none";
+    // The user's own mute or unmute wins: a muted value we didn't set, or a
+    // mute-button click / m key, hands control back.
+    if (st.owned && (input.userSignal === "release" || input.videoMuted !== st.lastSet)) {
+      st.owned = false;
+      st.released = true;
+    }
+    if (input.adShowing) {
+      if (st.owned) { action = "exit"; st.owned = false; }
+      st.cur = null;
+      st.quietCur = null;
+      st.released = false;
+      const had = st.soundOn;
+      st.soundOn = false;
+      return out(action, had ? "stop" : "none");
+    }
+    const r = rangeAt(st.ranges, input.nowMs);
+    const same = r && st.cur && r.s === st.cur.s && r.e === st.cur.e;
+    if (!same) {
+      if (st.cur && st.owned) { action = "exit"; st.owned = false; }
+      st.released = false;
+      st.quietCur = null;     // a new range plays the (new) sound again
+      st.cur = r ? { s: r.s, e: r.e } : null;
+      if (r) {
+        // Already muted by the user: hands off. A mute we held for the range we
+        // just left is ours, so a seek from one range into another keeps it.
+        if (input.videoMuted && action !== "exit") {
+          st.owned = false;
+        } else {
+          action = "enter";
+          st.owned = true;
+          st.lastSet = true;
+        }
+      }
+    }
+    const want = !!(st.cur && st.owned && st.mode !== "mute" && !st.soundBlocked
+      && !st.quietCur && !input.paused && input.videoVolume > 0
+      && input.nowMs < st.cur.s + MUTE_SOUND_CAP_MS);
+    let sound = "none";
+    if (want && !st.soundOn) sound = "start";
+    else if (!want && st.soundOn) sound = "stop";
+    st.soundOn = want;
+    return out(action, sound);
+  }
+
+  // A live sound switch (rev 5.6): the new mode, no sound now, and the range in
+  // progress, if any, stays silent until the playhead leaves it.
+  function muteSwitchSound(state, mode) {
+    return { ...state, mode, soundOn: false,
+      quietCur: state.cur ? { s: state.cur.s, e: state.cur.e } : null };
+  }
+
+  // Wall-clock ms to the next edge (a range start or end, or the sound cap), or
+  // null when paused, stopped, or more than a second away.
+  function nextBoundaryDelay(state, nowMs, playbackRate, paused) {
+    if (paused || !(playbackRate > 0)) return null;
+    let edge = Infinity;
+    for (const r of state.ranges) {
+      if (r.s > nowMs && r.s < edge) edge = r.s;
+      if (r.e > nowMs && r.e < edge) edge = r.e;
+    }
+    if (state.soundOn && state.cur) {
+      const cap = state.cur.s + MUTE_SOUND_CAP_MS;
+      if (cap > nowMs && cap < edge) edge = cap;
+    }
+    if (!Number.isFinite(edge)) return null;
+    const delay = (edge - nowMs) / playbackRate;
+    return delay > 1000 ? null : Math.max(0, delay);
+  }
+
+  // How long a sound should play, in real ms, for a range entered at nowMs.
+  function soundLengthMs(mode, range, nowMs, playbackRate) {
+    const rate = playbackRate > 0 ? playbackRate : 1;
+    const mediaMs = Math.min(range.e - nowMs, range.s + MUTE_SOUND_CAP_MS - nowMs);
+    if (!(mediaMs > 0)) return 0;
+    const realMs = mediaMs / rate;
+    if (mode === "moo") return Math.max(250, Math.min(realMs, MUTE_SOUND_CAP_MS));
+    return realMs;
+  }
+
+  // A sound as data: nodes, connections and automation events (seconds from start).
+  // playPlan turns it into Web Audio; nothing here touches the API.
+  function soundPlan(mode, lengthMs, volume) {
+    const L = Math.max(0, lengthMs) / 1000;
+    const vol = Number.isFinite(volume) ? Math.max(0, Math.min(1, volume)) : 1;
+    if (mode === "bleep") {
+      return {
+        mode, length: L, level: 0.15, volume: 0.15 * vol,
+        nodes: [{ id: "osc", kind: "osc", wave: "sine", freq: 1000 }],
+        chain: ["osc"],
+        events: [
+          { node: "env", param: "gain", kind: "set", value: 0, at: 0 },
+          { node: "env", param: "gain", kind: "linear", value: 1, at: Math.min(0.005, L) },
+          { node: "env", param: "gain", kind: "set", value: 1, at: Math.max(0, L - 0.01) },
+          { node: "env", param: "gain", kind: "linear", value: 0, at: L },
+        ],
+      };
+    }
+    if (mode === "moo") {
+      // Rev 5.5: a voiced "mm-OO-oo". A sawtooth with the rumble cut (hp), two
+      // formants (f1 glides, f2 closes toward "oo") and a mouth that opens and
+      // closes (lp). Lowpass/highpass Q is in dB in Web Audio: -3.01 is flat.
+      const atk = Math.min(0.1, 0.25 * L), rel = Math.min(0.25, 0.35 * L);
+      return {
+        mode, length: L, level: 0.25, volume: 0.25 * vol,
+        nodes: [
+          { id: "osc", kind: "osc", wave: "sawtooth", freq: 120 },
+          { id: "lfo", kind: "osc", wave: "sine", freq: 4.5, modulates: "osc", depth: 2 },
+          { id: "hp", kind: "filter", wave: "highpass", q: -3.01, freq: 120 },
+          { id: "f1", kind: "filter", wave: "peaking", q: 3, gain: 9, freq: 300 },
+          { id: "f2", kind: "filter", wave: "peaking", q: 4, gain: 5, freq: 1100 },
+          { id: "lp", kind: "filter", wave: "lowpass", q: -3.01, freq: 450 },
+        ],
+        chain: ["osc", "hp", "f1", "f2", "lp"],
+        events: [
+          { node: "osc", param: "frequency", kind: "set", value: 120, at: 0 },
+          { node: "osc", param: "frequency", kind: "exp", value: 155, at: 0.3 * L },
+          { node: "osc", param: "frequency", kind: "exp", value: 110, at: L },
+          { node: "f1", param: "frequency", kind: "set", value: 300, at: 0 },
+          { node: "f1", param: "frequency", kind: "exp", value: 650, at: 0.35 * L },
+          { node: "f1", param: "frequency", kind: "exp", value: 450, at: L },
+          { node: "f2", param: "frequency", kind: "set", value: 1100, at: 0 },
+          { node: "f2", param: "frequency", kind: "exp", value: 800, at: L },
+          { node: "lp", param: "frequency", kind: "set", value: 450, at: 0 },
+          { node: "lp", param: "frequency", kind: "exp", value: 1600, at: 0.3 * L },
+          { node: "lp", param: "frequency", kind: "exp", value: 900, at: L },
+          { node: "env", param: "gain", kind: "set", value: 0, at: 0 },
+          { node: "env", param: "gain", kind: "linear", value: 1, at: atk },
+          { node: "env", param: "gain", kind: "set", value: 1, at: Math.max(atk, L - rel) },
+          { node: "env", param: "gain", kind: "linear", value: 0, at: L },
+        ],
+      };
+    }
+    return null;   // mute mode plays nothing
+  }
+  // --- T-020 cover listed words: pure logic (END) --------------------------------
+
+  // --- T-020 cover listed words: wiring (BEGIN) ----------------------------------
+  // The session that runs while "Cover listed words" is on. Everything it touches
+  // in the page or the browser arrives through `deps`, so
+  // tests/js/mute_wiring_checks.js can drive the real code with fakes. It belongs
+  // to the page, not the panel: closing the panel leaves it running.
+  const MUTE_SOUNDS = ["bleep", "mute", "moo"];
+  const MUTE_VERB = { bleep: "Bleeping", mute: "Muting", moo: "Mooing over" };
+  const MUTE_PILL_EMOJI = { bleep: "🔔", mute: "🔇", moo: "🐄" };
+  const MUTE_STOP_NAME = { bleep: "Stop bleeping", mute: "Stop muting", moo: "Stop mooing" };
+  const MUTE_INSTALL_HINT = "pipx inject youtube-tldw faster-whisper";
+  const MUTE_PING_MS = 20000;
+  const MUTE_RETRY_MS = [5000, 10000, 20000];   // a rebuild's pre-download busy (rev 5.6)
+  const MUTE_SAFETY_MS = 660000;         // the server's 600 s budget plus a minute
+  const MUTE_PILL_GONE_MS = 1000;        // Stop on the pill: keep its live region this long
+  const MUTE_ANNOUNCE_DELAY_MS = 100;    // a live region filled on a later tick
+  // T-020 status text: BEGIN
+  // Every string here is recorded verbatim in docs/contracts.md. {verb} is
+  // Bleeping / Muting / Mooing over; {n} is "1 spot" or "N spots"; {s} is whole
+  // seconds of covered audio; {k} and {total} count hits; {detail} and {hint} are
+  // the server's own text.
+  const MUTE_TEXT = {
+    loading: "Reading the captions…",
+    emptyList: "No words are listed. Add some in TL;DW's extension options, then try again.",
+    noMatches: "None of this video's caption lines contain your listed words, so there's nothing to cover.",
+    soundChanged: "Sound changed: now {verbLower} listed words, starting at the next covered spot.",
+    listUpdated: "Word list updated: {verb} {n} from the captions (about {s} seconds of audio).",
+    liveEmptyList: "No words are listed, so covering is off. Add some in TL;DW's extension options, then turn it on again.",
+    liveNoMatches: "None of this video's caption lines contain your listed words, so covering is off.",
+    on: "{verb} {n} from the captions (about {s} seconds of audio). Timing them to the word…",
+    progress: "Timed to the word: {k} of {total}.",
+    doneAll: "{verb} {n}, all timed to the word (about {s} seconds of audio).",
+    donePart: "{verb} {n}: {k} timed to the word, the rest by caption line (about {s} seconds of audio).",
+    doneNone: "{verb} {n} by caption line: Whisper didn't find the words in the audio.",
+    whisperMissing: "{verb} {n} by caption line. To time them to the word, install Whisper for tldw serve: {hint}, then restart tldw serve and turn this off and on again.",
+    whisperOff: "{verb} {n} by caption line, because Whisper is turned off. To time them to the word, set 'Videos with no subtitles' in TL;DW's options to either transcribe choice.",
+    modelMissing: "{verb} {n} by caption line: Whisper's model isn't downloaded yet. Transcribe one video that has no subtitles to fetch it, then turn this off and on again.",
+    busySuffix: " Until then, spots are covered by caption line.",
+    olderServer: "{verb} {n} by caption line: this tldw serve can't time words. Update tldw, then restart tldw serve and turn this off and on again.",
+    unreachable: "{verb} {n} by caption line: couldn't reach tldw serve. Start it, then turn this off and on again.",
+    token: "{verb} {n} by caption line: TL;DW's token for tldw serve is missing or wrong. Paste the token tldw serve prints into TL;DW's options, then turn this off and on again.",
+    detail: "{verb} {n} by caption line: {detail}",
+    other: "{verb} {n} by caption line: timing them to the word failed. Turn this off and on again to retry.",
+    soundBlocked: "The browser blocked the sound, so listed words are muted instead. Turn this off and on again to allow sound.",
+    offBleep: "Bleeping is off.",
+    offMute: "Muting is off.",
+    offMoo: "Mooing is off.",
+    noTranscript: "Couldn't read this video's captions, so no words will be covered. Open the video's transcript and try again, or try another video.",
+    noPlayer: "Couldn't find the YouTube player. Reload the page, then try again.",
+    live: "Covering words isn't available on live streams. Try again after the stream ends.",
+    ad: "An ad is playing. Try again once the video starts.",
+    adPaused: "An ad is playing, so covering is paused. It picks up again when the video comes back.",
+    pillBleep: "Bleeping listed words",
+    pillMute: "Muting listed words",
+    pillMoo: "Mooing over listed words",
+    pillNow: " · now",
+  };
+  // T-020 status text: END
+  // The server's text for a pinned-off Whisper differs from its plain "off"; only
+  // the plain one gets our longer wording.
+  const MUTE_SERVER_OFF_TEXT = "Whisper is turned off.";
+
+  const muteCap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
+  function muteFill(template, vars) {
+    return template.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
+  }
+
+  function muteSpots(n) { return n === 1 ? "1 spot" : n + " spots"; }
+
+  function muteVars(mode, totals) {
+    const verb = MUTE_VERB[mode] || MUTE_VERB.bleep;
+    return { verb, verbLower: verb.toLowerCase(), n: muteSpots(totals.n),
+      s: Math.max(1, Math.round(totals.totalMs / 1000)), k: totals.k, total: totals.n };
+  }
+
+  // The status for a failed word-timing request, picked by `reason` and then by
+  // `status`. Server-supplied text is passed through as plain text, never markup.
+  function alignFailureText(m, mode, totals) {
+    const v = muteVars(mode, totals);
+    const detail = typeof m.error === "string" ? m.error.trim() : "";
+    const withDetail = () => muteFill(detail ? MUTE_TEXT.detail : MUTE_TEXT.other, { ...v, detail });
+    const reason = m.reason || null;
+    if (reason === "whisper_off") {
+      return detail && detail !== MUTE_SERVER_OFF_TEXT ? withDetail()
+        : muteFill(MUTE_TEXT.whisperOff, v);
+    }
+    if (reason === "whisper_missing") {
+      return muteFill(MUTE_TEXT.whisperMissing, { ...v, hint: m.installHint || MUTE_INSTALL_HINT });
+    }
+    if (reason === "model_missing") return muteFill(MUTE_TEXT.modelMissing, v);
+    if (reason === "busy" || reason === "rate_limited") {
+      return (detail || muteFill(MUTE_TEXT.other, v)) + MUTE_TEXT.busySuffix;
+    }
+    if (reason === "unreachable") return muteFill(MUTE_TEXT.unreachable, v);
+    if (reason === "token") return muteFill(MUTE_TEXT.token, v);
+    if (reason) return withDetail();   // ffmpeg_missing, too_long, download_failed, timeout, other
+    if (m.status === 401) return muteFill(MUTE_TEXT.token, v);
+    if (m.status === 404) return muteFill(MUTE_TEXT.olderServer, v);
+    if (m.status === 429) return (detail || muteFill(MUTE_TEXT.other, v)) + MUTE_TEXT.busySuffix;
+    if (m.status === 503 && m.installHint) {
+      return muteFill(MUTE_TEXT.whisperMissing, { ...v, hint: m.installHint });
+    }
+    return withDetail();
+  }
+
+  // The status once the request finished: every hit timed, some, or none.
+  function alignDoneText(mode, totals, failed, windows) {
+    const v = muteVars(mode, totals);
+    if (totals.k >= totals.n) return muteFill(MUTE_TEXT.doneAll, v);
+    if (totals.k > 0) return muteFill(MUTE_TEXT.donePart, v);
+    if (windows > 0 && failed >= windows) return muteFill(MUTE_TEXT.other, v);
+    return muteFill(MUTE_TEXT.doneNone, v);
+  }
+
+  function muteOffText(mode) {
+    return MUTE_TEXT["off" + muteCap(mode)] || MUTE_TEXT.offBleep;
+  }
+
+  // Web Audio for a soundPlan: source(s) -> envelope gain -> volume gain -> out.
+  // A volume change touches only the volume gain. stop() is safe to call twice.
+  function playPlan(ctx, plan) {
+    const t0 = ctx.currentTime;
+    const env = ctx.createGain();
+    const vol = ctx.createGain();
+    vol.gain.value = plan.volume;
+    const nodes = { env };
+    for (const n of plan.nodes) {
+      if (n.kind === "osc") {
+        const o = ctx.createOscillator();
+        o.type = n.wave;
+        o.frequency.value = n.freq;
+        nodes[n.id] = o;
+      } else if (n.kind === "filter") {
+        const f = ctx.createBiquadFilter();
+        f.type = n.wave;
+        f.Q.value = n.q;
+        f.frequency.value = n.freq;
+        if (Number.isFinite(n.gain)) f.gain.value = n.gain;
+        nodes[n.id] = f;
+      }
+    }
+    const extra = [];
+    for (const n of plan.nodes) {
+      if (!n.modulates) continue;
+      const depth = ctx.createGain();
+      depth.gain.value = n.depth;
+      nodes[n.id].connect(depth);
+      depth.connect(nodes[n.modulates].frequency);
+      extra.push(depth);
+    }
+    let prev = null;
+    for (const id of plan.chain) {
+      if (prev) prev.connect(nodes[id]);
+      prev = nodes[id];
+    }
+    prev.connect(env);
+    env.connect(vol);
+    vol.connect(ctx.destination);
+    for (const ev of plan.events) {
+      const p = nodes[ev.node][ev.param];
+      const at = t0 + ev.at;
+      if (ev.kind === "set") p.setValueAtTime(ev.value, at);
+      else if (ev.kind === "linear") p.linearRampToValueAtTime(ev.value, at);
+      else if (ev.kind === "exp") p.exponentialRampToValueAtTime(ev.value, at);
+    }
+    const oscs = plan.nodes.filter((n) => n.kind === "osc").map((n) => nodes[n.id]);
+    const all = [...Object.values(nodes), ...extra, vol];
+    let ended = false, stopped = false;
+    const disconnect = () => {
+      if (ended) return;
+      ended = true;
+      for (const n of all) { try { n.disconnect(); } catch (_) {} }
+    };
+    for (const o of oscs) { o.start(t0); o.stop(t0 + plan.length + 0.02); }
+    oscs[0].onended = disconnect;
+    return {
+      get ended() { return ended; },
+      setVolume(v) {
+        const x = Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 1;
+        try { vol.gain.setValueAtTime(plan.level * x, ctx.currentTime); } catch (_) {}
+      },
+      stop() {
+        if (stopped || ended) return;
+        stopped = true;
+        const t = ctx.currentTime;
+        const g = env.gain;
+        try {
+          g.cancelScheduledValues(t);
+          g.setValueAtTime(g.value, t);
+          g.linearRampToValueAtTime(0, t + 0.01);
+        } catch (_) {}
+        for (const o of oscs) { try { o.stop(t + 0.012); } catch (_) {} }
+      },
+    };
+  }
+
+  // The pill on the player while covering is on. Its own shadow root, so YouTube's
+  // styles can't reach the Stop button; built with textContent only.
+  function buildMutePill(doc, mode, onStop) {
+    const host = doc.createElement("div");
+    host.id = "tldw-mute-pill";
+    host.style.cssText = "position:fixed;z-index:2147483647;bottom:136px;left:50%;"
+      + "transform:translateX(-50%);";
+    const shadow = host.attachShadow({ mode: "open" });
+    const style = doc.createElement("style");
+    style.textContent = ".pill{display:flex;align-items:center;gap:10px;background:#1e1f24;"
+      + "color:#e9e9ea;font:14px system-ui,-apple-system,sans-serif;padding:4px 6px 4px 14px;"
+      + "border-radius:999px;box-shadow:0 6px 24px rgba(0,0,0,.45);}"
+      + ".stop{font:inherit;min-width:44px;min-height:44px;padding:0 14px;cursor:pointer;"
+      + "border-radius:999px;border:1px solid rgba(255,255,255,.35);background:#333;color:#fff;}"
+      + ".stop:focus-visible{outline:3px solid #8ab4f8;outline-offset:2px;}"
+      + ".sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);"
+      + "white-space:nowrap;}";
+    const box = doc.createElement("div");
+    box.className = "pill";
+    const emoji = doc.createElement("span");
+    emoji.setAttribute("aria-hidden", "true");
+    emoji.textContent = MUTE_PILL_EMOJI[mode] || MUTE_PILL_EMOJI.bleep;
+    const label = doc.createElement("span");
+    label.className = "label";
+    let base = MUTE_TEXT["pill" + muteCap(mode)] || MUTE_TEXT.pillBleep;
+    let now = false;
+    label.textContent = base;
+    const stop = doc.createElement("button");
+    stop.type = "button";
+    stop.className = "stop";
+    stop.textContent = "Stop";
+    stop.setAttribute("aria-label", MUTE_STOP_NAME[mode] || MUTE_STOP_NAME.bleep);
+    stop.addEventListener("click", onStop);
+    const live = doc.createElement("div");
+    live.className = "sr";
+    live.setAttribute("role", "status");
+    live.setAttribute("aria-live", "polite");
+    box.appendChild(emoji);
+    box.appendChild(label);
+    box.appendChild(stop);
+    box.appendChild(live);
+    shadow.appendChild(style);
+    shadow.appendChild(box);
+    return { host, label, live, stop,
+      setNow(on) { now = !!on; label.textContent = base + (now ? MUTE_TEXT.pillNow : ""); },
+      // A live sound switch (rev 5.6): emoji, label and the Stop button's name.
+      setMode(m) {
+        emoji.textContent = MUTE_PILL_EMOJI[m] || MUTE_PILL_EMOJI.bleep;
+        base = MUTE_TEXT["pill" + muteCap(m)] || MUTE_TEXT.pillBleep;
+        stop.setAttribute("aria-label", MUTE_STOP_NAME[m] || MUTE_STOP_NAME.bleep);
+        label.textContent = base + (now ? MUTE_TEXT.pillNow : "");
+      } };
+  }
+
+  // deps: { doc, win, findVideo(), videoId(), pageUrl(), readTranscript(),
+  //   getWords(), getSound(), connect(), AudioCtx, defaults(), normalise(), ui(),
+  //   setTimeout, clearTimeout, setInterval, clearInterval }
+  // ui() returns the open panel's {status(text), announce(text), pressed(on),
+  //   busy(on)} or null while the panel is closed.
+  function createMuteCover(deps) {
+    let S = null;              // the live session, or null
+    let lastStatus = "";
+
+    const ui = () => { try { return deps.ui(); } catch (_) { return null; } };
+
+    function say(sess, text, announce) {
+      // A status that lands during an ad is kept for after it; the line keeps
+      // saying covering is paused until the ad ends.
+      if (sess && sess.adSaid && text !== MUTE_TEXT.adPaused) {
+        sess.beforeAd = text;
+        return;
+      }
+      lastStatus = text;
+      if (sess) sess.status = text;
+      const panel = ui();
+      if (panel) {
+        panel.status(text);
+        if (announce) panel.announce(text);
+      } else if (announce && sess && sess.pill) {
+        const live = sess.pill.live;
+        live.textContent = "";
+        deps.setTimeout(() => { live.textContent = text; }, MUTE_ANNOUNCE_DELAY_MS);
+      }
+    }
+
+    function isAd() {
+      const player = deps.doc.querySelector("#movie_player");
+      return !!(player && player.matches && player.matches(".ad-showing"));
+    }
+
+    function durMs(video) {
+      const d = video.duration;
+      return Number.isFinite(d) ? Math.floor(d * 1000) : null;
+    }
+
+    function totals(sess) {
+      const t = muteTotals(sess.st.hits, sess.st.ranges);
+      t.k = sess.st.hits.filter((h) => h.words && h.words.length).length;
+      return t;
+    }
+
+    function closeCtx(sess) {
+      if (sess.ctx) { try { sess.ctx.close(); } catch (_) {} sess.ctx = null; }
+    }
+
+    // A context for bleep or moo. At toggle-on this runs inside the click; on a
+    // live switch from mute (rev 5.6) it runs without a gesture, which the page's
+    // sticky activation usually allows. One that never runs falls through to
+    // startSound's muted-only path. A fresh context clears the old failure flags.
+    function openCtx(sess) {
+      if (sess.ctx || !deps.AudioCtx) return;
+      try {
+        const ctx = new deps.AudioCtx();
+        sess.ctx = ctx;
+        sess.resumeFailed = false;
+        sess.blockedSaid = false;
+        if (sess.st) sess.st.soundBlocked = false;
+        const p = ctx.resume && ctx.resume();
+        if (p && typeof p.catch === "function") {
+          p.catch(() => { if (sess.ctx === ctx) sess.resumeFailed = true; });
+        }
+      } catch (_) { sess.ctx = null; }
+    }
+
+    function clearRetry(sess) {
+      if (sess.retryTimer) { deps.clearTimeout(sess.retryTimer); sess.retryTimer = null; }
+    }
+
+    // --- sound -----------------------------------------------------------------
+    function startSound(sess, nowMs) {
+      const ctx = sess.ctx;
+      if (!ctx || ctx.state !== "running" || sess.resumeFailed) {
+        sess.st.soundBlocked = true;
+        sess.st.soundOn = false;
+        if (!sess.blockedSaid) {
+          sess.blockedSaid = true;
+          say(sess, MUTE_TEXT.soundBlocked, true);
+        }
+        return;
+      }
+      const v = sess.video;
+      const len = soundLengthMs(sess.mode, sess.st.cur, nowMs, v.playbackRate);
+      const plan = soundPlan(sess.mode, len, v.volume);
+      if (!plan || len <= 0) return;
+      stopSound(sess);
+      try { sess.sound = playPlan(ctx, plan); } catch (_) { sess.sound = null; }
+    }
+
+    function stopSound(sess) {
+      if (sess.sound) { try { sess.sound.stop(); } catch (_) {} sess.sound = null; }
+    }
+
+    // --- the tick ----------------------------------------------------------------
+    // sig: null (a plain tick), "release" (the user's mute button or m key),
+    // "seek" or "timer" (the boundary timer).
+    function tick(sess, sig) {
+      if (S !== sess || !sess.active) return;
+      const v = sess.video;
+      if (!v.isConnected) { stop({ quiet: true }); return; }
+      const nowMs = Math.max(0, Math.floor(v.currentTime * 1000));
+      const ad = isAd();
+      flushRefinements(sess.st, nowMs);
+      const r = muteStep(sess.st, { nowMs, videoMuted: !!v.muted, videoVolume: v.volume,
+        videoId: deps.videoId(), adShowing: ad, paused: !!v.paused,
+        userSignal: sig === "release" ? "release" : null });
+      sess.st = r.state;
+      if (r.action === "teardown") { stop({ quiet: true }); return; }
+      if (r.action === "enter") { try { v.muted = true; } catch (_) {} }
+      else if (r.action === "exit") { try { v.muted = false; } catch (_) {} }
+      if (r.sound === "start") startSound(sess, nowMs);
+      else if (r.sound === "stop") {
+        // A moo that reached its range's end rings out (about 250 ms at most);
+        // anything the user did, a pause, a seek or an ad cuts it.
+        const natural = sess.mode === "moo" && sig !== "release" && sig !== "seek"
+          && !v.paused && !ad && !sess.st.released;
+        if (natural) sess.sound = null;
+        else stopSound(sess);
+      }
+      // An ad mid-session pauses covering; when it ends, the status from before
+      // it comes back on the visible line, unannounced.
+      if (ad && !sess.adSaid) {
+        sess.beforeAd = sess.status;
+        sess.adSaid = true;
+        say(sess, MUTE_TEXT.adPaused, true);
+      } else if (!ad && sess.adSaid) {
+        sess.adSaid = false;
+        if (sess.beforeAd) say(sess, sess.beforeAd, false);
+        sess.beforeAd = "";
+      }
+      if (sess.pill) sess.pill.setNow(!!(sess.st.cur && sess.st.owned));
+      arm(sess, nowMs, sig === "timer");
+    }
+
+    // The boundary timer: fires at the next range edge so a short word isn't
+    // missed between timeupdate ticks. Re-armed at most twice for the same edge.
+    function arm(sess, nowMs, fromTimer) {
+      if (sess.timer) { deps.clearTimeout(sess.timer); sess.timer = null; }
+      const v = sess.video;
+      const d = nextBoundaryDelay(sess.st, nowMs, v.playbackRate, !!v.paused);
+      if (d === null) { sess.rearms = 0; sess.edge = null; return; }
+      const edge = Math.round(nowMs + d * v.playbackRate);
+      if (fromTimer && sess.edge !== null && Math.abs(edge - sess.edge) <= 1) {
+        sess.rearms += 1;
+        if (sess.rearms > 2) return;      // timeupdate stays the backstop
+      } else {
+        sess.rearms = 0;
+      }
+      sess.edge = edge;
+      sess.timer = deps.setTimeout(() => {
+        sess.timer = null;
+        tick(sess, "timer");
+      }, d);
+    }
+
+    // --- listeners -----------------------------------------------------------------
+    function listen(sess, target, type, fn, capture) {
+      target.addEventListener(type, fn, capture ? { capture: true } : false);
+      sess.listeners.push([target, type, fn, !!capture]);
+    }
+
+    function isEditable(e) {
+      // composedPath()[0] sees through shadow roots, as onKey does.
+      const t = (e.composedPath && e.composedPath()[0]) || e.target;
+      if (!t) return false;
+      const tag = String(t.tagName || "").toUpperCase();
+      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || !!t.isContentEditable;
+    }
+
+    function attach(sess) {
+      const v = sess.video;
+      const onTick = () => tick(sess, null);
+      for (const type of ["timeupdate", "play", "pause"]) {
+        listen(sess, v, type, onTick);
+      }
+      // A new rate changes a sound's real-time length: stop it, and the tick
+      // starts it again for the time left under the cap.
+      listen(sess, v, "ratechange", () => {
+        if (sess.sound) { stopSound(sess); sess.st.soundOn = false; }
+        tick(sess, null);
+      });
+      listen(sess, v, "seeked", () => tick(sess, "seek"));
+      listen(sess, v, "volumechange", () => {
+        if (sess.sound) sess.sound.setVolume(v.volume);
+        tick(sess, null);
+      });
+      const onReload = () => {
+        // A mid-roll ad or a quality change reloads the element: give up our
+        // mute and sound now, and only end the session if the video changed.
+        if (sess.st.owned) { try { v.muted = false; } catch (_) {} }
+        sess.st.owned = false;
+        sess.st.cur = null;
+        sess.st.soundOn = false;
+        stopSound(sess);
+        if (sess.timer) { deps.clearTimeout(sess.timer); sess.timer = null; }
+        if (deps.videoId() !== sess.videoId || !v.isConnected) stop({ quiet: true });
+      };
+      listen(sess, v, "emptied", onReload);
+      listen(sess, v, "loadstart", onReload);
+      listen(sess, deps.doc, "keydown", (e) => {
+        if (e.key !== "m" && e.key !== "M") return;
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        if (isEditable(e)) return;
+        tick(sess, "release");
+      }, true);
+      listen(sess, deps.doc, "click", (e) => {
+        const target = e.target;
+        if (target && target.closest && target.closest(".ytp-mute-button")) {
+          tick(sess, "release");
+        }
+      }, true);
+      listen(sess, deps.doc, "fullscreenchange", () => {
+        if (!sess.pill) return;
+        const parent = deps.doc.fullscreenElement || deps.doc.body;
+        if (sess.pill.host.parentNode !== parent) parent.appendChild(sess.pill.host);
+      });
+      listen(sess, deps.win, "pagehide", () => {
+        if (sess.st.owned) { try { v.muted = false; } catch (_) {} sess.st.owned = false; }
+        stop({ quiet: true });
+      });
+    }
+
+    // --- word timing ---------------------------------------------------------------
+    function endAlignPort(sess) {
+      if (sess.ping) { deps.clearInterval(sess.ping); sess.ping = null; }
+      if (sess.safety) { deps.clearTimeout(sess.safety); sess.safety = null; }
+      const port = sess.port;
+      sess.port = null;
+      if (port) { try { port.disconnect(); } catch (_) {} }
+    }
+
+    function alignFailed(sess, m) {
+      sess.alignDone = true;
+      endAlignPort(sess);
+      // A rebuilt session can find the server still busy with the stream it just
+      // ended. Retry that, but only a busy that came before any download began
+      // (no progress on this port), so the audio is never fetched twice.
+      if (sess.rebuilt && m && m.reason === "busy" && !sess.sawProgress
+          && sess.retries < MUTE_RETRY_MS.length) {
+        const wait = MUTE_RETRY_MS[sess.retries];
+        sess.retries += 1;
+        clearRetry(sess);
+        sess.retryTimer = deps.setTimeout(() => {
+          sess.retryTimer = null;
+          if (S === sess && sess.active) startAlign(sess);
+        }, wait);
+        return;
+      }
+      say(sess, alignFailureText(m, sess.mode, totals(sess)), true);
+    }
+
+    function onAlign(sess, port, m) {
+      if (S !== sess || sess.port !== port || deps.videoId() !== sess.videoId) return;
+      if (m.type === "alignWindow") {
+        const win = sess.windows[m.i];
+        if (!win || !Array.isArray(m.words)) return;
+        const nowMs = Math.max(0, Math.floor(sess.video.currentTime * 1000));
+        if (sess.heard) sess.heard.push({ start_ms: win.start_ms, end_ms: win.end_ms, words: m.words });
+        const byHit = assignWindowWords(win, sess.st.hits, m.words);
+        for (const [hitId, words] of byHit) {
+          const hit = sess.st.hits.find((h) => h.id === hitId);
+          if (hit) hit.heard = true;
+          if (!hit || (hit.words && hit.words.length)) continue;
+          applyRefinement(sess.st, hitId, refineHit(hit, words, sess.pattern, win), nowMs);
+        }
+        const t = totals(sess);
+        say(sess, muteFill(MUTE_TEXT.progress, muteVars(sess.mode, t)), false);
+        arm(sess, nowMs, false);
+      } else if (m.type === "alignDone") {
+        sess.alignDone = true;
+        endAlignPort(sess);
+        say(sess, alignDoneText(sess.mode, totals(sess), Number(m.failed) || 0,
+          sess.windows.length), true);
+      } else if (m.type === "alignProgress") {
+        sess.sawProgress = true;
+      } else if (m.type === "alignError") {
+        alignFailed(sess, m);
+      }
+    }
+
+    function startAlign(sess) {
+      const nowMs = Math.max(0, Math.floor(sess.video.currentTime * 1000));
+      sess.alignDone = false;
+      sess.sawProgress = false;
+      sess.windows = alignWindows(sess.st.hits.filter((h) => !h.heard), nowMs, durMs(sess.video));
+      if (!sess.windows.length) return;
+      let port;
+      try { port = deps.connect(); } catch (_) { alignFailed(sess, { reason: "other" }); return; }
+      sess.port = port;
+      sess.ping = deps.setInterval(() => {
+        try { port.postMessage({ type: "ping" }); } catch (_) {}
+      }, MUTE_PING_MS);
+      sess.safety = deps.setTimeout(() => {
+        if (S === sess && sess.port === port && !sess.alignDone) {
+          alignFailed(sess, { reason: "timeout" });
+        }
+      }, MUTE_SAFETY_MS);
+      port.onMessage.addListener((m) => onAlign(sess, port, m));
+      port.onDisconnect.addListener(() => {
+        if (S !== sess || sess.port !== port) return;
+        if (!sess.alignDone) alignFailed(sess, { reason: "other" });
+        else endAlignPort(sess);
+      });
+      try {
+        port.postMessage({ type: "align", url: deps.pageUrl(),
+          windows: sess.windows.map((w) => ({ start_ms: w.start_ms, end_ms: w.end_ms })) });
+      } catch (_) {
+        alignFailed(sess, { reason: "other" });
+      }
+    }
+
+    // --- on and off ----------------------------------------------------------------
+    // Called straight from the toggle's click: the AudioContext is made and
+    // resumed before the first await, while the click still counts as a gesture.
+    function start() {
+      if (S) return;
+      const sess = { active: false, stopped: false, listeners: [], ctx: null,
+        resumeFailed: false, sound: null, port: null, ping: null, safety: null,
+        timer: null, rearms: 0, edge: null, pill: null, windows: [], alignDone: false,
+        st: null, mode: "bleep", pattern: null, video: null, videoId: deps.videoId(),
+        status: "", blockedSaid: false, adSaid: false, beforeAd: "",
+        // rev 5.6: what a live settings change needs. cues and heard stay in this
+        // tab's memory only and are dropped on every end.
+        cues: null, heard: [], listKey: "", modeSetLive: false, wordsSetLive: false,
+        rebuilt: false, retries: 0, retryTimer: null, sawProgress: false };
+      // A pill still fading out from a Stop a moment ago goes now.
+      const old = deps.doc.getElementById("tldw-mute-pill");
+      if (old && old.parentNode) old.parentNode.removeChild(old);
+      openCtx(sess);
+      const video = deps.findVideo();
+      const refuse = (text) => { closeCtx(sess); say(null, text, true); };
+      if (!video) { refuse(MUTE_TEXT.noPlayer); return; }
+      if (video.duration === Infinity) { refuse(MUTE_TEXT.live); return; }
+      if (isAd()) { refuse(MUTE_TEXT.ad); return; }
+      sess.video = video;
+      S = sess;
+      const panel = ui();
+      if (panel) { panel.pressed(true); panel.busy(true); }
+      say(sess, MUTE_TEXT.loading, true);
+      load(sess);
+    }
+
+    async function load(sess) {
+      let words, sound, t;
+      try {
+        words = await deps.getWords();
+        sound = await deps.getSound();
+      } catch (_) { words = {}; sound = {}; }
+      if (S !== sess) return;
+      // A change that arrived while these reads were pending wins (rev 5.6).
+      if (!sess.wordsSetLive) {
+        const list = resolveMuteList((words || {}).muteWords, deps.defaults(), deps.normalise());
+        sess.pattern = muteWordsPattern(list);
+        sess.listKey = list.join("\n");
+      }
+      if (!sess.modeSetLive) {
+        const picked = (sound || {}).muteSound;
+        sess.mode = MUTE_SOUNDS.includes(picked) ? picked : "bleep";
+      }
+      if (sess.mode === "mute") closeCtx(sess);
+      if (!sess.pattern) { endEarly(sess, MUTE_TEXT.emptyList); return; }
+      try { t = await deps.readTranscript(); } catch (_) { t = null; }
+      if (S !== sess) return;
+      if (deps.videoId() !== sess.videoId) { stop({ quiet: true }); return; }
+      if (!t || !Array.isArray(t.cues) || !t.cues.length) {
+        endEarly(sess, MUTE_TEXT.noTranscript);
+        return;
+      }
+      // The list can be emptied while the captions are read.
+      if (!sess.pattern) { endEarly(sess, MUTE_TEXT.emptyList); return; }
+      sess.cues = t.cues;
+      const found = muteRanges(t.cues, sess.pattern, durMs(sess.video));
+      if (!found.n) { endEarly(sess, MUTE_TEXT.noMatches); return; }
+      sess.st = { videoId: sess.videoId, hits: found.hits, ranges: found.ranges,
+        mode: sess.mode, owned: false, lastSet: null, cur: null, soundOn: false,
+        soundBlocked: false, released: false, pending: [] };
+      sess.active = true;
+      attach(sess);
+      sess.pill = buildMutePill(deps.doc, sess.mode, () => stop({ fromPill: true }));
+      (deps.doc.fullscreenElement || deps.doc.body).appendChild(sess.pill.host);
+      const panel = ui();
+      if (panel) panel.busy(false);
+      say(sess, muteFill(MUTE_TEXT.on, muteVars(sess.mode, totals(sess))), true);
+      tick(sess, null);
+      startAlign(sess);
+    }
+
+    // Nothing to cover: the session ends, and the toggle goes back off.
+    function endEarly(sess, text) {
+      closeCtx(sess);
+      sess.cues = null;
+      sess.heard = null;
+      clearRetry(sess);
+      S = null;
+      const panel = ui();
+      if (panel) { panel.busy(false); panel.pressed(false); }
+      say(null, text, true);
+    }
+
+    // opts: {quiet} ends without the "off" announcement (a new video, a reload);
+    // {fromPill} moves focus to the player and keeps the pill's live region for a
+    // second so the "off" status is heard.
+    function stop(opts) {
+      const sess = S;
+      if (!sess) return;
+      const o = opts || {};
+      S = null;
+      sess.stopped = true;
+      sess.active = false;
+      stopSound(sess);
+      if (sess.st && sess.st.owned && sess.video) {
+        try { sess.video.muted = false; } catch (_) {}
+        sess.st.owned = false;
+      }
+      for (const [target, type, fn, capture] of sess.listeners) {
+        try { target.removeEventListener(type, fn, capture ? { capture: true } : false); } catch (_) {}
+      }
+      sess.listeners = [];
+      if (sess.timer) { deps.clearTimeout(sess.timer); sess.timer = null; }
+      clearRetry(sess);
+      endAlignPort(sess);
+      closeCtx(sess);
+      sess.cues = null;
+      sess.heard = null;
+      const panel = ui();
+      if (panel) { panel.busy(false); panel.pressed(false); }
+      const off = muteOffText(sess.mode);
+      const pill = sess.pill;
+      sess.pill = null;
+      if (pill && o.fromPill) {
+        const player = deps.doc.querySelector("#movie_player");
+        if (player && player.focus) { try { player.focus(); } catch (_) {} }
+        lastStatus = off;
+        if (panel) { panel.status(off); panel.announce(off); }
+        else pill.live.textContent = off;
+        deps.setTimeout(() => {
+          if (pill.host.parentNode) pill.host.parentNode.removeChild(pill.host);
+        }, MUTE_PILL_GONE_MS);
+        return;
+      }
+      if (pill && o.endText) {
+        lastStatus = o.endText;
+        pill.live.textContent = o.endText;
+        deps.setTimeout(() => {
+          if (pill.host.parentNode) pill.host.parentNode.removeChild(pill.host);
+        }, MUTE_PILL_GONE_MS);
+        return;
+      }
+      if (pill && pill.host.parentNode) pill.host.parentNode.removeChild(pill.host);
+      if (!o.quiet) say(null, off, true);
+    }
+
+    // --- live settings (rev 5.6) ----------------------------------------------------
+    // A sound switch: no sound now, the range in progress stays silent, the next
+    // range uses the new sound. Going to mute closes the context; leaving mute
+    // opens one.
+    function setSound(sess, mode) {
+      if (!sess.active) {
+        sess.modeSetLive = true;   // load keeps this over a late stored read
+        if (mode === sess.mode) return;
+        sess.mode = mode;
+        if (mode === "mute") closeCtx(sess); else openCtx(sess);
+        return;
+      }
+      if (mode === sess.mode) return;
+      stopSound(sess);
+      sess.st = muteSwitchSound(sess.st, mode);
+      sess.mode = mode;
+      if (mode === "mute") closeCtx(sess); else openCtx(sess);
+      if (sess.pill) sess.pill.setMode(mode);
+      say(sess, muteFill(MUTE_TEXT.soundChanged, muteVars(mode, totals(sess))), true);
+      tick(sess, null);
+    }
+
+    // A new list while on: re-scan the kept captions in place. Hits inside a
+    // window Whisper already heard are refined here; only the rest are sent.
+    function rebuild(sess, list) {
+      const pattern = muteWordsPattern(list);
+      // With the panel closed, the pill says why before it goes (as Stop does).
+      const endLive = (text) => {
+        if (!ui() && sess.pill) { stop({ quiet: true, endText: text }); return; }
+        stop({ quiet: true });
+        say(null, text, true);
+      };
+      if (!pattern) { endLive(MUTE_TEXT.liveEmptyList); return; }
+      const found = muteRanges(sess.cues, pattern, durMs(sess.video));
+      if (!found.n) { endLive(MUTE_TEXT.liveNoMatches); return; }
+      const v = sess.video;
+      endAlignPort(sess);
+      clearRetry(sess);
+      // The boundary timer, re-arms and edge are reset by the tick below (arm),
+      // and alignDone by startAlign; only the retry count is ours to reset.
+      sess.retries = 0;
+      sess.rebuilt = true;
+      sess.pattern = pattern;
+      sess.listKey = list.join("\n");
+      const old = sess.st;
+      const nowMs = Math.max(0, Math.floor(v.currentTime * 1000));
+      sess.st = { videoId: sess.videoId, hits: found.hits, ranges: found.ranges,
+        mode: sess.mode, owned: false, lastSet: null, cur: null, soundOn: false,
+        soundBlocked: !!(old && old.soundBlocked), released: false, pending: [] };
+      // Each new hit whose own window lies inside one Whisper already returned is
+      // refined from that window, its words shared out over every such hit at
+      // once, exactly as onAlign does for a window that arrives on the port.
+      const dur = durMs(v);
+      const byHeard = new Map();
+      for (const h of sess.st.hits) {
+        const win = alignWindows([h], 0, dur)[0];
+        if (!win) continue;
+        const heard = (sess.heard || []).find((w) => w.start_ms <= win.start_ms && w.end_ms >= win.end_ms);
+        if (!heard) continue;
+        h.heard = true;
+        if (!byHeard.has(heard)) byHeard.set(heard, []);
+        byHeard.get(heard).push(h.id);
+      }
+      for (const [heard, ids] of byHeard) {
+        const win = { start_ms: heard.start_ms, end_ms: heard.end_ms, hits: ids };
+        const byHit = assignWindowWords(win, sess.st.hits, heard.words);
+        for (const [hitId, words] of byHit) {
+          const hit = sess.st.hits.find((h) => h.id === hitId);
+          if (hit) applyRefinement(sess.st, hitId, refineHit(hit, words, pattern, win), nowMs);
+        }
+      }
+      // The range under the playhead, if it's unchanged, carries on as it was:
+      // the user's own unmute still wins and a sound already playing isn't
+      // restarted. Otherwise give up our mute and re-decide in the same task,
+      // so the audio never comes back for an instant inside a range.
+      const r = rangeAt(sess.st.ranges, nowMs);
+      if (old && old.cur && r && r.s === old.cur.s && r.e === old.cur.e) {
+        Object.assign(sess.st, { cur: old.cur, owned: old.owned, lastSet: old.lastSet,
+          released: old.released, soundOn: old.soundOn, quietCur: old.quietCur || null });
+      } else {
+        stopSound(sess);
+        if (old && old.owned) { try { v.muted = false; } catch (_) {} }
+      }
+      say(sess, muteFill(MUTE_TEXT.listUpdated, muteVars(sess.mode, totals(sess))), true);
+      tick(sess, null);
+      if (S !== sess) return;
+      startAlign(sess);
+      if (!sess.windows.length) {
+        sess.alignDone = true;
+        say(sess, alignDoneText(sess.mode, totals(sess), 0, 0), false);
+      }
+    }
+
+    // From the one storage.onChanged listener: { sound?: {newValue}, words?: {newValue} }.
+    // A removed key resolves as at toggle-on. Sound goes first, then the list.
+    function settingsChanged(ch) {
+      const sess = S;
+      if (!sess || !ch) return;
+      if (ch.sound) {
+        const picked = ch.sound.newValue;
+        setSound(sess, MUTE_SOUNDS.includes(picked) ? picked : "bleep");
+      }
+      if (S !== sess || !ch.words) return;
+      const list = resolveMuteList(ch.words.newValue, deps.defaults(), deps.normalise());
+      if (!sess.active) {
+        sess.wordsSetLive = true;
+        sess.pattern = muteWordsPattern(list);
+        sess.listKey = list.join("\n");
+        return;
+      }
+      if (list.join("\n") === sess.listKey) return;
+      rebuild(sess, list);
+    }
+
+    return {
+      start, stop, settingsChanged,
+      isOn: () => !!S,
+      isLoading: () => !!S && !S.active,
+      status: () => lastStatus,
+      _session: () => S,
+    };
+  }
+  // The open panel's side of the session: a visible status line, a live region for
+  // the announced statuses, the toggle's pressed state, and busy while reading.
+  // `root` is the panel's shadow root (null while closed); `later` is setTimeout.
+  function coverPanelUi(root, later) {
+    if (!root) return null;
+    const btn = root.querySelector(".covertoggle");
+    const line = root.querySelector(".coverstatus");
+    const live = root.querySelector(".coverlive");
+    const row = root.querySelector(".coverwrap");
+    if (!btn || !line || !live || !row) return null;
+    return {
+      status(text) { line.textContent = text; },
+      announce(text) {
+        live.textContent = "";
+        later(() => { live.textContent = text; }, MUTE_ANNOUNCE_DELAY_MS);
+      },
+      pressed(on) { btn.setAttribute("aria-pressed", on ? "true" : "false"); },
+      // aria-disabled, not disabled: the button keeps focus while the captions are
+      // read, and a second press stops the session (its onclick checks isOn).
+      busy(on) {
+        btn.setAttribute("aria-disabled", on ? "true" : "false");
+        if (on) row.setAttribute("aria-busy", "true");
+        else row.removeAttribute("aria-busy");
+      },
+    };
+  }
+
+  // A re-opened panel takes its toggle state and status from the live session.
+  function setupCoverToggle(root, cover, later) {
+    const btn = root && root.querySelector(".covertoggle");
+    const u = coverPanelUi(root, later);
+    if (!btn || !u) return;
+    u.pressed(cover.isOn());
+    u.busy(cover.isLoading());
+    if (cover.isOn()) u.status(cover.status());
+    btn.onclick = () => {
+      if (cover.isOn()) cover.stop();
+      else cover.start();
+    };
+  }
+  // --- T-020 cover listed words: wiring (END) ------------------------------------
+
+  // The page's one session, wired to the real page and browser.
+  const muteCover = createMuteCover({
+    doc: document,
+    win: window,
+    findVideo: () => document.querySelector("video.html5-main-video")
+      || document.querySelector("video"),
+    videoId: () => { try { return new URL(location.href).searchParams.get("v"); }
+                     catch (_) { return null; } },
+    pageUrl: () => location.href,
+    readTranscript: collectPageTranscript,
+    // Read at toggle-on; later changes arrive through the one onChanged
+    // listener at the top of this file (rev 5.6), never a second one.
+    getWords: () => api.storage.local.get("muteWords"),
+    getSound: () => api.storage.local.get("muteSound"),
+    connect: () => api.runtime.connect({ name: "tldw" }),
+    AudioCtx: window.AudioContext || window.webkitAudioContext,
+    defaults: () => globalThis.TLDW_MUTE_DEFAULTS,
+    normalise: () => globalThis.TLDW_normaliseMuteList,
+    ui: coverUi,
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (id) => clearTimeout(id),
+    setInterval: (fn, ms) => setInterval(fn, ms),
+    clearInterval: (id) => clearInterval(id),
+  });
+  onMuteSettings = (live) => muteCover.settingsChanged(live);
+
+  function coverUi() { return coverPanelUi(root, (fn, ms) => setTimeout(fn, ms)); }
+  function setupCover() { setupCoverToggle(root, muteCover, (fn, ms) => setTimeout(fn, ms)); }
 
   // --- Play key moments: fetch segment timestamps, then skip the YouTube player ---
 

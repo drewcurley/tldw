@@ -92,10 +92,11 @@ def put(video_id: str, meta, cues: list, source: str = CAPTIONS) -> None:
         pass
 
 
-def _prune(directory: Path | None = None) -> None:
+def _prune(directory: Path | None = None, cap: int | None = None) -> None:
     target = directory or CACHE_DIR
+    limit = MAX_ENTRIES if cap is None else cap
     files = sorted(target.glob("*.json"), key=lambda f: f.stat().st_mtime)
-    for stale in files[:max(0, len(files) - MAX_ENTRIES)]:
+    for stale in files[:max(0, len(files) - limit)]:
         stale.unlink(missing_ok=True)
 
 

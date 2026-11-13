@@ -9,12 +9,12 @@ How tldw is tested: the levels, the tools, the gates, the test data, and how a c
 | | |
 |---|---|
 | Test runner | pytest (`pyproject.toml:13`, `dev = ["pytest>=8"]`; config at `pyproject.toml:23-32`) |
-| Suite size | 723 tests: 660 before the Tier 1 docs, plus 63 in `tests/test_docs_contracts.py` (57 from Tier 1, 6 from Tier 2: the runbook-message and manifest-name guards) |
+| Suite size | 866 tests (2026-11-13, T-020 rev 5.6; 863 before it: rev 5.6 added the `quiet` and `live` groups and the settings-listener case). It was 723 before T-020: 660 before the Tier 1 docs, plus 63 in `tests/test_docs_contracts.py` (57 from Tier 1, 6 from Tier 2: the runbook-message and manifest-name guards). T-020 added `tests/test_align.py`, the "Cover listed words" node harnesses and their pytest cases, and new extractor self-tests |
 | JavaScript | No JS test runner. The extension's real functions run in node, driven from pytest (`tests/test_extension_render.py`, `tests/js/*.js`) |
 | End-to-end tool | None. N/A: there is no browser automation tool in the repository |
 | Contract-test tool | None separate. `tests/test_server.py` runs the real HTTP server; `tests/test_docs_contracts.py` checks `docs/contracts.md` against the code |
 | CI | GitHub Actions, `.github/workflows/checks.yml`, job `tldw` ("tldw tests (pytest + extension)", `checks.yml:115-129`), which runs `sh scripts/ci-tldw-tests.sh run` |
-| Gate | Full pass, zero skips, at least `MIN_TESTS=723` tests (`scripts/ci-tldw-tests.sh:27`). No coverage-percentage gate |
+| Gate | Full pass, zero skips, at least `MIN_TESTS=866` tests (`scripts/ci-tldw-tests.sh:27`). No coverage-percentage gate |
 
 ## Test levels
 
@@ -29,7 +29,7 @@ One file per module under `tests/`. Each one calls the module's functions direct
 | `tests/test_cli.py` | 29 | `cli.py` |
 | `tests/test_config.py` | 4 | `config.py` |
 | `tests/test_core.py` | 6 | `core.py` |
-| `tests/test_hygiene.py` | 20 | `hygiene.py`, `tldw cache` |
+| `tests/test_hygiene.py` | 21 | `hygiene.py`, `tldw cache` |
 | `tests/test_metadata.py` | 20 | `metadata.py` |
 | `tests/test_naming.py` | 10 | `naming.py` |
 | `tests/test_overlays.py` | 7 | `overlays.py` |
@@ -44,6 +44,7 @@ One file per module under `tests/`. Each one calls the module's functions direct
 | `tests/test_videomode.py` | 21 | `videomode.py` |
 | `tests/test_whisper_transcribe.py` | 35 | `whisper_transcribe.py` |
 | `tests/test_isolation.py` | 6 | the isolation guards themselves (below) |
+| `tests/test_align.py` | 102 | `align.py` and `POST /align/stream` (T-020): window parsing, the ffmpeg cut, the fingerprint and key, store 13, `download_audio(max_duration_s=)`, `_load_model(local_only=)`, and the route over real HTTP (the `srv` fixture, as `test_server.py` does), including every `reason`, the check order, the permit wait and the budget on a fake clock, and client-gone at function level. The route's tests live here rather than in `test_server.py`, and the store's here rather than in a `test_txcache.py` (Test Engineer, T-020 build review). Every external tool is stubbed: `shutil.which`, `align.run`, `importlib.metadata.version`, `is_available`, `model_on_disk`, `_load_model`, `download_audio`; so the result doesn't depend on the host having ffmpeg or faster-whisper |
 
 No unit test runs a real `claude`, `yt-dlp`, `ffmpeg`, Piper or faster-whisper. They are stubbed, and `tests/conftest.py` makes a forgotten stub fail (see Isolation).
 
@@ -52,7 +53,7 @@ No unit test runs a real `claude`, `yt-dlp`, `ffmpeg`, Piper or faster-whisper. 
 - **What that proves.** Routing, auth (`401`), body limits (`413`), the slot pools (`429`), CORS preflight, NDJSON framing and the error shapes are tested through the same code path the extension uses. Only the model, yt-dlp and Piper behind the handlers are faked.
 - **Its level.** This is the suite's contract level for the HTTP API. There is no separate contract-test tool such as Pact or schemathesis, and no OpenAPI file.
 
-### Extension: node harnesses driven from pytest (`tests/test_extension_render.py`, 6 tests)
+### Extension: node harnesses driven from pytest (`tests/test_extension_render.py`, 33 tests)
 The harnesses run the extension's **real** functions, cut out of the source files, not copies.
 - **`tests/js/render_checks.js`** (`test_answer_rendering_escaping_and_citations`, `tests/test_extension_render.py:22`)
   - Cuts functions out of `content.js` by literal start/end markers (`grab`, `tests/js/render_checks.js:7-15`) and `eval`s them.
@@ -64,16 +65,23 @@ The harnesses run the extension's **real** functions, cut out of the source file
 - **`tests/js/probe_checks.js`** (`test_the_cache_check_before_reading_the_page`, `:57`)
   - Runs `startSummarize`, `probeOutcome` and `handleProbe` inside `vm.createContext` sandboxes (`tests/js/probe_checks.js:61-85`), with a fake port, page and `fetch`.
   - Covers the old-server 404 treated as a miss, and the `httpError`, `askError` and `speakError` mappings (`:191-197`).
-- **`test_extension_scripts_parse`** (`:47`, parametrized over 3 files) runs `node --check` on `content.js`, `background.js` and `options.js`.
+- **`test_extension_scripts_parse`** (`:47`, parametrized over 4 files) runs `node --check` on `content.js`, `background.js`, `options.js` and `mute_words.js`.
+- **"Cover listed words" (T-020).** Each script takes a group name, prints `checks=<n>`, and exits non-zero on an unknown group; each pytest case asserts `n` is at least that group's floor (written in `tests/test_extension_render.py`), so a group that silently runs nothing fails. Fixtures use made-up words; the shipped default list is never printed.
+  - **`tests/js/mute_checks.js`**: the pure functions between `content.js`'s "pure logic (BEGIN/END)" markers, with `mute_words.js` loaded first (10 groups, `quiet` for a live sound switch's `quietCur` among them).
+  - **`tests/js/mute_wiring_checks.js`**: the session wiring (`createMuteCover`, `playPlan`, `buildMutePill`, the panel adapter) with a fake page, `<video>`, Web Audio, port, storage and timers (11 groups; `live` drives rev 5.6's live settings changes: the sound switch, the word-list rebuild, heard-window reuse, the rebuild's busy retry and the live ends). Its listener fake keys on `(type, fn, capture)` and has a negative self-test.
+  - **`tests/js/align_bg_checks.js`**: the real `handleAlign` in `background.js`, with streamed NDJSON, including a page that disconnects before the settings read (no fetch).
+  - **`tests/js/settings_listener_checks.js`** (`test_settings_listener_passes_only_the_cover_keys`): the one `storage.onChanged` listener, between `content.js`'s "settings listener" markers. It must be the only listener; it acts only in the `local` area; `closeAction` still works; and it passes "Cover listed words" only the `muteSound`/`muteWords` `newValue`s, never the token or anything else in `changes` (rev 5.6).
+  - **`tests/js/options_mute_checks.js`**: the real `options.js` with a fake page and recording storage (Save, Restore, the sound, and Save's text and its 4 s clear).
+  - **Firefox copy list:** `test_firefox_build_copies_every_file_the_extension_loads` runs `build-firefox.sh` on a copy and checks every referenced file landed, with a negative self-test.
 
 **Coupling to watch.** The harnesses find code by literal source markers, comments included. Renaming or reflowing one of those lines breaks a `grab()`-based check, which reports "start marker not found" (`tests/js/render_checks.js:7-15`). Not every check fails that loudly: the bare `src.indexOf` slices (`tests/js/render_checks.js:137`, `:155`, `:165`) return -1 on a missing marker and can pass, and renaming the `PANEL_*_MS` constants silently drops the speed-up replacements in `tests/js/page_transcript_checks.js:96-98` (FU-11, [T-010](../tasks/T-010.md)). `tests/test_claude_client.py:284` (`test_extension_model_lists_match_the_server_allowlist`) likewise matches the literal `const MODELS = [` in `background.js` and `options.js`. `docs/contracts.md` lists these markers as contracts.
 
 ### Procedure: hook and CI-script fixture suites (`scripts/test/*.sh`, 16 suites)
 These are shell fixture suites for the git hooks and CI scripts (`.githooks/`, `scripts/*.sh`). CI's `scripts` job runs each one by name (`.github/workflows/checks.yml:30-109`), and `scripts/test/test-ci-wiring.sh` fails if a suite isn't wired in. They test the procedure gates, not tldw. `scripts/test/test-ci-tldw-tests.sh` (32 cases) tests the floor and the zero-skip check of `ci-tldw-tests.sh` itself.
 
-### Docs-contract check: `tests/test_docs_contracts.py` (63 tests)
+### Docs-contract check: `tests/test_docs_contracts.py`
 - **What it checks.**
-  - It extracts 23 categories of contract from the code: routes, methods, NDJSON types, `partial` kinds, request and response keys, port messages and names, status codes, CLI subcommands, flags and exit codes, env vars, config keys, storage keys, home paths, temp prefixes, executables, `urlopen` sites, model downloads, manifest permissions, page selectors and thread starts.
+  - It extracts 25 categories of contract from the code (23, plus T-020's two): routes, methods, NDJSON types, `partial` kinds, request and response keys, port messages and names, status codes, CLI subcommands, flags and exit codes, env vars, config keys, storage keys, home paths, temp prefixes, executables, `urlopen` sites, model downloads, manifest permissions, page selectors and thread starts.
   - Each item must appear in `docs/contracts.md` as an exact backticked token.
   - **Reverse checks:** any route, env var or storage key listed in the doc's tables but gone from the code fails.
 - **Its own guards.**
@@ -82,8 +90,9 @@ These are shell fixture suites for the git hooks and CI scripts (`.githooks/`, `
   - Every `querySelector` receiver must be classified as page or non-page.
   - A negative test removes `/ask/stream` from a copy of the doc, adds a route that doesn't exist, and asserts that both are reported.
 - **The Tier 2 guards.**
-  - **Runbook messages:** every `> ` quote under a runbook's `## What you see` must equal a whole fixed string in the code. Python strings are found with `ast`, and extension strings with a small JS tokenizer. Messages with variable parts are cited, not quoted. A floor (`RUNBOOK_QUOTE_FLOOR`, 16 today) means a renamed heading can't silently drop a file's quotes, and a negative test checks that a made-up quote fails.
+  - **Runbook messages:** every `> ` quote under a runbook's `## What you see` must equal a whole fixed string in the code. Python strings are found with `ast`, and extension strings with a small JS tokenizer. Messages with variable parts are cited, not quoted. A floor (`RUNBOOK_QUOTE_FLOOR`, 19 today: T-020 added three) means a renamed heading can't silently drop a file's quotes, and a negative test checks that a made-up quote fails.
   - **The manifest name:** `test_manifest_names_match_contracts_md` checks that both manifests' `name` equal each other and the `name` row in `contracts.md`'s manifest keys (T-019).
+- **The T-020 additions.** Two more extractors, `align_reasons` (every `reason` a word-timing failure can carry) and `injected_files` (the `executeScript` files); `storage_keys` reads `get`/`set`/`remove` with a string or string-array argument; `page_selectors` also reads `closest` and `matches`; self-tests for each. **`status_strings`**: every "Cover listed words" status and server detail text, read from its marker block in `content.js` and `align.py` and from `#whisperCoverHint`, must appear verbatim in `contracts.md`, with a negative self-test.
 - **Where its conventions live.** The module docstring documents the token conventions and how a category's section is found (by heading).
 - **The leak check.** The file also holds the deterministic leak check for `docs/` and new task files: home-directory paths, the secret patterns read from `scripts/ci-checks.sh`, and the template-placeholder marker.
 
@@ -122,16 +131,16 @@ Every test runs with these autouse fixtures. Each guard exists because the thing
 There are **no coverage-percentage gates** at any level: no coverage tool is configured. The only automated gates are these, all in `scripts/ci-tldw-tests.sh`:
 1. pytest must exit 0;
 2. the JUnit report must show **0 failures, 0 errors and 0 skips** (`scripts/ci-tldw-tests.sh:58-62`);
-3. at least `MIN_TESTS` (723) tests must run (`:27`, `:59-60`), so a deleted or uncollected test file fails CI.
+3. at least `MIN_TESTS` (866) tests must run (`:27`, `:59-60`), so a deleted or uncollected test file fails CI.
 
-`MIN_TESTS` is raised by hand when tests are added, and `scripts/test/test-ci-tldw-tests.sh:185` fails if it ever drops below 723. Beyond that, "every contract has a guarding test" is enforced by review (Test Engineer redlines in `.claude/agents/sdet.md`) and by the mapping table below, not by a tool.
+`MIN_TESTS` is raised by hand when tests are added, and `scripts/test/test-ci-tldw-tests.sh:185` fails if it ever drops below 866. Beyond that, "every contract has a guarding test" is enforced by review (Test Engineer redlines in `.claude/agents/sdet.md`) and by the mapping table below, not by a tool.
 
 ## Skips: `skipif(node)` versus CI's zero-skip rule
-`tests/test_extension_render.py` marks all of its tests `skipif(shutil.which("node") is None)` (`:21`, `:34`, `:45`, `:56`). That covers 6 tests, counting the 3 parametrized parse checks.
+`tests/test_extension_render.py` marks its node tests `skipif(shutil.which("node") is None)` (10 markers, covering every parametrized case) and its two Firefox-build tests `skipif(shutil.which("bash") is None)`. One test, the injected-files order, needs neither.
 - **Locally**, a machine without node skips them, and pytest still exits 0.
 - **In CI**, `ci-tldw-tests.sh` fails if `node` is missing (`:76`), before anything installs, and fails on **any** skip in the report (`:58-62`).
 
-So the extension tests can never pass CI by being skipped. Locally, run with `-rs` (`ci-tldw-tests.sh:85` does) to see whether anything was skipped. No `skip`, `xfail` or `todo` markers exist besides these four `skipif`s (grep of `tests/*.py`, 2026-11-12).
+So the extension tests can never pass CI by being skipped. Locally, run with `-rs` (`ci-tldw-tests.sh:85` does) to see whether anything was skipped. No `skip`, `xfail` or `todo` markers exist besides these `skipif`s (grep of `tests/*.py`, 2026-11-13).
 
 ## Flake policy
 Flakes are bugs: fix the test or delete it. **Never re-run until green.** CI has no retry step; the job runs pytest once (`scripts/ci-tldw-tests.sh:85`).
@@ -174,34 +183,34 @@ There is **no mutation-testing tool**.
 
 | `docs/contracts.md` section | Guarding tests | Level | Unguarded parts (follow-up) |
 |---|---|---|---|
-| HTTP routes, methods, auth | `tests/test_server.py`: every route is called over real HTTP (`/summarize/stream`, `/summarize/cached`, `/segments/stream`, `/speak`, `/speak/stream`, `/preview`, `/ask/stream`, `/transcribe/stop`, `/health`, `/voices`, buffered `/summarize`); `*_requires_token`; `test_preflight_allows_extension_origin` (`:186`), `test_preflight_rejects_web_origin` (`:792`); `test_docs_contracts.py[routes, http_methods]` | contract | No test asserts the `404 {"error":"not found"}` answer for an unknown path, or the stdlib 501 for an unhandled method (FU-1, [T-010](../tasks/T-010.md)) |
+| HTTP routes, methods, auth | `tests/test_server.py`: every route is called over real HTTP (`/summarize/stream`, `/summarize/cached`, `/segments/stream`, `/speak`, `/speak/stream`, `/preview`, `/ask/stream`, `/transcribe/stop`, `/health`, `/voices`, buffered `/summarize`); `/align/stream` is called the same way from `tests/test_align.py` (T-020); `*_requires_token`; `test_preflight_allows_extension_origin` (`:186`), `test_preflight_rejects_web_origin` (`:792`); `test_docs_contracts.py[routes, http_methods]` | contract | No test asserts the `404 {"error":"not found"}` answer for an unknown path, or the stdlib 501 for an unhandled method (FU-1, [T-010](../tasks/T-010.md)) |
 | Request and response bodies, error shapes | `test_server.py`: `test_oversized_body` (`:151`), `test_summarize_accepts_a_transcript_sized_body_but_not_an_endless_one` (`:159`), `test_a_bad_body_to_the_stop_route_is_a_400` (`:1907`), `test_a_bad_probe_is_a_400` (`:2228`), unknown-model 400 (`:733`), `test_summarize_stream_error_is_in_band` (`:222`); `test_docs_contracts.py[request_keys, response_keys]` | contract | Chunked bodies → `400` and a missing `Content-Length` → `411` (FU-10, [T-010](../tasks/T-010.md)) |
 | Request and response headers; server-side cross-cutting invariants | `test_server.py`: the token tests (`*_requires_token`), CORS (`:111`, `:186-192`, `:792-797`), body caps (`:151`, `:159`), token-file mode (`:771-790`, POSIX only) | contract | The loopback refusal, `X-Content-Type-Options`/`Cache-Control`, and the caption host allowlist (FU-10, [T-010](../tasks/T-010.md)) |
 | Extension → server HTTP calls | `tests/js/probe_checks.js` (the `/summarize/cached` probe and its 404→miss); `test_docs_contracts.py[routes]` (every called path exists) | extension harness | The request bodies and headers `background.js` and `options.js` send for the other routes (FU-2, FU-5, [T-010](../tasks/T-010.md)) |
 | Limits and slot pools | `test_server.py`: `test_busy_returns_429` (`:176`), `test_each_route_counts_against_its_own_limit` (`:2524`), `test_the_two_limits_say_different_things` (`:2542`), the prefetch-reserve tests (`:2663-2686`); conftest's leak and double-release check | contract | — |
-| NDJSON stream events and `partial` kinds | `test_server.py`: `test_summarize_stream_emits_progress_then_result` (`:205`), `test_summarize_stream_sends_the_summary_as_it_is_written` (`:689`), `test_segments_stream` (`:234`), `test_speak_stream_*` (`:299-350`), `test_ask_streams_progress_then_deltas` (`:515`); every emitted type occurs in `test_server.py`; `test_docs_contracts.py[ndjson_types, partial_kinds]`, `test_background_reads_only_ndjson_types_the_server_emits` | contract | — |
-| Extension message protocol (port, `tabs.sendMessage`) | `tests/js/probe_checks.js` (`summarize`, `probeCache`, `probe`, `result`, `error`); `tests/js/render_checks.js` (`stopTranscribe`, `needsTranscription`, the refresh flag); `test_docs_contracts.py[port_message_types, port_names]` (inventory only) | extension harness | The speak, ask, segments and preview message flows (`speakProgress`, `audioChunk`, `audioEnd`, `askDelta`, `askDone`, `segmentAdded`, `segmentsDone`, `getSegments`, `previewError`), and `TLDW_INVOKE`/`TLDW_ERROR`, have no behavioural test (FU-2, [T-010](../tasks/T-010.md)) |
+| NDJSON stream events and `partial` kinds | `test_server.py`: `test_summarize_stream_emits_progress_then_result` (`:205`), `test_summarize_stream_sends_the_summary_as_it_is_written` (`:689`), `test_segments_stream` (`:234`), `test_speak_stream_*` (`:299-350`), `test_ask_streams_progress_then_deltas` (`:515`); every emitted type occurs in `test_server.py`; `test_docs_contracts.py[ndjson_types, partial_kinds]`, `test_background_reads_only_ndjson_types_the_server_emits`; `/align/stream`'s `window`/`result`/`error` in `tests/test_align.py` and, as the worker reads them, `tests/js/align_bg_checks.js` | contract | — |
+| Extension message protocol (port, `tabs.sendMessage`) | `tests/js/probe_checks.js` (`summarize`, `probeCache`, `probe`, `result`, `error`); `tests/js/render_checks.js` (`stopTranscribe`, `needsTranscription`, the refresh flag); `test_docs_contracts.py[port_message_types, port_names]` (inventory only); the `align` flow (`align`, `alignProgress`, `alignWindow`, `alignDone`, `alignError`) in `tests/js/align_bg_checks.js` and `tests/js/mute_wiring_checks.js` (T-020) | extension harness | The speak, ask, segments and preview message flows (`speakProgress`, `audioChunk`, `audioEnd`, `askDelta`, `askDone`, `segmentAdded`, `segmentsDone`, `getSegments`, `previewError`), and `TLDW_INVOKE`/`TLDW_ERROR`, have no behavioural test (FU-2, [T-010](../tasks/T-010.md)) |
 | Status → message mapping (`httpError`, `askError`, `speakError`, `showError`) | `tests/js/probe_checks.js:191-197`; `test_docs_contracts.py[status_codes]` | extension harness | — |
 | CLI subcommands, flags, exit codes | `tests/test_cli.py`, `tests/test_config.py` (`config set/get`), `tests/test_usage.py` (`usage --file/--by-video`), `tests/test_hygiene.py:218-245` (`cache clean`, `--dry-run`); `test_docs_contracts.py[cli_*]` | unit | No test of the `serve` parser through `cli.main` (`--host`, `--port`, `--token`, `--allow-origin`, `--llm-cmd`, the `TLDW_TOKEN` fallback), of `config unset`, or of exit code `130` (FU-3, [T-010](../tasks/T-010.md)) |
 | Environment variables | `TLDW_LLM_CMD` (`test_claude_client.py`, `test_server.py:1104`); `TLDW_OUTPUT_DIR` (`test_config.py:23-36`); `TLDW_YTDLP_COOKIES` (`test_metadata.py:130-150`); `DISABLE_PROMPT_CACHING` (`test_claude_client.py:376-421`); `CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` (`test_server.py:2899-2921`); `HF_HUB_CACHE` (`test_hygiene.py:229`); `test_docs_contracts.py[env_vars]` (both directions) | unit | `TLDW_TOKEN`, `HF_HOME` and `HF_HUB_DOWNLOAD_TIMEOUT` have no test (FU-4, [T-010](../tasks/T-010.md)) |
 | Config keys | `test_config.py`; `test_cli.py:326-342` (`test_a_setting_the_server_would_ignore_is_refused`, `test_valid_settings_are_written`); `test_isolation.py:54`; `test_docs_contracts.py[config_keys]` | unit | — |
-| On-disk stores and home paths | `test_isolation.py:18` (every `Path.home()` constant is redirected); per-store tests in `test_server.py`, `test_usage.py`, `test_hygiene.py`; token file mode (`test_server.py:771-790`); `test_docs_contracts.py[home_paths, temp_prefixes]` | unit and contract | — |
-| `chrome.storage.local` keys and defaults | `test_docs_contracts.py[storage_keys]` (inventory, both directions); `render_checks.js` (`closePolicy`, sponsor counters) | inventory plus a partial harness | `options.js` load/save (`load`, the save handler at `extension/options.js:124-141`) and the differing `DEFAULTS` in `options.js` and `background.js` have no behavioural test (FU-5, [T-010](../tasks/T-010.md)) |
+| On-disk stores and home paths | `test_isolation.py:18` (every `Path.home()` constant is redirected); per-store tests in `test_server.py`, `test_usage.py`, `test_hygiene.py`; store 13 in `test_align.py` (round trip, expiry, every bad shape a miss, every fingerprint input, the cap); token file mode (`test_server.py:771-790`); `test_docs_contracts.py[home_paths, temp_prefixes]` | unit and contract | — |
+| `chrome.storage.local` keys and defaults | `test_docs_contracts.py[storage_keys]` (inventory, both directions); `render_checks.js` (`closePolicy`, sponsor counters); `tests/js/options_mute_checks.js` (`muteWords` and `muteSound` load, Restore and Save, T-020); `tests/js/settings_listener_checks.js` and `mute_wiring_checks.js` group `live` (the two keys applied while on, rev 5.6) | inventory plus a partial harness | `options.js` load/save (`load`, the save handler at `extension/options.js:124-141`) and the differing `DEFAULTS` in `options.js` and `background.js` have no behavioural test (FU-5, [T-010](../tasks/T-010.md)) |
 | Lists copied from the server | `MODELS`: `test_claude_client.py:284`; `WHISPER_POLICIES`: options vs worker only (`render_checks.js:422-432`) | unit / harness | `WHISPER_POLICIES` isn't compared with `server.py:66`; `VOICE_FALLBACK`/`VOICE_OPTIONS` aren't compared with `audio.VOICES` (FU-6, [T-010](../tasks/T-010.md)) |
-| Manifests and the Firefox build | `test_docs_contracts.py[manifest_permissions]` (inventory); `test_manifest_names_match_contracts_md` (the `name` key) | inventory; `name` guarded | **Unguarded:** the rest of both manifests (versions kept equal, `host_permissions` tied to port 8765), and `extension/build-firefox.sh`'s copy list (FU-7, [T-010](../tasks/T-010.md)) |
+| Manifests and the Firefox build | `test_docs_contracts.py[manifest_permissions]` (inventory); `test_manifest_names_match_contracts_md` (the `name` key); `test_firefox_build_copies_every_file_the_extension_loads` and its negative test (the copy list, T-020); `test_the_injected_files_are_the_word_list_then_content` | inventory; `name` and the Firefox copy list guarded | **Unguarded:** the rest of both manifests (versions kept equal, `host_permissions` tied to port 8765) (FU-7, [T-010](../tasks/T-010.md)) |
 | YouTube page contract (selectors, transcript panel) | `tests/js/page_transcript_checks.js` (segment rows, panel, transcript button, `#visibility-button`, `meta[itemprop=…]`); `test_docs_contracts.py[page_selectors]` | extension harness | `video.html5-main-video` (seek and play) has no harness test (FU-2, [T-010](../tasks/T-010.md)) |
 | Subprocess integrations and the model I/O contract | `test_proc.py`, `test_claude_client.py` (stream-json parsing, watchdog, env), `test_metadata.py`, `test_videomode.py`, `test_audio.py`, `test_whisper_transcribe.py`; `test_isolation.py:36-46` (real binaries refused); `test_docs_contracts.py[executables, urlopen_sites, model_download_sites]` | unit | Against stubs only. A real `claude`, `yt-dlp` or `ffmpeg` release that changes its output is caught only by use, never in CI (by design: no network, no quota) |
 | Background jobs and threads | conftest's "background work outlived the test" check; `test_server.py` transcription and prefetch tests (`:1541-1664`, `:2663-2976`); `test_docs_contracts.py[thread_starts]` | contract | — |
-| Text the tests depend on (source markers) | `grab()` fails on a missing marker (`tests/js/render_checks.js:7-15`) | harness | The bare `indexOf` slices (`render_checks.js:137`, `:155`, `:165`) and the `PANEL_*_MS` replacements (`page_transcript_checks.js:96-98`) don't fail on a missing marker (FU-11, [T-010](../tasks/T-010.md)) |
+| Text the tests depend on (source markers) | `grab()` fails on a missing marker (`tests/js/render_checks.js:7-15`); the T-020 harnesses exit 2 on a missing marker; `test_contracts_md_quotes_every_status_string_verbatim` reads the two T-020 text blocks by marker | harness | The bare `indexOf` slices (`render_checks.js:137`, `:155`, `:165`) and the `PANEL_*_MS` replacements (`page_transcript_checks.js:96-98`) don't fail on a missing marker (FU-11, [T-010](../tasks/T-010.md)) |
 | Keyboard and accessibility baseline | `render_checks.js:84-114` (`fromModal`, the hotkey shield and its removal, no `keydown` handler on the chat input), `render_checks.js:402` (the stop button's `aria-label`) | extension harness | Escape, Enter/Shift+Enter, the Tab trap, the dialog semantics and the `aria-live` regions have no test (FU-2, [T-010](../tasks/T-010.md)) |
 | Public module entry points | the unit suites import and call them (`test_cli.py`, `test_server.py`, `test_claude_client.py` and the rest) | unit | No test pins the signatures as such; a rename fails only where a test calls it |
 | Cross-cutting data invariants | per-store tests in `test_server.py`, `test_usage.py`, `test_hygiene.py`; `test_isolation.py:18` | unit and contract | As listed per store in `docs/data-model.md` |
-| Interface text (`"trimmed video"`, `" (cached)"`) | `render_checks.js:325-327` (trimmed note escaped) | harness | The `" (cached)"` header suffix (`extension/content.js:930`) has no test (FU-2, [T-010](../tasks/T-010.md)) |
+| Interface text (`"trimmed video"`, `" (cached)"`) | `render_checks.js:325-327` (trimmed note escaped) | harness | The `" (cached)"` header suffix (`extension/content.js:956`) has no test (FU-2, [T-010](../tasks/T-010.md)) |
 
 ## What to run before a commit
 From the repository root, in the dev venv:
 1. **The whole tldw suite:** `.venv/bin/python -m pytest -p no:cacheprovider -rs`.
-   - Expect 0 failures and 0 skips, and at least 723 tests.
+   - Expect 0 failures and 0 skips, and at least 866 tests.
    - It includes `tests/test_docs_contracts.py`, so any change to a contract surface also needs `docs/contracts.md` updated.
    - Never run a subset alone before committing a contract-touching change.
 2. **The extension tests are not optional.** With node installed, `-rs` must show no skips; without node, the extension tests did not run.
@@ -220,7 +229,7 @@ From the repository root, in the dev venv:
 - FU-4: no test of `TLDW_TOKEN`, `HF_HOME` or `HF_HUB_DOWNLOAD_TIMEOUT`. → [T-010](../tasks/T-010.md)
 - FU-5: no behavioural test of `options.js` load/save, or of the two `DEFAULTS` objects that differ. → [T-010](../tasks/T-010.md)
 - FU-6: `WHISPER_POLICIES` is not compared with the server's; `VOICE_FALLBACK`/`VOICE_OPTIONS` are not compared with `audio.VOICES`. → [T-010](../tasks/T-010.md)
-- FU-7: the manifests (version equality, `host_permissions` coupled to 8765) and the copy list in `extension/build-firefox.sh` are unguarded. → [T-010](../tasks/T-010.md)
+- FU-7: the manifests (version equality, `host_permissions` coupled to 8765) are unguarded. (The `extension/build-firefox.sh` copy list is now guarded, T-020.) → [T-010](../tasks/T-010.md)
 - FU-8: `tests/test_server.py` uses a well-known public video ID; replace it with an invented one. → [T-011](../tasks/T-011.md)
 - FU-9: no coverage tool, dependency-vulnerability audit or SAST. This records the current state; it is not a decision to add one. → [T-017](../tasks/T-017.md)
 - FU-10: no test of the loopback refusal, chunked → `400`, missing `Content-Length` → `411`, the constant response headers (`X-Content-Type-Options`, `Cache-Control`) or the caption host allowlist. → [T-010](../tasks/T-010.md)
