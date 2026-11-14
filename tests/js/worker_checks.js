@@ -16,6 +16,8 @@ const check = (name, got, want) => {
   if (!ok) failures.push(`${name} -> ${JSON.stringify(got)}`);
 };
 const tick = () => new Promise((r) => setImmediate(r));
+// A promise left rejected is a named failure, not just node's exit code.
+process.on("unhandledRejection", (e) => { failures.push("unhandled rejection: " + e); });
 const flush = async (n = 12) => { for (let i = 0; i < n; i++) await tick(); };
 const ORIGIN = "https://www.youtube.com/*";
 const ID = "AAAAAAAAAAA";
@@ -41,7 +43,7 @@ function worker({ mode = "chrome", stored = {}, granted = false, registered = []
     stored: { ...stored }, granted, registered: registered.slice(),
     calls: [], sets: [], warnings: [], infos: [], fetches: [],
     holdGet: null, failGet: 0, failSet: 0, holdRegister: null, failRegister: null,
-    executed: [], tabMessages: [], optionsOpened: 0,
+    executed: [], tabMessages: [], optionsOpened: 0, badge: [], badgeMode: null,
   };
   const ev = {
     onClicked: event(), onConnect: event(), onMessage: event(), onInstalled: event(),
@@ -78,8 +80,17 @@ function worker({ mode = "chrome", stored = {}, granted = false, registered = []
       onConnect: ev.onConnect, onMessage: ev.onMessage, onInstalled: ev.onInstalled,
       onStartup: ev.onStartup,
       openOptionsPage: async () => { w.optionsOpened++; },
+      getManifest: () => ({ action: { default_title: "FAKE default" } }),
     },
-    action: { onClicked: ev.onClicked },
+    // The badge setters record, and can be made to throw, reject, or be missing.
+    action: { onClicked: ev.onClicked,
+      ...Object.fromEntries(["setBadgeText", "setBadgeBackgroundColor", "setBadgeTextColor",
+                             "setTitle"].map((name) => [name, (arg) => {
+        w.badge.push([name, arg]);
+        if (w.badgeMode === "throw") throw new Error("Invalid argument");
+        if (w.badgeMode === "reject") return Promise.reject(new Error("No tab with id: 7."));
+        return Promise.resolve();
+      }])) },
     tabs: { sendMessage: async (tabId, msg) => { w.tabMessages.push({ tabId, msg }); } },
     storage: { local: storageLocal, onChanged: ev.storageChanged },
     permissions: {
@@ -116,6 +127,7 @@ function worker({ mode = "chrome", stored = {}, granted = false, registered = []
       },
     },
   };
+  w.chrome = chrome;
   const ctx = {
     chrome, URL, TextDecoder, TextEncoder, AbortController, atob, btoa,
     setTimeout, clearTimeout, setInterval, clearInterval,
@@ -456,6 +468,69 @@ const NOW = () => Date.now();
     const m = b.summarize({});
     await flush();
     check("...while a manual run still works", types(m).includes("result"), true);
+  }
+
+  // ------------------------------------------------------- the badge ----
+  const TAB = { id: "tldw-ext-id", tab: { id: 7 }, frameId: 0 };
+  {
+    const w = worker();
+    const r = w.message({ type: "badge:set" }, TAB);
+    check("badge:set returns undefined (no reply, stays synchronous)", r.returned, undefined);
+    await flush();
+    check("...and never replies", r.got, false);
+    check("set: text, colour, text colour and title, all for that tab",
+      JSON.stringify(w.badge), JSON.stringify([
+        ["setBadgeText", { tabId: 7, text: "✓" }],
+        ["setBadgeBackgroundColor", { tabId: 7, color: "#137333" }],
+        ["setBadgeTextColor", { tabId: 7, color: "#FFFFFF" }],
+        ["setTitle", { tabId: 7, title: "TL;DW summarized this video for you — click to read" }]]));
+    w.badge.length = 0;
+    w.message({ type: "badge:clear" }, TAB);
+    check("clear: no text, the manifest's own title",
+      JSON.stringify(w.badge), JSON.stringify([
+        ["setBadgeText", { tabId: 7, text: "" }],
+        ["setTitle", { tabId: 7, title: "FAKE default" }]]));
+    w.badge.length = 0;
+    w.message({ type: "badge:set", tabId: 99 }, TAB);
+    check("a tabId in the message is never used", w.badge.every(([, a]) => a.tabId === 7), true);
+    check("...the message is still handled", w.badge.length, 4);
+  }
+  for (const [label, sender] of [
+    ["no tab (the options page)", { id: "tldw-ext-id" }],
+    ["frameId 0 but no tab", { id: "tldw-ext-id", frameId: 0 }],
+    ["a sub-frame", { id: "tldw-ext-id", tab: { id: 7 }, frameId: 3 }],
+    ["tab id -1", { id: "tldw-ext-id", tab: { id: -1 }, frameId: 0 }],
+    ["a tab id that isn't an integer", { id: "tldw-ext-id", tab: { id: 1.5 }, frameId: 0 }],
+    ["another extension", { id: "other-ext", tab: { id: 7 }, frameId: 0 }],
+  ]) {
+    const w = worker();
+    w.message({ type: "badge:set" }, sender);
+    check(`badge ignored from ${label}`, w.badge.length, 0);
+  }
+  {
+    const w = worker();
+    delete w.chrome.action.setBadgeTextColor;
+    w.message({ type: "badge:set" }, TAB);
+    check("without setBadgeTextColor the other three still run",
+      JSON.stringify(w.badge.map(([n]) => n)),
+      JSON.stringify(["setBadgeText", "setBadgeBackgroundColor", "setTitle"]));
+  }
+  for (const mode of ["throw", "reject"]) {
+    const w = worker();
+    w.badgeMode = mode;
+    let threw = false;
+    try { w.message({ type: "badge:set" }, TAB); w.message({ type: "badge:clear" }, TAB); }
+    catch (_) { threw = true; }
+    await flush();
+    check(`action calls that ${mode} don't escape`, threw, false);
+    check(`...every call was still attempted (${mode})`, w.badge.length, 6);
+  }
+  {
+    // The tab check lives in the badge branch only: the options page has no tab.
+    const w = worker();
+    const r = w.message({ type: "channels:add", key: "@chan", name: "Chan" });
+    await flush();
+    check("channels:add from a tab-less sender still works", r.value && r.value.ok, true);
   }
 
   // ------------------------------------------------- the channel list ----

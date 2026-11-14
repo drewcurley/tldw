@@ -29,6 +29,9 @@ const between = (start, end, from = 0) => {
   return SRC.slice(i, j);
 };
 const tick = () => new Promise((r) => setImmediate(r));
+// A promise left rejected anywhere is a failure, not just node's opinion.
+const unhandled = [];
+process.on("unhandledRejection", (e) => { unhandled.push(e); failures.push("unhandled rejection: " + e); });
 const flush = async (n = 10) => { for (let i = 0; i < n; i++) await tick(); };
 
 const CODE = [
@@ -83,8 +86,13 @@ function setup({ stored = { autoRun: true, autoChannels: [LISTED] }, url = watch
     t.ports.push(p);
     return p;
   };
+  // window's own events (pagehide/pageshow), dispatched as a browser would.
+  t.win = { listeners: {}, addEventListener(type, fn) {
+    (t.win.listeners[type] = t.win.listeners[type] || []).push(fn); } };
+  t.fire = (type, { persisted = false, trusted = true } = {}) =>
+    (t.win.listeners[type] || []).forEach((fn) => fn({ type, persisted, isTrusted: trusted }));
   const ctx = {
-    document: doc, location: { href: url }, URL,
+    document: doc, location: { href: url }, URL, window: t.win,
     console: { info: (...a) => t.infos.push(a.map(String).join(" ")), log() {}, warn() {}, error() {} },
     setTimeout: clock.setTimeout, setInterval: clock.setInterval,
     clearTimeout: clock.clear, clearInterval: clock.clear,
@@ -103,13 +111,14 @@ function setup({ stored = { autoRun: true, autoChannels: [LISTED] }, url = watch
     // content.js's own state, as declared at the top of its IIFE.
     autoRun: false, autoChannels: [], autoHandled: new Set(), autoRunVid: null,
     autoTimer: null, currentRun: null, drains: new Map(), autoLogged: new Set(),
-    pausedShown: false, lastCached: false, host: null, root: null, port: null,
+    pausedShown: false, lastCached: false, badgeVid: null, host: null, root: null, port: null,
     requestActive: false, currentVideoId: null, backgrounded: false, lastProgress: null,
     partialState: null, txLive: null, pendingOffer: null, lastPayload: null,
     safetyTimer: null, pingTimer: null, creepTimer: null, stageTimer: null, progressPct: 0,
     // The panel's drawing, stubbed and recorded.
     showLoading() { t.showLoading++; ctx.host = "panel"; },
-    showResult(p, cached) { t.shown.push({ title: p && p.title, cached }); },
+    // As the real showResult does first (a source check below pins that).
+    showResult(p, cached) { ctx.badgeShown(p); t.shown.push({ title: p && p.title, cached }); },
     showError(m) { t.errors.push(m); },
     showTranscribeOffer(offer, url, vid) { t.offers.push(vid); },
     onPartial() {}, updateProgress() {}, addStopControl() {}, showPartial() {}, applyWidth() {},
@@ -821,19 +830,20 @@ async function running(opts) {
   // ================================================ AC4: the top of the file ====
   const whole = ({ withChannels = true, preset } = {}) => {
     const doc = new D.Document();
-    const t = { doc, onMessage: [] };
+    const t = { doc, onMessage: [], sent: [] };
     const ctx = {
       document: doc, location: { href: watch(V1) }, URL,
       console: { info() {}, log() {}, warn() {}, error() {} },
       setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
       chrome: {
-        runtime: { connect() {}, sendMessage: async () => ({}),
+        runtime: { connect() {}, sendMessage: async (m) => { t.sent.push(m); return {}; },
                    onMessage: { addListener: (fn) => t.onMessage.push(fn) } },
         storage: { local: { get: async (d) => ({ ...d }), set: async () => {} },
                    onChanged: { addListener() {} } },
       },
     };
     ctx.window = ctx;
+    ctx.addEventListener = () => {};
     vm.createContext(ctx);
     if (preset !== undefined) ctx.__tldwInit = preset;
     if (withChannels) vm.runInContext(CHANNELS, ctx);
@@ -848,6 +858,12 @@ async function running(opts) {
     check("...auto-run listens for navigations", t.doc.listenerCount("yt-navigate-finish"), 1);
     const again = whole({ preset: true });
     check("a real second injection does nothing", again.onMessage.length, 0);
+    await flush();
+    const fresh = whole();
+    await flush();
+    check("a fresh page clears the badge exactly once",
+      JSON.stringify(fresh.sent.map((m) => m.type)), '["badge:clear"]');
+    check("...and a second injection sends nothing", again.sent.length, 0);
   }
   {
     const t = whole({ withChannels: false });
@@ -870,6 +886,174 @@ async function running(opts) {
     check("a TLDW_CHANNELS without channelKey counts as missing",
       doc.listenerCount("yt-navigate-finish"), 0);
   }
+
+  // ============================================================ the badge ====
+  const badgeMsgs = (t) => t.messages.map((m) => m.type).filter((x) => x.startsWith("badge:"));
+  const result = (vid = V1, extra = {}) => ({ type: "result", payload: { title: "T", video_id: vid }, ...extra });
+  {
+    const { t, p } = await running();
+    check("start: one clear, nothing else", JSON.stringify(badgeMsgs(t)), '["badge:clear"]');
+    check("...no video id is ever sent", t.messages.some((m) => m.type.startsWith("badge:")
+      && Object.keys(m).length !== 1), false);
+    p.deliver(result());
+    check("an automatic result with the panel closed sets the badge",
+      JSON.stringify(badgeMsgs(t)), '["badge:clear","badge:set"]');
+    check("...for its video", t.ctx.badgeVid, V1);
+    check("...logged once", t.infos.filter((x) => x === "[TL;DW auto] badge " + V1).length, 1);
+    // Opened from the notice: read, so cleared.
+    t.toast().dispatchEvent(D.event("click"));
+    check("opening it from the notice clears the badge", badgeMsgs(t).slice(-1)[0], "badge:clear");
+    check("...and forgets it", t.ctx.badgeVid, null);
+    t.ctx.showResult({ video_id: V1 });
+    check("showing it again sends nothing more", badgeMsgs(t).length, 3);
+  }
+  {
+    // A cache hit served to an automatic run badges too.
+    const t = setup();
+    t.ctx.initAutoRun();
+    await t.advance(3000);
+    t.ports[0].deliver({ type: "probe", hit: true, payload: { title: "C", video_id: V1 } });
+    check("an automatic cache hit sets the badge", badgeMsgs(t).includes("badge:set"), true);
+  }
+  {
+    // Opened with the toolbar instead.
+    const { t, p } = await running();
+    p.deliver(result());
+    t.ctx.host = null;
+    t.invoke(V1);
+    check("opening it with the toolbar clears the badge", badgeMsgs(t).slice(-1)[0], "badge:clear");
+  }
+  {
+    const { t, p } = await running();
+    p.deliver(result());
+    t.ctx.showResult({ video_id: V2, title: "other" });
+    check("showing another video's summary keeps the badge", t.ctx.badgeVid, V1);
+    check("...and sends nothing", badgeMsgs(t).slice(-1)[0], "badge:set");
+  }
+  for (const [label, dest] of [["another video", V2], ["a page that isn't a video", null]]) {
+    const { t, p } = await running();
+    p.deliver(result());
+    t.navigate(dest, dest ? { vid: dest, href: "/@other" } : null);
+    check(`navigating to ${label} clears the badge`, badgeMsgs(t).slice(-1)[0], "badge:clear");
+    check(`...and forgets it (${label})`, t.ctx.badgeVid, null);
+  }
+  {
+    // Leaving the page, and coming back from the back/forward cache.
+    const { t, p } = await running();
+    p.deliver(result());
+    const n = badgeMsgs(t).length;
+    t.fire("pagehide", { trusted: false });
+    t.fire("pageshow", { persisted: true, trusted: false });
+    check("fake pagehide/pageshow events do nothing", badgeMsgs(t).length, n);
+    t.fire("pagehide", { persisted: false });
+    check("leaving the page clears the badge", badgeMsgs(t).slice(-1)[0], "badge:clear");
+    check("...but keeps what it was for", t.ctx.badgeVid, V1);
+    t.fire("pageshow", { persisted: false });
+    check("an ordinary pageshow doesn't set it again", badgeMsgs(t).length, n + 1);
+    t.fire("pagehide", { persisted: true });
+    t.fire("pageshow", { persisted: true });
+    check("restored from the back/forward cache: set again", badgeMsgs(t).slice(-1)[0], "badge:set");
+  }
+  {
+    // With nothing waiting, nothing is sent.
+    const { t } = await running();
+    const n = badgeMsgs(t).length;
+    t.ctx.showResult({ video_id: V1 });
+    t.fire("pagehide");
+    t.navigate(V2, { vid: V2, href: "/@other" });
+    check("no badge: showResult, pagehide and navigating send nothing", badgeMsgs(t).length, n);
+  }
+  {
+    // A second automatic result, for the video navigated to, takes over.
+    const { t, p } = await running({ stored: { autoRun: true, autoChannels: [LISTED, { key: "@other", name: "O" }] } });
+    p.deliver(result());
+    t.navigate(V2, { vid: V2, href: "/@other" });
+    await t.advance(3000);
+    const p2 = t.ports[t.ports.length - 1];
+    p2.deliver({ type: "probe", hit: false });
+    await t.advance(0);
+    p2.deliver(result(V2));
+    check("the next video's automatic result is the badge's now", t.ctx.badgeVid, V2);
+  }
+  {
+    // A new automatic result is the badge's, whatever was there before (state set
+    // directly: no real flow leaves an old one behind, as navigating clears it).
+    const { t, p } = await running();
+    t.ctx.badgeVid = V3;
+    p.deliver(result());
+    check("a new automatic result takes the badge", t.ctx.badgeVid, V1);
+    t.ctx.showResult({ video_id: V1 });
+    check("...and opening it clears it", badgeMsgs(t).slice(-1)[0], "badge:clear");
+  }
+  // Nothing else badges.
+  const noBadge = async (label, act, opts) => {
+    const { t, p } = await running(opts);
+    await act(t, p);
+    check(`no badge: ${label}`, badgeMsgs(t).includes("badge:set"), false);
+  };
+  await noBadge("an error", async (t, p) => p.deliver({ type: "error", error: "x" }));
+  await noBadge("needsTranscription", async (t, p) => p.deliver({ type: "needsTranscription", offer: {} }));
+  await noBadge("autoPaused", async (t, p) => p.deliver({ type: "autoPaused", limit: "hour" }));
+  await noBadge("a lost worker connection", async (t, p) => p.drop());
+  await noBadge("a transcription that times out", async (t, p) => {
+    p.deliver({ type: "transcribing", videoId: V1, estimateS: 300 });
+    await t.advance(2460000);
+  });
+  await noBadge("a run made manual by a click", async (t, p) => {
+    t.invoke(V1);
+    t.ctx.backgrounded = true;
+    p.deliver(result());
+  });
+  await noBadge("a result shown in an open panel", async (t, p) => {
+    t.ctx.backgrounded = false;          // no real flow gets here with run.auto true
+    p.deliver(result());
+  });
+  await noBadge("a drained run's result", async (t, p) => {
+    t.navigate(V2, { vid: V2, href: "/@other" });
+    p.deliver(result());
+  });
+  {
+    // Dropped before its summarize went out: nothing to announce, ever.
+    const t = setup();
+    let release;
+    t.ctx.collectPageTranscript = () => new Promise((r) => { release = r; });
+    t.ctx.initAutoRun();
+    await t.advance(3000);
+    const p = t.ports[0];
+    p.deliver({ type: "probe", hit: false });
+    await t.advance(0);
+    t.navigate(V2, { vid: V2, href: "/@other" });
+    release({ cues: [] });
+    await flush();
+    p.deliver(result());
+    check("no badge: a run dropped before its summarize", badgeMsgs(t).includes("badge:set"), false);
+  }
+  {
+    // A manual run that finishes behind a closed panel: its notice, no badge.
+    const t = setup({ stored: { autoRun: false, autoChannels: [] } });
+    await t.advance(0);
+    t.invoke(V1);
+    const p = t.ports[0];
+    t.ctx.backgrounded = true;
+    p.deliver({ type: "probe", hit: false });
+    await t.advance(0);
+    p.deliver(result());
+    check("no badge: a manual run", badgeMsgs(t).includes("badge:set"), false);
+  }
+  {
+    // Sends never throw: a reloaded extension throws outright; no reply rejects.
+    const { t, p } = await running();
+    t.reply = () => { throw new Error("Extension context invalidated."); };
+    let threw = false;
+    try { p.deliver(result()); } catch (_) { threw = true; }
+    check("a throwing sendMessage doesn't escape", threw, false);
+    t.reply = () => Promise.reject(new Error("The message port closed before a response was received."));
+    t.ctx.showResult({ video_id: V1 });
+    await flush();
+    check("...nor does a rejecting one (no unhandled rejection)", unhandled.length, 0);
+  }
+  check("the real showResult starts by telling the badge",
+    /function showResult\(p, cached\) \{\s*badgeShown\(p\);/.test(SRC), true);
 
   // ---------------------------------------------- keyboard: real keys only ----
   {

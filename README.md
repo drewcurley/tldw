@@ -431,7 +431,8 @@ later. From there you can also:
   `[12:34]` moments you can click to jump the player there.
 - **Automatic summaries** (off by default) — turn it on in Options, then pick
   channels from the panel ("⚡ Always summarize"), and their videos are summarized in the background when you
-  open them, with a notice when each is ready. Capped at 10 an hour; details in
+  open them, with a notice — and a ✓ on the toolbar button for that tab — when each
+  is ready. Capped at 10 an hour; details in
   [`extension/README.md`](extension/README.md#automatic-summaries-for-channels-you-choose).
 
 Powered by a small local server:
