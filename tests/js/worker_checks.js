@@ -343,6 +343,116 @@ const NOW = () => Date.now();
     check("without the helpers, sync unregisters", b.registered.length, 0);
   }
 
+  // ------------------------------------- usage: automatic, and read ----
+  const probeWith = (w, msg) => {
+    const port = { name: "tldw", posted: [], listeners: [],
+      onMessage: { addListener: (fn) => port.listeners.push(fn) },
+      onDisconnect: { addListener() {} },
+      postMessage: (m) => port.posted.push(m) };
+    w.ev.onConnect.fire(port);
+    port.listeners.forEach((fn) => fn({ type: "probeCache", url: WATCH, videoId: ID, ...msg }));
+    return port;
+  };
+  const PAGE = { id: "tldw-ext-id", tab: { id: 7 }, frameId: 0 };
+  const servedFetches = (w) => w.fetches.filter((f) => f.url.endsWith("/usage/served"));
+  {
+    const w = worker({ stored: { token: "tok" } });
+    w.summarize({ auto: true });
+    await flush();
+    check("an automatic summarize tells the server", w.fetches[0].body.trigger, "auto");
+    probeWith(w, { videoId: "BBBBBBBBBBB", url: "https://www.youtube.com/watch?v=BBBBBBBBBBB",
+                   auto: true });
+    await flush();
+    const probeBody = w.fetches.find((f) => f.url.endsWith("/summarize/cached")).body;
+    check("...and so does its probe", probeBody.trigger, "auto");
+  }
+  for (const [label, extra] of [["a click", {}], ['auto: "true"', { auto: "true" }],
+                                ["auto: 1", { auto: 1 }]]) {
+    const w = worker({ stored: { token: "tok" } });
+    w.summarize(extra);
+    probeWith(w, { videoId: "BBBBBBBBBBB", url: "https://www.youtube.com/watch?v=BBBBBBBBBBB",
+                   ...extra });
+    await flush();
+    check(`${label}: no trigger on the summarize or the probe`,
+      w.fetches.filter((f) => f.body && "trigger" in f.body).length, 0);
+  }
+  {
+    // The worker's own cache answers a click: the server never hears of it, so
+    // the worker says it was read -- after the answer, never holding it up.
+    let hang = false;
+    const w = worker({ stored: { token: "tok" },
+      fetchImpl: (url) => (hang && url.endsWith("/usage/served")
+        ? new Promise(() => {}) : resultResponse()) });
+    w.summarize({ auto: true });
+    await flush();
+    check("an automatic run's result reports no read", servedFetches(w).length, 0);
+    hang = true;
+    const p = w.summarize({});
+    check("a clicked worker-cache hit is answered at once",
+      types(p).includes("result") && servedFetches(w).length === 0, true);
+    await flush();
+    check("...then reports the read", JSON.stringify(servedFetches(w).map((f) => f.body)),
+      JSON.stringify([{ url: ID }]));
+    const q = probeWith(w, {});
+    check("a clicked worker-cache probe hit is answered at once",
+      types(q).includes("probe"), true);
+    await flush();
+    check("...and reports the read too", servedFetches(w).length, 2);
+    w.summarize({ auto: true });
+    probeWith(w, { auto: true });
+    await flush();
+    check("automatic worker-cache hits report nothing", servedFetches(w).length, 2);
+  }
+  {
+    // No token set: nothing to report with, so nothing is sent.
+    const w = worker({ stored: { token: "" } });
+    w.message({ type: "usage:served", video_id: ID }, PAGE);
+    await flush();
+    check("no token: usage:served sends nothing", servedFetches(w).length, 0);
+  }
+  {
+    // A cache entry under an id that isn't one never reaches the server.
+    const w = worker({ stored: { token: "tok" } });
+    w.summarize({ videoId: "not-an-id" });
+    await flush();
+    w.summarize({ videoId: "not-an-id" });
+    await flush();
+    check("a bad id in the worker's cache reports nothing", servedFetches(w).length, 0);
+  }
+  {
+    // The page saw an automatic summary opened.
+    const w = worker({ stored: { token: "tok" } });
+    const r = w.message({ type: "usage:served", video_id: ID }, PAGE);
+    check("usage:served returns undefined (no reply)", r.returned, undefined);
+    await flush();
+    check("...and records the read", JSON.stringify(servedFetches(w).map((f) => f.body)),
+      JSON.stringify([{ url: ID }]));
+    check("...with no model sent", "model" in servedFetches(w)[0].body, false);
+  }
+  for (const [label, msg, sender] of [
+    ["another extension", { video_id: ID }, { id: "other-ext", tab: { id: 7 }, frameId: 0 }],
+    ["a sub-frame", { video_id: ID }, { id: "tldw-ext-id", tab: { id: 7 }, frameId: 2 }],
+    ["no tab", { video_id: ID }, { id: "tldw-ext-id", frameId: 0 }],
+    ["a bad id", { video_id: "x/../y" }, PAGE],
+    ["no id", {}, PAGE],
+  ]) {
+    const w = worker({ stored: { token: "tok" } });
+    w.message({ type: "usage:served", ...msg }, sender);
+    await flush();
+    check(`usage:served ignored from ${label}`, servedFetches(w).length, 0);
+  }
+  {
+    // An older server answers 404; a dead one fails to fetch. Neither escapes.
+    for (const fail of [() => ({ ok: false, status: 404, json: async () => ({}) }),
+                        () => { throw new TypeError("Failed to fetch"); }]) {
+      const w = worker({ stored: { token: "tok" }, fetchImpl: fail });
+      let threw = false;
+      try { w.message({ type: "usage:served", video_id: ID }, PAGE); } catch (_) { threw = true; }
+      await flush();
+      check("a failed read report doesn't escape", threw, false);
+    }
+  }
+
   // ------------------------------------------------------------- budget ----
   {
     const w = worker({ stored: { token: "tok" } });

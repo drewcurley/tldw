@@ -110,8 +110,10 @@ const PROBE_TIMEOUT_MS = 5000;
 // skip the page's transcript against a server that would then go to YouTube.
 async function handleProbe(port, msg) {
   const { url, videoId } = msg;
+  const auto = msg.auto === true;
   if (videoId && cache.has(videoId)) {
     safePost(port, { type: "probe", hit: true, payload: cache.get(videoId) });
+    if (!auto) noteServed(videoId);     // never reaches the server's own record
     return;
   }
   const { serverUrl, token, model, segmentRatio } = await getSettings();
@@ -127,7 +129,8 @@ async function handleProbe(port, msg) {
     const resp = await fetch(serverUrl.replace(/\/+$/, "") + "/summarize/cached", {
       method: "POST", signal: ctrl.signal,
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-      body: JSON.stringify({ url, model, segment_ratio: segmentRatio }),
+      body: JSON.stringify({ url, model, segment_ratio: segmentRatio,
+                             ...(auto ? { trigger: "auto" } : {}) }),
     });
     if (resp.ok) {
       const ev = await resp.json();
@@ -147,8 +150,10 @@ async function handleProbe(port, msg) {
 
 async function handleSummarize(port, msg) {
   const { url, videoId, refresh, page, transcribe } = msg;
+  const auto = msg.auto === true;
   if (videoId && cache.has(videoId) && !refresh) {
     safePost(port, { type: "result", payload: cache.get(videoId), cached: true });
+    if (!auto) noteServed(videoId);
     return;
   }
   const { serverUrl, token, model, segmentRatio, whisper } = await getSettings();
@@ -182,7 +187,8 @@ async function handleSummarize(port, msg) {
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
       body: JSON.stringify({ url, model, segment_ratio: segmentRatio,
                              refresh: !!refresh, page, whisper,
-                             transcribe: transcribe === true }),
+                             transcribe: transcribe === true,
+                             ...(auto ? { trigger: "auto" } : {}) }),
     });
     if (!resp.ok) {
       let detail = "";
@@ -772,6 +778,14 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       () => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
     return true;
   }
+  if (msg.type === "usage:served") {
+    // The panel showed an automatic summary: it was read. Top frame of a tab only,
+    // and the id from the message, checked -- not the tab's URL, which moves during
+    // in-page navigation.
+    if (!sender.tab || sender.frameId !== 0) return undefined;
+    noteServed(msg.video_id);
+    return undefined;
+  }
   if (msg.type === "badge:set" || msg.type === "badge:clear") {
     // Only a content script in a tab's top frame, and only for its own tab: the
     // tab comes from the sender, never from the message. (Checked here, not in the
@@ -783,6 +797,28 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   return undefined;
 });
+
+// --- "someone read this summary" -----------------------------------------------
+//
+// One usage row on the server, so an automatic summary counts towards "videos
+// TL;DW'd" only once it's been opened. Fire and forget: never awaited by anything
+// that answers the page, and an older server's 404 or a failure is just dropped.
+const SERVED_ID = /^[A-Za-z0-9_-]{11}$/;
+
+function noteServed(videoId) {
+  if (typeof videoId !== "string" || !SERVED_ID.test(videoId)) return;
+  try {
+    Promise.resolve().then(async () => {
+      const { serverUrl, token } = await getSettings();
+      if (!token) return;
+      await fetch(serverUrl.replace(/\/+$/, "") + "/usage/served", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+        body: JSON.stringify({ url: videoId }),
+      });
+    }).catch(() => {});
+  } catch (_) {}
+}
 
 // --- the toolbar badge: "an automatic summary is waiting in this tab" -----------
 //

@@ -103,7 +103,8 @@ the message gets through, it stays until the tab closes.)
   it counts from is `autoRunLog` in the extension's storage (service worker
   DevTools → Application → Storage).
 - Each one uses your Claude plan like a click does — a summary, plus the key-moment
-  selection the server prepares after every summary.
+  selection the server prepares after every summary. It counts toward "videos TL;DW'd"
+  only once you open it.
 - Reading the transcript briefly opens and closes YouTube's transcript panel, as a
   click does.
 - It applies to YouTube tabs opened or reloaded after you turn it on. Remove

@@ -28,6 +28,7 @@
   let pausedShown = false;      // the budget notice, once per page
   let lastCached = false;       // whether lastPayload came from a cache
   let badgeVid = null;          // the video whose automatic summary the badge announces
+  const autoResults = new Set(); // videos with an automatic summary not yet opened here
 
   let host = null;
   let root = null;
@@ -718,7 +719,7 @@
                     page, transcribe: !!transcribe };
       // run.auto, not auto: a toolbar click before this point made the run the
       // user's, and the user's runs are never counted against the budget.
-      if (run.auto) msg.auto = true;
+      if (run.auto) { msg.auto = true; run.sentAuto = true; }
       myPort.postMessage(msg);
     });
     const finished = () => {
@@ -798,6 +799,9 @@
       const automatic = autoWording();
       finished();
       if (m.type === "result") {
+        // Went out as automatic (logged so by the server), whatever it is now -- a
+        // click after the send makes it the user's, and showing it is the read.
+        if (run.sentAuto) autoResults.add(videoId);
         if (backgrounded) {
           lastPayload = m.payload;
           lastCached = !!m.cached;
@@ -833,7 +837,11 @@
     // refresh or an accepted transcription wants new work, so those go straight
     // to the page as before.
     if (refresh || transcribe) summarizeFromPage();
-    else myPort.postMessage({ type: "probeCache", url, videoId });
+    else {
+      myPort.postMessage({ type: "probeCache", url, videoId,
+                           ...(run.auto ? { auto: true } : {}) });
+      if (run.auto) run.sentAuto = true;
+    }
     // Heartbeat: the page never suspends, so pinging every 20s keeps the MV3 service
     // worker alive through a long (60s+) summarize that would otherwise be killed.
     pingTimer = setInterval(() => {
@@ -1004,8 +1012,19 @@
   // The toolbar badge, for the automatic summary waiting in this tab. Sends never
   // throw: after an extension reload sendMessage throws outright, and with no reply
   // its promise rejects.
-  function sendBadge(type) {
-    try { Promise.resolve(api.runtime.sendMessage({ type })).catch(() => {}); } catch (_) {}
+  function sendRuntime(msg) {
+    try { Promise.resolve(api.runtime.sendMessage(msg)).catch(() => {}); } catch (_) {}
+  }
+
+  function sendBadge(type) { sendRuntime({ type }); }
+
+  // A summary is on screen: if it's one an automatic run produced, it's been read,
+  // and only now does it count towards "videos TL;DW'd". Once per video per page.
+  function servedShown(p) {
+    if (p && autoResults.has(p.video_id)) {
+      autoResults.delete(p.video_id);
+      sendRuntime({ type: "usage:served", video_id: p.video_id });
+    }
   }
 
   // A summary is on screen: if it's the one the badge was announcing, it's read.
@@ -1218,6 +1237,7 @@
 
   function showResult(p, cached) {
     badgeShown(p);
+    servedShown(p);
     if (!host) mount();
     clearTimers();
     lastPayload = p;

@@ -96,9 +96,9 @@ def _node(script, *args):
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("script,args,floor", [
     ("channels_checks.js", [CHANNELS_JS], 81),
-    ("worker_checks.js", [BACKGROUND_JS, CHANNELS_JS], 139),
+    ("worker_checks.js", [BACKGROUND_JS, CHANNELS_JS], 162),
     ("options_checks.js", [OPTIONS_JS, CHANNELS_JS], 64),
-    ("auto_run_checks.js", [CONTENT_JS, CHANNELS_JS], 227),
+    ("auto_run_checks.js", [CONTENT_JS, CHANNELS_JS], 240),
 ])
 def test_automatic_summaries(script, args, floor):
     proc = _node(script, *args)

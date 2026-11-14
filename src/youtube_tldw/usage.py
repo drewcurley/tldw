@@ -189,7 +189,29 @@ def _append(row: dict) -> None:
         config.restrict_to_owner(USAGE_FILE)
 
 
-def note_video(video_id: str, video_ms: int, summary_words: int, wpm: int = 200) -> None:
+# Rows that record something other than a model call -- no tokens, no cost. The
+# one list `tldw usage` filters with, so a new kind can't slip in as a $0 "call".
+NOT_MODEL_CALLS = frozenset({"video", "segments_served", "summary_served"})
+
+
+def note_summary_served(video_id: str, how: str) -> None:
+    """Someone opened a summary: "viewed" (the panel showed an automatic run's
+    result, or the extension answered from its own cache), "cache" or "probe" (the
+    server handed a cached summary to a request that wasn't automatic).
+
+    An automatic summary only counts towards stats() once one of these exists for
+    its video -- otherwise every video a listed channel published would.
+    """
+    try:
+        _append({"ts": time.time(), "kind": "summary_served",
+                 "video_id": video_id, "how": how})
+        print(f"  served {video_id} ({how})", flush=True)
+    except Exception as exc:                      # never break the real request
+        print(f"  (usage accounting failed: {exc!r})", flush=True)
+
+
+def note_video(video_id: str, video_ms: int, summary_words: int, wpm: int = 200,
+               trigger: str = "") -> None:
     """Record that a video was reduced to a readable summary.
 
     Its own row rather than a field on a model call: the interesting quantity is
@@ -198,9 +220,12 @@ def note_video(video_id: str, video_ms: int, summary_words: int, wpm: int = 200)
     """
     try:
         read_ms = int(summary_words / max(1, wpm) * 60_000)
-        _append({"ts": time.time(), "kind": "video", "step": "video",
-                 "video_id": video_id, "video_ms": int(video_ms),
-                 "read_ms": read_ms, "words": int(summary_words)})
+        row = {"ts": time.time(), "kind": "video", "step": "video",
+               "video_id": video_id, "video_ms": int(video_ms),
+               "read_ms": read_ms, "words": int(summary_words)}
+        if trigger:                       # a click's row stays exactly as it was
+            row["trigger"] = trigger
+        _append(row)
     except Exception as exc:
         print(f"  (usage accounting failed: {exc!r})", flush=True)
 
@@ -209,12 +234,29 @@ def stats(path=None) -> dict:
     """How many videos, and how much watching they replaced.
 
     Keyed by video id so re-summarizing the same video doesn't count twice; the
-    most recent run for a video wins.
+    most recent run for a video supplies its numbers.
+
+    A video counts if any run of it was asked for (an untagged row -- every row
+    before automatic summaries existed is one), or if any summary of it was ever
+    opened. An automatic summary nobody opened replaced no watching. One pass and
+    no timestamps: a clock change can't flip it, and a later automatic run can't
+    un-count a video someone read.
     """
     latest: dict = {}
+    wanted: set = set()
+    served: set = set()
     for row in read_rows(path):
-        if row.get("kind") == "video" and row.get("video_id"):
-            latest[row["video_id"]] = row
+        vid = row.get("video_id")
+        if not vid:
+            continue
+        kind = row.get("kind")
+        if kind == "video":
+            latest[vid] = row
+            if row.get("trigger") != "auto":
+                wanted.add(vid)
+        elif kind == "summary_served":
+            served.add(vid)
+    latest = {vid: row for vid, row in latest.items() if vid in wanted or vid in served}
     watch_ms = sum(int(r.get("video_ms") or 0) for r in latest.values())
     read_ms = sum(int(r.get("read_ms") or 0) for r in latest.values())
     return {"videos": len(latest),
