@@ -81,6 +81,39 @@ small notice you can click to read it, and re-opening mid-run re-attaches to the
 already in flight rather than starting it over. Options has an **"If you close the
 panel while it's still working"** setting if you'd rather it stopped and discarded.
 
+### Automatic summaries for channels you choose
+
+Off by default. **Options → Automatic summaries → "Summarize videos from chosen
+channels automatically"** turns it on; Chrome then asks to let TL;DW read
+youtube.com pages (the extension can't see YouTube until you allow it, and unticking
+the box gives that access back). After that, every summary's panel offers
+**⚡ Always summarize {channel}**. When you open a video from a channel on your list,
+TL;DW summarizes it in the background with the panel closed and shows a notice when
+it's ready — click it, or the toolbar button, to read it.
+
+- It only runs for the tab you're looking at, after about 3 seconds on the video,
+  never on top of a summary already running, and at most once per video per page.
+  Already-summarized videos come from the cache for free.
+- The worker caps automatic runs at **10 an hour and 40 a day** (your clicks are
+  never counted). Past that you get one notice and can still click TL;DW. The log
+  it counts from is `autoRunLog` in the extension's storage (service worker
+  DevTools → Application → Storage).
+- Each one uses your Claude plan like a click does — a summary, plus the key-moment
+  selection the server prepares after every summary.
+- Reading the transcript briefly opens and closes YouTube's transcript panel, as a
+  click does.
+- It applies to YouTube tabs opened or reloaded after you turn it on. Remove
+  channels on the options page. Why a run did or didn't happen is logged in the
+  page's console as `[TL;DW auto] …`.
+- **Firefox:** after pulling, re-run `./build-firefox.sh` (`dist-firefox/` isn't
+  tracked). If your Firefox can't grant the permission, the section says it isn't
+  supported.
+- **Rolling back:** untick the box *first*, while the new version is still loaded —
+  that gives back the access and unregisters the background script — then revert
+  and reload the extension and your YouTube tabs. The stored list is left alone; an
+  older version ignores it. If you skipped the untick, check `chrome://extensions` →
+  TL;DW → Details → Site access, and remove youtube.com if it's listed.
+
 ## Any model, not just Claude
 
 The server shells out to whatever model command it's configured with, so the

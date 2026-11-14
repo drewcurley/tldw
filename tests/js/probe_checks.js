@@ -61,6 +61,8 @@ function panel() {
     port: null, requestActive: false, currentVideoId: null, backgrounded: false,
     lastProgress: null, partialState: null, txLive: null, pendingOffer: null,
     lastPayload: null, safetyTimer: null, pingTimer: null,
+    drains: new Map(), currentRun: null, autoRunVid: null, lastCached: false,
+    progressPct: 0, showPausedNotice() {}, logAuto() {}, stopTranscribe() {},
   };
   vm.createContext(ctx);
   vm.runInContext(PANEL_SRC, ctx);

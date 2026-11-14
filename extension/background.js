@@ -1,3 +1,14 @@
+// The shared helpers for automatic summaries. Chrome's service worker loads them
+// here; Firefox's event page has no importScripts and lists channels.js before this
+// file instead. Guarded twice: a missing or broken channels.js must never take the
+// worker down -- manual summaries don't need it, and every auto feature checks for
+// it and fails closed.
+if (typeof importScripts === "function") {
+  try { importScripts("channels.js"); } catch (e) {
+    console.warn("[TL;DW auto] channels.js failed to load:", e);
+  }
+}
+
 // Service worker. The content script opens a long-lived Port and the work happens
 // while that port is connected — this keeps the worker alive through the ~20-60s
 // summarize (a plain awaited fetch in the click handler would be suspended ~30s in
@@ -58,7 +69,15 @@ function send(tabId, msg) {
 api.action.onClicked.addListener(async (tab) => {
   if (!tab.id) return;
   const videoId = tab.url && videoIdFromUrl(tab.url);
-  await api.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+  try {
+    await api.scripting.executeScript({ target: { tabId: tab.id },
+                                       files: ["channels.js", "content.js"] });
+  } catch (e) {
+    // Never let the automatic-summary helpers take the click down with them:
+    // content.js alone works, with those features off.
+    console.warn("[TL;DW auto] injecting channels.js failed; continuing without it:", e);
+    await api.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+  }
   if (!videoId) {
     send(tab.id, { type: "TLDW_ERROR",
       error: "Open a YouTube video (a /watch page) first, then click TL;DW." });
@@ -137,6 +156,18 @@ async function handleSummarize(port, msg) {
     safePost(port, { type: "error",
       error: "No server token set. Open the extension's Options and paste the token from `tldw serve`." });
     return;
+  }
+  // An automatic run spends the owner's plan without a click, so it is counted
+  // here, where the page can't reach -- after the free answers above (the worker's
+  // own cache, a missing token) and immediately before the request. Only exactly
+  // `true` counts as automatic; anything else is a click.
+  if (msg.auto === true) {
+    const verdict = await takeAutoBudget(Date.now());
+    if (!verdict.ok) {
+      console.info("[TL;DW auto] paused:", verdict.limit, "limit reached");
+      safePost(port, { type: "autoPaused", limit: verdict.limit });
+      return;
+    }
   }
   const ctrl = new AbortController();
   // Accepting the offer means agreeing to wait minutes, so this request gets the
@@ -579,3 +610,167 @@ function httpError(status, detail) {
   if (status === 504) return "Summarizing timed out on the server. Try again, or use the CLI for long videos.";
   return detail || ("Server error (" + status + ").");
 }
+
+
+// --- automatic summaries ----------------------------------------------------------
+//
+// Everything below is a no-op until the owner ticks the option, which also grants
+// the optional youtube.com permission. With either missing, nothing is registered.
+
+const AUTO_SCRIPT_ID = "tldw-auto";
+const channelsLib = () => {
+  const ch = globalThis.TLDW_CHANNELS;
+  return ch && typeof ch.channelKey === "function" ? ch : null;
+};
+
+// One sync at a time: turning the option on fires permissions.onAdded and
+// storage.onChanged together, and two unserialized syncs would both register.
+let syncChain = Promise.resolve();
+
+function syncAutoScript() {
+  syncChain = syncChain.then(doSync, doSync).catch((e) => {
+    console.warn("[TL;DW auto] sync failed:", e);
+  });
+  return syncChain;
+}
+
+async function registeredAuto() {
+  const list = await api.scripting.getRegisteredContentScripts({ ids: [AUTO_SCRIPT_ID] });
+  return Array.isArray(list) && list.some((s) => s.id === AUTO_SCRIPT_ID);
+}
+
+async function unregisterAuto() {
+  try {
+    await api.scripting.unregisterContentScripts({ ids: [AUTO_SCRIPT_ID] });
+    console.info("[TL;DW auto] unregister");
+  } catch (e) {
+    if (!/nonexistent|does not exist|no.*script/i.test(String(e && e.message || e))) throw e;
+  }
+}
+
+// Registered exactly when the option is on, the permission is held, and the
+// shared helpers loaded. Both conditions are read fresh on every run.
+async function doSync() {
+  if (!api.scripting || !api.scripting.registerContentScripts) return;
+  const ch = channelsLib();
+  const { autoRun } = await api.storage.local.get({ autoRun: false });
+  const granted = !!ch && await api.permissions.contains({ origins: [ch.ORIGIN] });
+  const want = autoRun === true && granted;
+  const have = await registeredAuto();
+  if (want === have) return;
+  if (!want) { await unregisterAuto(); return; }
+  try {
+    await api.scripting.registerContentScripts([{
+      id: AUTO_SCRIPT_ID, matches: [ch.ORIGIN], js: ["channels.js", "content.js"],
+      runAt: "document_idle", allFrames: false, persistAcrossSessions: true,
+    }]);
+    console.info("[TL;DW auto] register");
+  } catch (e) {
+    if (/duplicate/i.test(String(e && e.message || e))) return;
+    // Anything else: say so and leave nothing registered.
+    console.warn("[TL;DW auto] register failed:", e);
+    try { await unregisterAuto(); } catch (_) {}
+  }
+}
+
+// After an install or update, re-register so the script names this build's files.
+api.runtime.onInstalled.addListener(() => {
+  syncChain = syncChain.then(unregisterAuto, unregisterAuto).catch(() => {});
+  syncAutoScript();
+});
+api.runtime.onStartup.addListener(() => { syncAutoScript(); });
+api.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.autoRun) syncAutoScript();
+});
+api.permissions.onAdded.addListener(() => { syncAutoScript(); });
+api.permissions.onRemoved.addListener(() => { syncAutoScript(); });
+
+// The budget: start times of automatic runs, kept in storage.local so "40 a day"
+// survives a browser restart. One check-and-record at a time, so two tabs that
+// finish their dwell together can't both read 9. A storage failure pauses rather
+// than lets runs through.
+let budgetChain = Promise.resolve();
+
+function takeAutoBudget(now) {
+  const step = budgetChain.then(async () => {
+    const ch = channelsLib();
+    if (!ch) return { ok: false, limit: "hour" };
+    const { autoRunLog } = await api.storage.local.get({ autoRunLog: [] });
+    const log = ch.sanitizeRunLog(autoRunLog, now);
+    const verdict = ch.budgetDecision(log, now);
+    if (verdict.ok) {
+      log.push(now);
+      await api.storage.local.set({ autoRunLog: ch.sanitizeRunLog(log, now) });
+    }
+    return verdict;
+  }).catch((e) => {
+    console.warn("[TL;DW auto] budget unavailable, pausing:", e);
+    return { ok: false, limit: "hour" };
+  });
+  budgetChain = step;
+  return step;
+}
+
+// The channel list has one writer: this worker. The panel and the options page
+// send intents; each runs alone, on what is in storage at that moment.
+let channelChain = Promise.resolve();
+
+function changeChannels(fn) {
+  const step = channelChain.then(async () => {
+    const ch = channelsLib();
+    if (!ch) return { ok: false };
+    const { autoChannels } = await api.storage.local.get({ autoChannels: [] });
+    return fn(ch, ch.sanitizeChannels(autoChannels));
+  }).catch((e) => {
+    console.warn("[TL;DW auto] channel list change failed:", e);
+    return { ok: false };
+  });
+  channelChain = step;
+  return step;
+}
+
+// Writes back the *sanitized* list: an entry today's rules reject (a key form from
+// a newer version, after a downgrade) is dropped on the next add or remove. Unknown
+// fields on accepted entries are kept.
+function addChannel(msg) {
+  return changeChannels(async (ch, list) => {
+    if (!ch.isValidKey(msg.key) || typeof msg.name !== "string") return { ok: false };
+    if (list.some((c) => c.key === msg.key)) return { ok: true, result: "exists" };
+    if (list.length >= ch.MAX_CHANNELS) return { ok: true, result: "full" };
+    const entry = { key: msg.key, name: String(msg.name).trim().slice(0, ch.MAX_NAME),
+                    addedAt: Date.now() };
+    if (!entry.name) return { ok: false };
+    if (typeof msg.href === "string" && msg.href.length <= 300) entry.href = msg.href;
+    await api.storage.local.set({ autoChannels: [...list, entry] });
+    return { ok: true, result: "ok" };
+  });
+}
+
+function removeChannel(msg) {
+  return changeChannels(async (_ch, list) => {
+    const next = list.filter((c) => c.key !== msg.key);
+    if (next.length !== list.length) await api.storage.local.set({ autoChannels: next });
+    return { ok: true, result: "removed" };
+  });
+}
+
+// Not async: a listener that returns a Promise closes the channel early on older
+// Chrome. sendResponse + `return true` for the three messages handled here, and
+// nothing at all for anything else -- or from anyone else.
+api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!sender || sender.id !== api.runtime.id || !msg) return undefined;
+  if (msg.type === "channels:add") {
+    addChannel(msg).then(sendResponse);
+    return true;
+  }
+  if (msg.type === "channels:remove") {
+    removeChannel(msg).then(sendResponse);
+    return true;
+  }
+  if (msg.type === "openOptions") {
+    Promise.resolve(api.runtime.openOptionsPage()).then(
+      () => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
+    return true;
+  }
+  return undefined;
+});

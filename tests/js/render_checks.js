@@ -284,7 +284,9 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
   const port = stripComments(src.slice(src.indexOf("  function startSummarize("),
                                        src.indexOf("  function endBackground(")));
   check("meta/partial are routed before the request is marked finished",
-    port.indexOf('m.type === "partial"') < port.indexOf("requestActive = false"), true);
+    port.indexOf('m.type === "partial"') <
+      port.indexOf("requestActive = false;\n      partialState = null;\n      txLive = null;"),
+    true);
   check("re-opening mid-run redraws what's been written, not a spinner",
     /partialState && partialState\.meta\) \{\s*showPartial\(\)/.test(stripComments(src)), true);
 }
@@ -386,7 +388,7 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
     /m\.type === "transcribing"[\s\S]{0,600}safetyTimer = setTimeout/.test(panel),
     true);
   check("an offer while the panel is closed does not reopen it",
-    /if \(backgrounded\) \{[\s\S]{0,200}endBackground\([\s\S]{0,80}return;/.test(panel),
+    /if \(backgrounded\) \{[\s\S]{0,200}endBackground\([\s\S]{0,160}"offer"\);\s*return;/.test(panel),
     true);
   check("...it is kept and shown when they come back",
     /pendingOffer = \{ offer: m\.offer, url, videoId \}/.test(panel), true);
@@ -401,7 +403,7 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
   check("the stop button is labelled like every other control here",
     /stoptx[\s\S]{0,200}setAttribute\("aria-label"/.test(panel), true);
   check("stopping travels over the live port, not a fresh message",
-    /port\.postMessage\(\{ type: "stopTranscribe", url \}\)/.test(panel), true);
+    /const p = via \|\| port;[\s\S]{0,80}p\.postMessage\(\{ type: "stopTranscribe", url \}\)/.test(panel), true);
   check("the panel's own safety timer does not fire mid-transcription",
     /transcribe \? 24\d{5} : 160000/.test(panel), true);
 
@@ -538,7 +540,7 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
 
   const panel = stripComments(src);
   check("refresh and an accepted transcription skip the probe",
-    /if \(refresh \|\| transcribe\) summarizeFromPage\(\);\s*else port\.postMessage\(\{ type: "probeCache"/.test(panel),
+    /if \(refresh \|\| transcribe\) summarizeFromPage\(\);\s*else myPort\.postMessage\(\{ type: "probeCache"/.test(panel),
     true);
   check("a miss falls back to reading the page",
     /if \(!hit\) \{ summarizeFromPage\(\); return; \}/.test(panel), true);
