@@ -254,6 +254,10 @@ tldw usage
 `--by-video` breaks it down per video, `--days N` limits the window, and the report
 splits cost by model.
 
+Automatic summaries are included in the cost and token figures — they're real
+spending — but a video only counts toward "videos TL;DW'd" and hours saved once you
+open its summary.
+
 tldw runs the `claude` CLI stripped of everything a coding agent carries by default
 — no tools, no MCP servers from your plugins, no settings files or `CLAUDE.md`, and
 its own short system prompt. That default context was ~89% of every request's input

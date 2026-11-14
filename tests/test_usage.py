@@ -241,3 +241,91 @@ def test_served_rows_are_not_counted_as_model_calls(monkeypatch, tmp_path, capsy
     assert "3 model call(s)" in out
     assert "1 prefetch call(s) ($0.07), 1 on request, 2 selection(s) played" in out
     assert "1 recorded before tracking began" in out
+
+
+# --- automatic summaries count only once someone opens them (issue #20) ----------
+
+def _video(vid, ts, trigger=None, video_ms=600_000, read_ms=60_000):
+    row = {"ts": ts, "kind": "video", "step": "video", "video_id": vid,
+           "video_ms": video_ms, "read_ms": read_ms, "words": 200}
+    if trigger:
+        row["trigger"] = trigger
+    return row
+
+
+def _served(vid, ts, how="viewed"):
+    return {"ts": ts, "kind": "summary_served", "video_id": vid, "how": how}
+
+
+def _stats(tmp_path, rows):
+    log = tmp_path / "s.jsonl"
+    log.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return usage.stats(log)
+
+
+def test_an_automatic_summary_nobody_opened_does_not_count(tmp_path):
+    assert _stats(tmp_path, [_video("a", 1, "auto")])["videos"] == 0
+
+
+@pytest.mark.parametrize("served_ts", [0, 2])
+def test_an_opened_automatic_summary_counts_whenever_it_was_opened(tmp_path, served_ts):
+    """No timestamp comparison: a clock change can't flip it, and having read an
+    earlier summary of the video is just as much proof."""
+    st = _stats(tmp_path, [_video("a", 1, "auto"), _served("a", served_ts)])
+    assert st["videos"] == 1 and st["watch_ms"] == 600_000
+
+
+def test_a_later_automatic_run_never_uncounts_a_video_someone_asked_for(tmp_path):
+    st = _stats(tmp_path, [_video("a", 1), _video("a", 2, "auto", video_ms=900_000)])
+    assert st["videos"] == 1
+    assert st["watch_ms"] == 900_000          # the latest run's numbers
+
+
+def test_untagged_rows_from_before_this_change_still_count(tmp_path):
+    assert _stats(tmp_path, [_video("a", 1), _video("b", 2)])["videos"] == 2
+
+
+def test_a_served_row_alone_is_not_a_video(tmp_path):
+    assert _stats(tmp_path, [_served("x", 1)])["videos"] == 0
+
+
+def test_an_opened_automatic_summary_is_counted_once(tmp_path):
+    st = _stats(tmp_path, [_video("a", 1, "auto"), _served("a", 2), _served("a", 3),
+                           _video("a", 4, "auto")])
+    assert st["videos"] == 1
+
+
+def test_only_an_automatic_rows_tag_is_written(tmp_path):
+    usage.note_video("a", 600_000, 100)
+    usage.note_video("b", 600_000, 100, trigger="auto")
+    rows = usage.read_rows()
+    assert "trigger" not in rows[0]
+    assert rows[1]["trigger"] == "auto"
+
+
+def test_note_summary_served_writes_its_row():
+    usage.note_summary_served("abcdefghijk", "viewed")
+    (row,) = usage.read_rows()
+    assert (row["kind"], row["video_id"], row["how"]) == ("summary_served", "abcdefghijk",
+                                                           "viewed")
+
+
+def test_served_rows_are_not_model_calls_in_tldw_usage(tmp_path, capsys):
+    log = tmp_path / "u.jsonl"
+    rows = [{"ts": 1, "kind": "summarize", "step": "summarize", "cost_usd": 0.10,
+             "video_id": "a", "model": "opus"},
+            _video("a", 2, "auto"), _served("a", 3), _served("b", 4)]
+    log.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    assert cli._run_usage(["--file", str(log)]) == 0
+    out = capsys.readouterr().out
+    assert "1 model call(s)" in out
+    assert "summary_served" not in out and "\n  ?" not in out
+    assert "1 video(s) TL;DW'd" in out
+    assert usage.NOT_MODEL_CALLS == frozenset({"video", "segments_served", "summary_served"})
+
+
+def test_tldw_usage_filters_with_the_one_shared_list():
+    import inspect
+    src = inspect.getsource(cli._run_usage)
+    assert "usage_mod.NOT_MODEL_CALLS" in src
+    assert '"segments_served")' not in src          # no local copy of the list

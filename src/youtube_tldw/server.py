@@ -856,6 +856,12 @@ def _page_transcript(body, url: str):
     return meta, cues
 
 
+def _trigger(body) -> str:
+    """Who started this request: "auto" for an automatic summary, "" for a click.
+    An exact match from an allowlist, so nothing free-form reaches the usage log."""
+    return "auto" if isinstance(body, dict) and body.get("trigger") == "auto" else ""
+
+
 def _page_version_ok(page: dict) -> bool:
     """Is this page object from an extension with the sync check? An int (not a
     bool, which Python counts as one) of at least 2."""
@@ -1039,6 +1045,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/summarize/cached":
             self._guarded(self._run_cached, slots=None)      # one disk read
+            return
+        if path == "/usage/served":
+            self._guarded(self._run_served, slots=None)      # appends one line
             return
         if path == "/ask/stream":
             self._guarded(self._run_ask, slots=_claude_slots, max_bytes=MAX_ASK_BYTES)
@@ -1244,6 +1253,7 @@ class _Handler(BaseHTTPRequestHandler):
         # transcript: the point is to compare summaries, and re-fetching the video
         # would risk a rate limit for nothing.
         refresh = isinstance(body, dict) and body.get("refresh") is True
+        trigger = _trigger(body)  # "auto" for an automatic run; "" for a click
         tx_source = None          # set when this request transcribed the audio
         policy = _whisper_policy(body)
         if policy is None:
@@ -1255,6 +1265,9 @@ class _Handler(BaseHTTPRequestHandler):
                                                    _effective_source(vid)))
             if hit:
                 tlog(f"cached summary for {vid} (no model call)")
+                # Before stats() below, so the count this result carries includes it.
+                if not trigger:
+                    usage.note_summary_served(vid, "cache")
                 emit({"type": "meta", "video_id": hit.get("video_id", vid),
                       "title": hit.get("title", ""), "channel": hit.get("channel", ""),
                       "source_url": hit.get("source_url", md.watch_url(vid)),
@@ -1294,13 +1307,14 @@ class _Handler(BaseHTTPRequestHandler):
                 emit({"type": "partial", "kind": ev["kind"], "text": ev["text"]})
 
         def _summarize(prefetched):
-            with usage.interaction("summarize", _vid_of(url)):
+            with usage.interaction("summarize", _vid_of(url), trigger=trigger):
                 result = core.summarize_url(
                     url, ratio, lang, timeout=REQUEST_TIMEOUT,
                     max_chars=SINGLE_PASS_CHARS, on_progress=progress,
                     on_partial=partial, _prefetched=prefetched)
                 usage.note_video(result.meta.video_id, result.meta.duration_ms,
-                                 textmode.summary_word_count(result.result))
+                                 textmode.summary_word_count(result.result),
+                                 trigger=trigger)
                 return result
 
         try:
@@ -1341,7 +1355,8 @@ class _Handler(BaseHTTPRequestHandler):
             emit({"type": "error", "status": 500, "error": "internal error"})
             print(f"  unexpected error: {exc!r}", flush=True)
             return
-        print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s", flush=True)
+        print(f"  summarized '{summary.meta.title}' in {time.monotonic()-start:.1f}s"
+              + (" [auto]" if trigger else ""), flush=True)
         source = tx_source or (_cache_source(summary.meta.video_id)
                                if summary.cues else txcache.CAPTIONS)
         if summary.cues:
@@ -1395,12 +1410,34 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"type": "miss"})
             return
         # What today's cached-summary path does: have key moments ready.
+        # Someone asked for it (not an automatic run): it's being read. Before
+        # stats(), so the count this answer carries includes it.
+        if not _trigger(body):
+            usage.note_summary_served(vid, "probe")
         tx = _cache_get(vid, touch=True)
         if tx:
             _start_seg_prefetch(tx[0], tx[1], claude_client.current_model(),
                                 _segment_ratio(body), _cache_source(vid))
         self._send_json(200, {"type": "result", **hit, "cached": True,
                               "stats": usage.stats()})
+
+    def _run_served(self, body) -> None:
+        """The extension showed someone a summary it already had: one usage row.
+
+        Written for an automatic summary opened in the panel, or one the extension
+        answered from its own cache -- requests that never reach the server's own
+        cache-hit paths, which record theirs themselves. Appends a line; nothing
+        else, so no slot."""
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "expected a JSON object"})
+            return
+        try:
+            vid = canonical_video_id(str(body.get("url") or ""))
+        except TldrError:
+            self._send_json(400, {"error": "bad video url"})
+            return
+        usage.note_summary_served(vid, "viewed")
+        self._send_json(200, {"ok": True})
 
     def _transcribe_fallback(self, meta, body, policy, emit, progress):
         """Offer, or carry out, transcription of a video that has no captions.

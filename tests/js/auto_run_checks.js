@@ -111,14 +111,18 @@ function setup({ stored = { autoRun: true, autoChannels: [LISTED] }, url = watch
     // content.js's own state, as declared at the top of its IIFE.
     autoRun: false, autoChannels: [], autoHandled: new Set(), autoRunVid: null,
     autoTimer: null, currentRun: null, drains: new Map(), autoLogged: new Set(),
-    pausedShown: false, lastCached: false, badgeVid: null, host: null, root: null, port: null,
+    pausedShown: false, lastCached: false, badgeVid: null, autoResults: new Set(),
+    host: null, root: null, port: null,
     requestActive: false, currentVideoId: null, backgrounded: false, lastProgress: null,
     partialState: null, txLive: null, pendingOffer: null, lastPayload: null,
     safetyTimer: null, pingTimer: null, creepTimer: null, stageTimer: null, progressPct: 0,
     // The panel's drawing, stubbed and recorded.
     showLoading() { t.showLoading++; ctx.host = "panel"; },
     // As the real showResult does first (a source check below pins that).
-    showResult(p, cached) { ctx.badgeShown(p); t.shown.push({ title: p && p.title, cached }); },
+    showResult(p, cached) {
+      ctx.badgeShown(p); ctx.servedShown(p);
+      t.shown.push({ title: p && p.title, cached });
+    },
     showError(m) { t.errors.push(m); },
     showTranscribeOffer(offer, url, vid) { t.offers.push(vid); },
     onPartial() {}, updateProgress() {}, addStopControl() {}, showPartial() {}, applyWidth() {},
@@ -1052,6 +1056,82 @@ async function running(opts) {
     await flush();
     check("...nor does a rejecting one (no unhandled rejection)", unhandled.length, 0);
   }
+  // ======================================================= read, or not ====
+  const servedMsgs = (t) => t.messages.filter((m) => m.type === "usage:served");
+  {
+    const t = setup();
+    t.ctx.initAutoRun();
+    await t.advance(3000);
+    const probe = t.ports[0].posted.find((m) => m.type === "probeCache");
+    check("an automatic run's probe says so", probe && probe.auto, true);
+  }
+  {
+    const { t, p } = await running();
+    const sent = p.posted.find((m) => m.type === "summarize");
+    check("...and its summarize", sent && sent.auto, true);
+    p.deliver(result());
+    check("an automatic result isn't a read yet", servedMsgs(t).length, 0);
+    t.toast().dispatchEvent(D.event("click"));
+    check("opening it is: one usage:served, for its video",
+      JSON.stringify(servedMsgs(t)), JSON.stringify([{ type: "usage:served", video_id: V1 }]));
+    t.ctx.showResult({ video_id: V1 });
+    check("...once per page", servedMsgs(t).length, 1);
+  }
+  {
+    // Served from the cache to an automatic run: opened later, still a read.
+    const t = setup();
+    t.ctx.initAutoRun();
+    await t.advance(3000);
+    t.ports[0].deliver({ type: "probe", hit: true, payload: { title: "C", video_id: V1 } });
+    t.ctx.host = null;
+    t.invoke(V1);
+    check("an automatic cache hit, opened: a read", servedMsgs(t).length, 1);
+  }
+  {
+    // Clicked after the summarize went out as automatic: the server logged it so,
+    // and the panel showing it is the read.
+    const { t, p } = await running();
+    t.invoke(V1);
+    p.deliver(result());
+    check("re-attached after the send, shown in the panel: a read",
+      JSON.stringify(servedMsgs(t)), JSON.stringify([{ type: "usage:served", video_id: V1 }]));
+  }
+  {
+    // Clicked after the probe went out as automatic, before the summarize.
+    const t = setup();
+    t.ctx.initAutoRun();
+    await t.advance(3000);
+    const p = t.ports[0];
+    t.invoke(V1);
+    p.deliver({ type: "probe", hit: false });
+    await t.advance(0);
+    const sent = p.posted.find((m) => m.type === "summarize");
+    check("a click before the summarize: it goes out as the user's", !!sent && !("auto" in sent), true);
+    p.deliver(result());
+    check("...and showing it still counts the probe's automatic start as read",
+      servedMsgs(t).length, 1);
+  }
+  {
+    // A run that was only ever the user's.
+    const t = setup({ stored: { autoRun: false, autoChannels: [] } });
+    await t.advance(0);
+    t.invoke(V1);
+    const p = t.ports[0];
+    const probe = p.posted.find((m) => m.type === "probeCache");
+    check("a manual run's probe carries no auto", !!probe && !("auto" in probe), true);
+    p.deliver({ type: "probe", hit: false });
+    await t.advance(0);
+    p.deliver(result());
+    check("a manual run's result sends no read", servedMsgs(t).length, 0);
+  }
+  {
+    const { t, p } = await running();
+    p.deliver(result());
+    t.ctx.showResult({ video_id: V2, title: "other" });
+    check("showing another video sends no read", servedMsgs(t).length, 0);
+  }
+  check("the real showResult tells the read too",
+    /badgeShown\(p\);\s*servedShown\(p\);/.test(SRC), true);
   check("the real showResult starts by telling the badge",
     /function showResult\(p, cached\) \{\s*badgeShown\(p\);/.test(SRC), true);
 

@@ -3355,3 +3355,133 @@ def test_a_client_that_leaves_while_waiting_for_a_slot_is_let_go_quietly(
         assert done.wait(10), "the handler never finished"
     err = capsys.readouterr().err
     assert "Traceback" not in err and "Exception occurred" not in err, err
+
+
+# --- automatic summaries in the usage log (issue #20) ----------------------------
+
+@pytest.mark.parametrize("body,want", [
+    ({"trigger": "auto"}, "auto"), ({"trigger": "AUTO"}, ""), ({"trigger": 1}, ""),
+    ({"trigger": True}, ""), ({"trigger": ["auto"]}, ""), ({}, ""), (None, ""),
+    ([], ""), ("auto", ""),
+])
+def test_only_exactly_auto_is_an_automatic_run(body, want):
+    assert server._trigger(body) == want
+
+
+def _summarize_recording(port, monkeypatch, extra=None):
+    """A stream whose model call is recorded, so its usage rows can be read."""
+    from youtube_tldw import usage
+
+    def fake(*a, **k):
+        usage.record(usage.Usage(step="summarize", cost_usd=0.01))
+        return core.Summary(_summary().meta, _summary().result, 2, _meta_cues()[1])
+
+    monkeypatch.setattr(server.core, "summarize_url", fake)
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+    return _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ", **(extra or {})},
+                        _auth())
+
+
+def test_an_automatic_stream_is_tagged_in_the_usage_log(srv, monkeypatch, capsys):
+    _, port = srv
+    events = _summarize_recording(port, monkeypatch, {"trigger": "auto"})
+    assert events[-1]["type"] == "result"
+    rows = _usage_rows()
+    (video,) = [r for r in rows if r.get("kind") == "video"]
+    assert video["trigger"] == "auto"
+    calls = [r for r in rows if r.get("step") == "summarize"]
+    assert calls and all(r.get("trigger") == "auto" for r in calls)
+    assert "[auto]" in capsys.readouterr().out
+    assert not [r for r in rows if r.get("kind") == "summary_served"]
+
+
+def test_a_clicked_stream_is_logged_exactly_as_before(srv, monkeypatch):
+    _, port = srv
+    _summarize_recording(port, monkeypatch)
+    rows = _usage_rows()
+    (video,) = [r for r in rows if r.get("kind") == "video"]
+    assert "trigger" not in video
+    assert all("trigger" not in r for r in rows if r.get("step") == "summarize")
+
+
+def _served_rows():
+    return [r["how"] for r in _usage_rows() if r.get("kind") == "summary_served"]
+
+
+def test_a_clicked_cache_hit_on_the_stream_is_a_read(srv, monkeypatch):
+    _, port = srv
+    _summarize_recording(port, monkeypatch, {"trigger": "auto"})
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
+    assert _served_rows() == ["cache"]
+    # Written before the stats it carries: the automatic video now counts.
+    assert events[-1]["stats"]["videos"] == 1
+
+
+def test_an_automatic_cache_hit_is_not_a_read(srv, monkeypatch):
+    _, port = srv
+    _summarize_recording(port, monkeypatch, {"trigger": "auto"})
+    _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ", "trigger": "auto"}, _auth())
+    _post_json(port, "/summarize/cached",
+               {"url": "https://youtu.be/dQw4w9WgXcQ", "trigger": "auto"}, _auth())
+    assert _served_rows() == []
+
+
+def test_a_clicked_probe_hit_is_a_read(srv, monkeypatch):
+    _, port = srv
+    _summarize_recording(port, monkeypatch, {"trigger": "auto"})
+    got = _post_json(port, "/summarize/cached", {"url": "https://youtu.be/dQw4w9WgXcQ"},
+                     _auth())
+    assert got["type"] == "result"
+    assert _served_rows() == ["probe"]
+    assert got["stats"]["videos"] == 1
+
+
+def test_a_fresh_summary_is_not_a_read(srv, monkeypatch):
+    _, port = srv
+    _summarize_recording(port, monkeypatch)
+    assert _served_rows() == []
+
+
+def test_the_served_route_records_a_view(srv):
+    _, port = srv
+    status, body, _ = _req(port, path="/usage/served", body={"url": "dQw4w9WgXcQ"},
+                           headers=_auth())
+    assert (status, body) == (200, {"ok": True})
+    assert _served_rows() == ["viewed"]
+    rows = [r for r in _usage_rows() if r.get("kind") == "summary_served"]
+    assert rows[0]["video_id"] == "dQw4w9WgXcQ"
+
+
+@pytest.mark.parametrize("body", [{}, {"url": "not a video"}, {"url": None}, [1], "x"])
+def test_the_served_route_refuses_what_isnt_a_video(srv, body):
+    _, port = srv
+    status, _, _ = _req(port, path="/usage/served", body=body, headers=_auth())
+    assert status == 400
+    assert _served_rows() == []
+
+
+def test_the_served_route_needs_the_token(srv):
+    _, port = srv
+    status, _, _ = _req(port, path="/usage/served", body={"url": "dQw4w9WgXcQ"},
+                        headers={"Content-Type": "application/json", "Origin": EXT_ORIGIN})
+    assert status == 401
+    assert _served_rows() == []
+
+
+def test_the_served_route_has_the_usual_body_limits(srv):
+    _, port = srv
+    status, _, _ = _req(port, path="/usage/served",
+                        body={"url": "dQw4w9WgXcQ", "pad": "x" * 40_000}, headers=_auth())
+    assert status == 413
+    status, _, _ = _req(port, path="/usage/served", body={"url": "dQw4w9WgXcQ"},
+                        headers=_auth({"Content-Type": "text/plain"}))
+    assert status == 415
+    assert _served_rows() == []
+
+
+def test_the_served_route_takes_no_slot(srv):
+    _, port = srv
+    with _filled(server._claude_slots, server.CLAUDE_LIMIT):
+        status, _, _ = _req(port, path="/usage/served", body={"url": "dQw4w9WgXcQ"},
+                            headers=_auth())
+    assert status == 200

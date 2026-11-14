@@ -483,10 +483,10 @@ def _run_usage(argv: list[str]) -> int:
         return (int(r.get("input_tokens") or 0) + int(r.get("cache_creation_tokens") or 0)
                 + int(r.get("cache_read_tokens") or 0))
 
-    # Only rows that are model calls. "video" rows note a finished summary and
-    # "segments_served" rows note a selection reaching the panel -- neither costs
-    # anything, and counting them inflated the call totals and per-step averages.
-    calls = [r for r in rows if r.get("kind") not in ("video", "segments_served")]
+    # Only rows that are model calls. "video" rows note a finished summary, and the
+    # "_served" rows note something reaching the panel -- none costs anything, and
+    # counting them inflated the call totals and per-step averages.
+    calls = [r for r in rows if r.get("kind") not in usage_mod.NOT_MODEL_CALLS]
     served = [r for r in rows if r.get("kind") == "segments_served"]
     total_cost = sum(float(r.get("cost_usd") or 0) for r in calls)
     st = usage_mod.stats(path)

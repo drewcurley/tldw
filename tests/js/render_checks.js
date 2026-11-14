@@ -540,7 +540,7 @@ check("quotes and ampersands escaped", renderAnswer('he said "hi" & left'),
 
   const panel = stripComments(src);
   check("refresh and an accepted transcription skip the probe",
-    /if \(refresh \|\| transcribe\) summarizeFromPage\(\);\s*else myPort\.postMessage\(\{ type: "probeCache"/.test(panel),
+    /if \(refresh \|\| transcribe\) summarizeFromPage\(\);\s*else \{\s*myPort\.postMessage\(\{ type: "probeCache"/.test(panel),
     true);
   check("a miss falls back to reading the page",
     /if \(!hit\) \{ summarizeFromPage\(\); return; \}/.test(panel), true);

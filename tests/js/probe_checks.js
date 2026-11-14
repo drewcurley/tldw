@@ -26,6 +26,8 @@ const between = (src, start, end) => {
   return src.slice(i, j);
 };
 const tick = () => new Promise((r) => setImmediate(r));
+// A promise left rejected is a named failure, not just node's exit code.
+process.on("unhandledRejection", (e) => { failures.push("unhandled rejection: " + e); });
 
 // ---------------------------------------------------------------- the panel ----
 const PANEL_SRC = between(content, "  function probeOutcome(m)", "\n  function showLoading()");
@@ -62,6 +64,7 @@ function panel() {
     lastProgress: null, partialState: null, txLive: null, pendingOffer: null,
     lastPayload: null, safetyTimer: null, pingTimer: null,
     drains: new Map(), currentRun: null, autoRunVid: null, lastCached: false,
+    autoResults: new Set(),
     progressPct: 0, showPausedNotice() {}, logAuto() {}, stopTranscribe() {},
   };
   vm.createContext(ctx);
@@ -81,6 +84,7 @@ function workerWith({ token = "tok", respond, cached } = {}) {
     getSettings: async () => ({ serverUrl: "http://127.0.0.1:8765/", token,
                                 model: "sonnet", segmentRatio: 0.25 }),
     safePost: (_port, m) => ctx.posted.push(m),
+    served: [], noteServed: (id) => ctx.served.push(id),
     fetch: async (url, init) => {
       ctx.fetches.push({ url, body: JSON.parse(init.body), auth: init.headers.Authorization });
       return respond();
