@@ -96,9 +96,9 @@ def _node(script, *args):
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("script,args,floor", [
     ("channels_checks.js", [CHANNELS_JS], 81),
-    ("worker_checks.js", [BACKGROUND_JS, CHANNELS_JS], 121),
+    ("worker_checks.js", [BACKGROUND_JS, CHANNELS_JS], 139),
     ("options_checks.js", [OPTIONS_JS, CHANNELS_JS], 64),
-    ("auto_run_checks.js", [CONTENT_JS, CHANNELS_JS], 187),
+    ("auto_run_checks.js", [CONTENT_JS, CHANNELS_JS], 227),
 ])
 def test_automatic_summaries(script, args, floor):
     proc = _node(script, *args)
@@ -203,3 +203,13 @@ def test_the_options_test_page_matches_options_html():
     for inside in ("autoToggle", "autoStatus", "autoChannels", "autoEmpty"):
         assert "autoControls" in ids[inside][2], inside
     assert "autoControls" not in ids["autoUnsupported"][2]
+
+
+def test_both_manifests_share_the_title_the_badge_restores():
+    """Clearing the badge puts back the manifest's default_title; the two builds
+    must agree on it, and on the version."""
+    chrome = json.loads((ROOT / "extension" / "manifest.json").read_text())
+    firefox = json.loads((ROOT / "extension" / "manifest.firefox.json").read_text())
+    assert chrome["action"]["default_title"] == firefox["action"]["default_title"]
+    assert chrome["action"]["default_title"]
+    assert chrome["version"] == firefox["version"]

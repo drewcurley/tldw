@@ -89,7 +89,11 @@ youtube.com pages (the extension can't see YouTube until you allow it, and untic
 the box gives that access back). After that, every summary's panel offers
 **⚡ Always summarize {channel}**. When you open a video from a channel on your list,
 TL;DW summarizes it in the background with the panel closed and shows a notice when
-it's ready — click it, or the toolbar button, to read it.
+it's ready — click it, or the toolbar button, to read it. If you miss the notice, the
+toolbar button shows a **✓** for that tab (its tooltip says the summary is ready)
+until you open the summary, move to another video, or reload or close the tab.
+(Leaving YouTube in that tab clears it too, as best it can: if the page unloads before
+the message gets through, it stays until the tab closes.)
 
 - It only runs for the tab you're looking at, after about 3 seconds on the video,
   never on top of a summary already running, and at most once per video per page.

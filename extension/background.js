@@ -772,5 +772,49 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       () => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
     return true;
   }
+  if (msg.type === "badge:set" || msg.type === "badge:clear") {
+    // Only a content script in a tab's top frame, and only for its own tab: the
+    // tab comes from the sender, never from the message. (Checked here, not in the
+    // shared guard above -- the options page has no tab and sends channels:*.)
+    const tab = sender.tab;
+    if (!tab || !Number.isInteger(tab.id) || tab.id < 0 || sender.frameId !== 0) return undefined;
+    setBadge(tab.id, msg.type === "badge:set");
+    return undefined;           // no reply: nothing waits on this
+  }
   return undefined;
 });
+
+// --- the toolbar badge: "an automatic summary is waiting in this tab" -----------
+//
+// Per tab, and nothing kept here: an MV3 worker is stopped after ~30s idle, so the
+// page says when to set and clear, and Chrome forgets a tab's badge when it closes.
+const BADGE_TEXT = "✓";
+const BADGE_BG = "#137333";     // white on it ~6:1; the badge on a dark toolbar ~3.1:1
+const BADGE_FG = "#FFFFFF";
+const BADGE_TITLE = "TL;DW summarized this video for you — click to read";
+
+// Chrome throws synchronously on a bad argument and rejects for a closed tab;
+// neither may escape the message listener.
+function quietly(call) {
+  try { Promise.resolve(call()).catch(() => {}); } catch (_) {}
+}
+
+function defaultTitle() {
+  try { return api.runtime.getManifest().action.default_title || ""; } catch (_) { return ""; }
+}
+
+function setBadge(tabId, on) {
+  const action = api.action;
+  if (on) {
+    quietly(() => action.setBadgeText({ tabId, text: BADGE_TEXT }));
+    quietly(() => action.setBadgeBackgroundColor({ tabId, color: BADGE_BG }));
+    if (typeof action.setBadgeTextColor === "function") {
+      quietly(() => action.setBadgeTextColor({ tabId, color: BADGE_FG }));
+    }
+    // The title is what a screen reader announces; it follows the badge.
+    quietly(() => action.setTitle({ tabId, title: BADGE_TITLE }));
+  } else {
+    quietly(() => action.setBadgeText({ tabId, text: "" }));
+    quietly(() => action.setTitle({ tabId, title: defaultTitle() }));
+  }
+}

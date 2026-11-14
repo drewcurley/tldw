@@ -27,6 +27,7 @@
   const autoLogged = new Set(); // "video|decision", so each is logged once
   let pausedShown = false;      // the budget notice, once per page
   let lastCached = false;       // whether lastPayload came from a cache
+  let badgeVid = null;          // the video whose automatic summary the badge announces
 
   let host = null;
   let root = null;
@@ -800,6 +801,11 @@
         if (backgrounded) {
           lastPayload = m.payload;
           lastCached = !!m.cached;
+          if (automatic) {
+            badgeVid = videoId;
+            sendBadge("badge:set");
+            logAuto(videoId, "badge");
+          }
           endBackground(automatic
             ? "TL;DW summarized this video for you — click to read"
             : "TL;DW summary ready — click to read", "ready");
@@ -993,6 +999,21 @@
     backgrounded = false;
     requestActive = false;
     toast(message, kind);
+  }
+
+  // The toolbar badge, for the automatic summary waiting in this tab. Sends never
+  // throw: after an extension reload sendMessage throws outright, and with no reply
+  // its promise rejects.
+  function sendBadge(type) {
+    try { Promise.resolve(api.runtime.sendMessage({ type })).catch(() => {}); } catch (_) {}
+  }
+
+  // A summary is on screen: if it's the one the badge was announcing, it's read.
+  function badgeShown(p) {
+    if (badgeVid && p && p.video_id === badgeVid) {
+      badgeVid = null;
+      sendBadge("badge:clear");
+    }
   }
 
   // kind: "ready" (opens the summary), "offer" (opens the transcription question),
@@ -1196,6 +1217,7 @@
   }
 
   function showResult(p, cached) {
+    badgeShown(p);
     if (!host) mount();
     clearTimers();
     lastPayload = p;
@@ -2291,6 +2313,12 @@
     const v = urlVideoId();
     // The URL, never the event's detail: that may not cross into this world.
     if (autoRunVid && v !== autoRunVid) leaveAutoRun();
+    // Not this video any more (another video, or a page that isn't one): the
+    // badge's summary is no longer the one this tab is showing.
+    if (badgeVid && v !== badgeVid) {
+      badgeVid = null;
+      sendBadge("badge:clear");
+    }
     if (pendingOffer && pendingOffer.videoId !== v) pendingOffer = null;
     scheduleAutoCheck();
   }
@@ -2300,8 +2328,26 @@
     else cancelAutoCheck();
   }
 
+  // Leaving the page: Chrome resets a tab's badge only when the tab closes, and on
+  // another site this script never runs to clear it. Best effort -- the message
+  // may not arrive during unload -- and badgeVid is kept for a back/forward-cache
+  // restore, which sets it again. Real events only: the page can fire these too.
+  function onPageHide(e) {
+    if (!e.isTrusted || !badgeVid) return;
+    sendBadge("badge:clear");
+  }
+
+  function onPageShow(e) {
+    if (!e.isTrusted || !e.persisted || !badgeVid) return;
+    sendBadge("badge:set");
+  }
+
   function initAutoRun() {
     if (!CH) return;
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
+    // A fresh page has no summary waiting: drop any badge a lost pagehide left.
+    sendBadge("badge:clear");
     document.addEventListener("yt-navigate-finish", onNavigated);
     document.addEventListener("visibilitychange", onVisibility);
     settingsReady.then(() => scheduleAutoCheck());
