@@ -301,6 +301,24 @@ remove each, and leaves the decision to you.
 **Upgrading:** key-moment selections made by earlier versions are re-made once per
 video, because the selection prompt changed. Cached summaries are unaffected.
 
+**Upgrading past the page-sync fix:** after clicking from one video to another on
+YouTube, older extensions could send the *previous* video's title, channel and
+duration — and, in the first couple of seconds, its transcript — and the server
+cached them. Transcripts read from captions, summaries and key-moment selections
+made before the fix are therefore set aside and remade once, the next time each
+video is opened. Whisper transcripts are kept. Until their TTL passes, `tldw cache`
+still counts the set-aside files.
+
+- **Order:** pull, reload the extension, reload your YouTube tabs, *then* restart
+  `tldw serve`. The other way round is safe but slower: until the extension is
+  reloaded, the server ignores what an out-of-date extension reads off the page and
+  fetches from YouTube itself (which can be rate-limited), and the panel says
+  "Your TL;DW extension is out of date".
+- **Rolling back:** stop `tldw serve`, revert, delete
+  `~/.cache/youtube-tldw/summaries/` and `~/.cache/youtube-tldw/segments/`, then
+  start it again — otherwise the older code would serve the pre-fix files again.
+  Reload the extension and your YouTube tabs too (either order is safe).
+
 ## Output
 
 ```

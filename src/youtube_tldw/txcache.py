@@ -36,6 +36,48 @@ def _path(video_id: str) -> Path:
 CAPTIONS = "captions"             # the source of every entry written before this
 
 
+# Bumped when entries written by older code can no longer be trusted. Generation 2:
+# after an in-page navigation, extensions before the sync check sent the *previous*
+# video's title, channel and duration (and sometimes its transcript), and the server
+# stored them. Caption entries below this generation are misses; audio entries are
+# not, because their metadata came from yt-dlp, never from the page, and they cost
+# minutes of CPU to remake. The summary and segment keys hash it too.
+META_GENERATION = 2
+
+
+def _generation_ok(gen) -> bool:
+    # bool is an int in Python; True must not pass for generation 1.
+    return isinstance(gen, int) and not isinstance(gen, bool) and gen >= META_GENERATION
+
+
+def _read(video_id: str):
+    """(status, entry): one parser behind both get() and get_status(), so the two
+    can't drift. status is "hit", "missing", "expired", "stale-gen" or "unreadable";
+    entry is (meta, cues, source) for a hit and None otherwise."""
+    try:
+        text = _path(video_id).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "missing", None
+    except (OSError, ValueError):         # ValueError: bytes that aren't UTF-8
+        return "unreadable", None
+    try:
+        raw = json.loads(text)
+        if time.time() - float(raw["saved_at"]) > TTL_SECONDS:
+            return "expired", None
+        source = raw.get("source") or CAPTIONS
+        if not isinstance(source, str):
+            source = CAPTIONS
+        # The generation is read for caption entries only, so a corrupt field on an
+        # audio entry can never cost a re-transcription.
+        if not source.startswith("audio:") and not _generation_ok(raw.get("gen")):
+            return "stale-gen", None
+        meta = _meta_from(raw["meta"])
+        return "hit", (meta, [Cue(int(c[0]), int(c[1]), c[2]) for c in raw["cues"]],
+                       source)
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+        return "unreadable", None         # truncated, or from an older shape
+
+
 def get(video_id: str):
     """(meta, cues, source) if a fresh copy is on disk, else None.
 
@@ -44,18 +86,13 @@ def get(video_id: str):
     written by an older version into a miss, and on a captionless video a miss
     now costs minutes of transcription rather than one yt-dlp call.
     """
-    try:
-        raw = json.loads(_path(video_id).read_text(encoding="utf-8"))
-        if time.time() - float(raw["saved_at"]) > TTL_SECONDS:
-            return None
-        meta = _meta_from(raw["meta"])
-        source = raw.get("source") or CAPTIONS
-        if not isinstance(source, str):
-            source = CAPTIONS
-        return (meta, [Cue(int(c[0]), int(c[1]), c[2]) for c in raw["cues"]],
-                source)
-    except (OSError, ValueError, KeyError, TypeError, IndexError):
-        return None                       # missing, truncated, or from an older shape
+    status, entry = _read(video_id)
+    return entry if status == "hit" else None
+
+
+def get_status(video_id: str) -> str:
+    """Why get() would return what it does -- for the log, not for decisions."""
+    return _read(video_id)[0]
 
 
 def _meta_dict(meta) -> dict:
@@ -80,6 +117,7 @@ def put(video_id: str, meta, cues: list, source: str = CAPTIONS) -> None:
             "meta": _meta_dict(meta),
             "cues": [[c.start_ms, c.end_ms, c.text] for c in cues],
             "source": source,
+            "gen": META_GENERATION,
         }
         tmp = _path(video_id).with_suffix(".tmp")
         tmp.write_text(json.dumps(payload), encoding="utf-8")

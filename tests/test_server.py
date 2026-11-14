@@ -1111,6 +1111,9 @@ def test_the_key_separates_backends(monkeypatch):
 
 VTT = ("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nhello there\n\n"
        "00:00:02.000 --> 00:00:04.000\nsecond line\n")
+# Every page object from an extension with the page-sync check says so. Pages
+# without it are not believed (see test_an_out_of_date_extension_*).
+PV = {"page_v": 2}
 
 
 def test_the_page_can_supply_the_transcript(srv, monkeypatch):
@@ -1124,8 +1127,10 @@ def test_the_page_can_supply_the_transcript(srv, monkeypatch):
                             [f"{len(cues)} cues from {channel}"], title, 0.2, ""))
     monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
     body = {"url": "https://youtu.be/dQw4w9WgXcQ",
-            "page": {"title": "Page Title", "channel": "Page Channel",
-                     "duration_ms": 600_000, "captions": VTT}}
+            "page": {**PV, "title": "Page Title", "channel": "Page Channel",
+                     "duration_ms": 600_000,
+                     "cues": [{"start_ms": 0, "text": "hello there"},
+                              {"start_ms": 2000, "text": "second line"}]}}
     result = _read_ndjson(port, body, _auth())[-1]
     assert result["type"] == "result"
     assert result["key_points"] == ["2 cues from Page Channel"]
@@ -1141,14 +1146,16 @@ def test_a_page_transcript_is_reused_by_questions(srv, monkeypatch):
                         lambda *a, **k: TextResult(["k"], "b", 0.2, ""))
     monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
     _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
-                        "page": {"captions": VTT}}, _auth())
+                        "page": {**PV, "cues": [{"start_ms": 0, "text": "hi"}]}},
+                 _auth())
     assert server._cache_get("dQw4w9WgXcQ") is not None
 
 
 @pytest.mark.parametrize("page", [
-    None, "a string", {}, {"captions": ""}, {"captions": "   "},
-    {"captions": "this is not a caption file at all"},
-    {"captions": 12345},
+    None, "a string", {}, dict(PV), {**PV, "cues": []}, {**PV, "cues": "x"},
+    {**PV, "cues": [{"start_ms": "x", "text": "y"}]},
+    # The pre-panel caption-track shape is no longer read at all.
+    {**PV, "captions": VTT},
 ])
 def test_junk_from_the_page_falls_back_to_fetching(srv, monkeypatch, page):
     """Untrusted input: anything unusable means fetch it properly, not fail."""
@@ -1167,8 +1174,8 @@ def test_junk_from_the_page_falls_back_to_fetching(srv, monkeypatch, page):
 
 def test_page_metadata_is_bounded_and_has_fallbacks():
     """Title and channel reach a prompt and a filename; duration reaches arithmetic."""
-    body = {"page": {"title": "T" * 5000, "channel": "", "duration_ms": -5,
-                     "captions": VTT}}
+    body = {"page": {**PV, "title": "T" * 5000, "channel": "", "duration_ms": -5,
+                     "cues": PANEL_CUES}}
     meta, cues = server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
     assert len(meta.title) <= 300
     assert meta.channel == "(unknown)"
@@ -1178,8 +1185,7 @@ def test_page_metadata_is_bounded_and_has_fallbacks():
 
 # --- the transcript as the page's own panel rendered it -------------------------
 #
-# This is the path that keeps the server from talking to YouTube at all. The older
-# `captions` shape is still accepted so an un-updated extension keeps working.
+# This is the path that keeps the server from talking to YouTube at all.
 
 PANEL_CUES = [{"start_ms": 0, "text": "first line"},
               {"start_ms": 5000, "text": "second line"}]
@@ -1193,14 +1199,14 @@ def test_panel_cues_are_used_without_contacting_youtube(srv, monkeypatch):
                         lambda *a, **k: TextResult(["k"], "b", 0.2, ""))
     monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
     _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ",
-                        "page": {"cues": PANEL_CUES, "title": "T", "channel": "C"}},
+                        "page": {**PV, "cues": PANEL_CUES, "title": "T", "channel": "C"}},
                  _auth())
     assert server._cache_get("dQw4w9WgXcQ") is not None
 
 
 def test_panel_cues_carry_the_pages_metadata():
-    body = {"page": {"cues": PANEL_CUES, "title": "A Title", "channel": "A Channel",
-                     "duration_ms": 600_000}}
+    body = {"page": {**PV, "cues": PANEL_CUES, "title": "A Title",
+                     "channel": "A Channel", "duration_ms": 600_000}}
     meta, cues = server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
     assert (meta.title, meta.channel) == ("A Title", "A Channel")
     assert meta.duration_ms == 600_000
@@ -1209,7 +1215,7 @@ def test_panel_cues_carry_the_pages_metadata():
 
 
 def test_panel_cues_without_a_duration_fall_back_to_the_last_cue():
-    body = {"page": {"cues": PANEL_CUES}}
+    body = {"page": {**PV, "cues": PANEL_CUES}}
     meta, cues = server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
     assert meta.duration_ms == cues[-1].end_ms
 
@@ -1219,20 +1225,81 @@ def test_panel_cues_without_a_duration_fall_back_to_the_last_cue():
 ])
 def test_unusable_panel_cues_fall_back_to_fetching(cues):
     """Same rule as every other page input: unusable means fetch it properly."""
-    body = {"page": {"cues": cues, "title": "T"}}
+    body = {"page": {**PV, "cues": cues, "title": "T"}}
     assert server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ") is None
 
 
-def test_cues_win_over_a_caption_track_when_both_arrive():
-    body = {"page": {"cues": PANEL_CUES, "captions": VTT}}
+def test_a_caption_track_alone_is_no_longer_read():
+    """The pre-panel `captions` shape came only from extensions that also predate
+    page_v; with the version gate it could never be reached, so it went."""
+    body = {"page": {**PV, "captions": VTT}}
+    assert server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ") is None
+    body = {"page": {**PV, "cues": PANEL_CUES, "captions": VTT}}
     _, cues = server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
     assert [c.text for c in cues] == ["first line", "second line"]
 
 
-def test_an_older_extension_still_gets_its_caption_track_parsed():
-    body = {"page": {"captions": VTT}}
-    result = server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
-    assert result is not None and result[1]
+# --- an extension from before the page-sync check -------------------------------
+#
+# After an in-page navigation, those read YouTube's <head> tags -- still about the
+# previous video -- and the server cached what they sent for a fortnight.
+
+@pytest.mark.parametrize("marker", [
+    {}, {"page_v": 1}, {"page_v": "2"}, {"page_v": True}, {"page_v": 2.0},
+    {"page_v": None},
+])
+def test_an_out_of_date_extensions_page_is_not_believed(marker):
+    body = {"page": {**marker, "cues": PANEL_CUES, "title": "Stale", "channel": "S"}}
+    assert server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ") is None
+
+
+@pytest.mark.parametrize("version", [2, 3])
+def test_a_current_extensions_page_is_believed(version):
+    body = {"page": {"page_v": version, "cues": PANEL_CUES, "title": "Fresh"}}
+    meta, _ = server._page_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
+    assert meta.title == "Fresh"
+
+
+def _stub_fetch(monkeypatch, fetched, title="From YouTube"):
+    from youtube_tldw.transcript import Cue
+    monkeypatch.setattr(server.core, "fetch_transcript",
+                        lambda vid, lang="en", **k: fetched.append(vid) or
+                        (VideoMeta(vid, title, "C", 1000, {}, {}), [Cue(0, 900, "x")]))
+    monkeypatch.setattr(server.core.summarize, "summarize_text",
+                        lambda cues, channel, title, ratio, **k: TextResult(
+                            ["k"], title, 0.2, ""))
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+
+
+def test_an_out_of_date_extension_gets_the_servers_own_fetch_and_is_told(
+        srv, monkeypatch, capsys):
+    _, port = srv
+    fetched = []
+    _stub_fetch(monkeypatch, fetched)
+    body = {"url": "https://youtu.be/dQw4w9WgXcQ",
+            "page": {"cues": PANEL_CUES, "title": "Stale title", "status": "ok"}}
+    events = _read_ndjson(port, body, _auth())
+    assert fetched == ["dQw4w9WgXcQ"]
+    assert events[-1]["title"] == "From YouTube"            # never the stale one
+    # Again (a refresh skips the summary cache; the fetched transcript is reused).
+    _read_ndjson(port, {**body, "refresh": True}, _auth())
+    told = [e for e in events if e["type"] == "progress"
+            and "out of date" in e["message"]]
+    assert told, events
+    out = capsys.readouterr().out
+    # Every request, not once: each is a yt-dlp call that can draw a 429.
+    assert out.count("extension predates the sync check") == 2
+
+
+def test_a_request_with_no_page_is_not_called_out_of_date(srv, monkeypatch, capsys):
+    _, port = srv
+    _stub_fetch(monkeypatch, [])
+    events = _read_ndjson(port, {"url": "https://youtu.be/dQw4w9WgXcQ"}, _auth())
+    assert not [e for e in events if e["type"] == "progress"
+                and "out of date" in e["message"]]
+    out = capsys.readouterr().out
+    assert "predates the sync check" not in out
+    assert "not offered" in out
 
 
 # --- where a transcript came from ----------------------------------------------
@@ -1241,22 +1308,28 @@ def test_an_older_extension_still_gets_its_caption_track_parsed():
 # track, costs minutes rather than seconds, and is keyed by the model that made it.
 # None of that may break the cache files written before any of it existed.
 
-def test_a_cache_file_from_before_provenance_is_still_a_hit(monkeypatch, tmp_path):
-    """Reading `source` as a required key would turn every pre-upgrade entry into a
-    miss — and on a captionless video a miss now costs minutes, not one fetch."""
+def _legacy_file(tmp_path, monkeypatch, **fields):
+    """A cache file as older code wrote it, straight onto disk -- never through
+    _cache_put, which would also fill memory, as no real restart does."""
     monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
-    (tmp_path / "dQw4w9WgXcQ.json").write_text(json.dumps({
-        "saved_at": time.time(),
-        "meta": {"video_id": "dQw4w9WgXcQ", "title": "T", "channel": "C",
-                 "duration_ms": 1000, "subtitles": {}, "auto_captions": {}},
-        "cues": [[0, 900, "hello"]],          # note: no "source" key at all
-    }), encoding="utf-8")
-    hit = txcache.get("dQw4w9WgXcQ")
-    assert hit is not None
-    meta, cues, source = hit
-    assert [c.text for c in cues] == ["hello"]
-    assert source == txcache.CAPTIONS      # an unmarked entry is a caption track
+    entry = {"saved_at": time.time(),
+             "meta": {"video_id": "dQw4w9WgXcQ", "title": "T", "channel": "C",
+                      "duration_ms": 1000, "subtitles": {}, "auto_captions": {}},
+             "cues": [[0, 900, "hello"]]}
+    entry.update(fields)
+    (tmp_path / "dQw4w9WgXcQ.json").write_text(json.dumps(entry), encoding="utf-8")
+
+
+def test_a_cache_file_from_before_provenance_is_now_a_miss(monkeypatch, tmp_path):
+    """Rewritten deliberately for the page-sync fix. This used to assert a hit: an
+    entry with no `source` is a caption track, and treating it as a miss would cost
+    a re-fetch. It is a caption track -- and every caption entry written before
+    generation 2 may hold another video's title, channel or even transcript, from an
+    extension that read the page before it caught up. So it is now a miss."""
+    _legacy_file(tmp_path, monkeypatch)            # no "source", no "gen"
+    assert txcache.get("dQw4w9WgXcQ") is None
+    assert txcache.get_status("dQw4w9WgXcQ") == "stale-gen"
 
 
 def test_provenance_survives_a_restart(monkeypatch, tmp_path):
@@ -1268,16 +1341,169 @@ def test_provenance_survives_a_restart(monkeypatch, tmp_path):
 
 
 def test_a_nonsense_source_reads_as_captions(monkeypatch, tmp_path):
+    """Rewritten deliberately for the page-sync fix: it now carries a current
+    generation, since a caption entry without one is a miss (tested below)."""
+    _legacy_file(tmp_path, monkeypatch, source={"not": "a string"},
+                 gen=txcache.META_GENERATION)
+    assert txcache.get("dQw4w9WgXcQ")[2] == txcache.CAPTIONS
+
+
+# --- the cache generation (page-sync fix) ----------------------------------------
+
+@pytest.mark.parametrize("fields", [
+    {"source": "captions"},                       # no gen at all
+    {"source": "captions", "gen": 1},
+    {},                                           # neither source nor gen
+    {"source": "captions", "gen": "x"},
+    {"source": "captions", "gen": None},
+    {"source": "captions", "gen": 1.5},
+])
+def test_an_old_or_unreadable_generation_is_a_miss_for_captions(
+        monkeypatch, tmp_path, fields):
+    _legacy_file(tmp_path, monkeypatch, **fields)
+    assert txcache.get("dQw4w9WgXcQ") is None
+    assert txcache.get_status("dQw4w9WgXcQ") == "stale-gen"
+
+
+def test_true_is_not_generation_one(monkeypatch, tmp_path):
+    """bool is an int in Python. At generation 2, True (== 1) would miss anyway;
+    only with the bar at 1 does the bool guard itself get tested."""
+    monkeypatch.setattr(txcache, "META_GENERATION", 1)
+    _legacy_file(tmp_path, monkeypatch, source="captions", gen=True)
+    assert txcache.get("dQw4w9WgXcQ") is None
+    _legacy_file(tmp_path, monkeypatch, source="captions", gen=1)
+    assert txcache.get("dQw4w9WgXcQ") is not None
+
+
+@pytest.mark.parametrize("gen", [2, 3])
+def test_a_current_or_newer_generation_is_a_hit(monkeypatch, tmp_path, gen):
+    _legacy_file(tmp_path, monkeypatch, source="captions", gen=gen)
+    assert txcache.get("dQw4w9WgXcQ") is not None
+    assert txcache.get_status("dQw4w9WgXcQ") == "hit"
+
+
+@pytest.mark.parametrize("fields", [{}, {"gen": 1}, {"gen": "x"}, {"gen": True}])
+def test_an_audio_transcript_survives_the_generation_bump(monkeypatch, tmp_path, fields):
+    """Its metadata came from yt-dlp, not the page, and it cost minutes of CPU."""
+    _legacy_file(tmp_path, monkeypatch, source="audio:small", **fields)
+    hit = txcache.get("dQw4w9WgXcQ")
+    assert hit is not None and hit[2] == "audio:small"
+
+
+def test_a_fresh_put_round_trips_at_the_current_generation(monkeypatch, tmp_path):
+    monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path)
+    from youtube_tldw.transcript import Cue
+    txcache.put("dQw4w9WgXcQ", VideoMeta("dQw4w9WgXcQ", "T", "C", 1000, {}, {}),
+                [Cue(0, 900, "x")])
+    raw = json.loads((tmp_path / "dQw4w9WgXcQ.json").read_text())
+    assert raw["gen"] == txcache.META_GENERATION == 2
+    assert txcache.get("dQw4w9WgXcQ") is not None
+
+
+def test_get_status_names_every_outcome_and_agrees_with_get(monkeypatch, tmp_path):
     monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
-    (tmp_path / "dQw4w9WgXcQ.json").write_text(json.dumps({
-        "saved_at": time.time(),
-        "meta": {"video_id": "dQw4w9WgXcQ", "title": "T", "channel": "C",
-                 "duration_ms": 1000, "subtitles": {}, "auto_captions": {}},
-        "cues": [[0, 900, "hello"]],
-        "source": {"not": "a string"},
-    }), encoding="utf-8")
-    assert txcache.get("dQw4w9WgXcQ")[2] == txcache.CAPTIONS
+    from youtube_tldw.transcript import Cue
+    meta = VideoMeta("v", "T", "C", 1000, {}, {})
+    cases = {}
+    txcache.put("hitvid12345", meta, [Cue(0, 900, "x")])
+    cases["hitvid12345"] = "hit"
+    cases["missingvid1"] = "missing"
+    (tmp_path / "unreadable1.json").write_text("{ not json")
+    cases["unreadable1"] = "unreadable"
+    (tmp_path / "stalegenvid.json").write_text(json.dumps({
+        "saved_at": time.time(), "meta": {"video_id": "v", "title": "T",
+        "channel": "C", "duration_ms": 1}, "cues": []}))
+    cases["stalegenvid"] = "stale-gen"
+    (tmp_path / "expiredvid1.json").write_text(json.dumps({
+        "saved_at": 0, "gen": 2, "meta": {}, "cues": []}))
+    cases["expiredvid1"] = "expired"
+    for vid, want in cases.items():
+        assert txcache.get_status(vid) == want, vid
+        # One parser: get() returns an entry exactly when the status is "hit".
+        assert (txcache.get(vid) is not None) == (want == "hit"), vid
+
+
+def test_a_file_that_is_not_utf8_is_a_miss_not_an_error(monkeypatch, tmp_path):
+    """It used to be: the read and the parse shared one `except ValueError`. A file
+    like this is never removed by `tldw cache clean`, so raising would fail every
+    request for that video until someone deleted it by hand."""
+    monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path)
+    (tmp_path / "dQw4w9WgXcQ.json").write_bytes(b"\xff\xfe\x00bad")
+    assert txcache.get("dQw4w9WgXcQ") is None
+    assert txcache.get_status("dQw4w9WgXcQ") == "unreadable"
+    assert server._cache_source("dQw4w9WgXcQ") == txcache.CAPTIONS
+
+
+def test_a_stale_generation_is_logged_once_per_video(monkeypatch, tmp_path, capsys):
+    _legacy_file(tmp_path, monkeypatch)
+    assert server._cache_get("dQw4w9WgXcQ") is None
+    assert server._cache_get("dQw4w9WgXcQ") is None
+    out = capsys.readouterr().out
+    assert out.count("cached transcript for dQw4w9WgXcQ invalidated (gen < 2)") == 1
+
+
+def test_an_empty_cache_is_not_logged_as_invalidated(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(txcache, "CACHE_DIR", tmp_path)
+    assert server._cache_get("dQw4w9WgXcQ") is None
+    assert "invalidated" not in capsys.readouterr().out
+
+
+def test_the_summary_and_segment_keys_carry_the_generation(monkeypatch):
+    summary, seg = server._summary_key("vid", None), server._seg_key("vid", None)
+    assert server._summary_key("vid", None) == summary          # stable
+    monkeypatch.setattr(txcache, "META_GENERATION", 3)
+    assert server._summary_key("vid", None) != summary
+    assert server._seg_key("vid", None) != seg
+    assert server._seg_file(server._seg_key("vid", None)) != server._seg_file(seg)
+
+
+def _pre_bump_summary_key(video_id, ratio, source=None):
+    """_summary_key exactly as it was before the generation was added."""
+    import hashlib
+    shape = "|".join((
+        video_id, server.claude_client.backend_fingerprint(),
+        str(round(ratio, 3)) if isinstance(ratio, (int, float)) else "auto",
+        server.summarize.PROMPT_FINGERPRINT, source or txcache.CAPTIONS))
+    return f"{video_id}-{hashlib.sha256(shape.encode()).hexdigest()[:16]}"
+
+
+def test_a_summary_cached_before_the_fix_is_not_served(srv, monkeypatch, tmp_path,
+                                                        capsys):
+    """End to end: a poisoned summary under the real old key, and a legacy
+    transcript file on disk, are both passed over; the page's own (correct) data is
+    used, and the file is rewritten at the current generation."""
+    _, port = srv
+    vid = "dQw4w9WgXcQ"
+    txcache.put_summary(_pre_bump_summary_key(vid, None), {
+        "type": "result", "video_id": vid, "title": "Me at the zoo",
+        "channel": "jawed", "summary_md": "stale", "key_points": ["stale"]})
+    _legacy_file(txcache.CACHE_DIR, monkeypatch, meta={
+        "video_id": vid, "title": "Me at the zoo", "channel": "jawed",
+        "duration_ms": 19000})
+    monkeypatch.setattr(server.core, "fetch_transcript",
+                        lambda *a, **k: pytest.fail("contacted YouTube"))
+    monkeypatch.setattr(server.core.summarize, "summarize_text",
+                        lambda cues, channel, title, ratio, **k: TextResult(
+                            ["fresh"], title, 0.2, ""))
+    monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
+
+    probe = _post_json(port, "/summarize/cached",
+                       {"url": f"https://youtu.be/{vid}"}, _auth())
+    assert probe == {"type": "miss"}, probe
+    body = {"url": f"https://youtu.be/{vid}",
+            "page": {**PV, "title": "Corpse Bride", "channel": "Movies",
+                     "cues": PANEL_CUES, "status": "ok-panel"}}
+    events = _read_ndjson(port, body, _auth())
+    result = events[-1]
+    assert result["type"] == "result"
+    assert result["title"] == "Corpse Bride"
+    # A current extension is never told it's out of date.
+    assert not [e for e in events if e["type"] == "progress"
+                and "out of date" in e["message"]]
+    raw = json.loads((txcache.CACHE_DIR / f"{vid}.json").read_text())
+    assert raw["gen"] == 2 and raw["meta"]["title"] == "Corpse Bride"
+    assert "invalidated (gen < 2)" in capsys.readouterr().out
 
 
 def test_the_in_memory_cache_reports_provenance_too():
@@ -1853,7 +2079,7 @@ def test_real_captions_from_the_page_beat_an_audio_transcript(monkeypatch):
     monkeypatch.setattr(server.whisper_transcribe, "resolve_model", lambda: "small")
     meta = VideoMeta("dQw4w9WgXcQ", "T", "C", 1000, {}, {})
     server._cache_put("dQw4w9WgXcQ", meta, [Cue(0, 900, "from audio")], "audio:small")
-    body = {"page": {"cues": [{"start_ms": 0, "text": "from real captions"}],
+    body = {"page": {**PV, "cues": [{"start_ms": 0, "text": "from real captions"}],
                      "title": "T", "channel": "C"}}
     chosen = server._preferred_transcript(body, "https://youtu.be/dQw4w9WgXcQ")
     assert [c.text for c in chosen[1]] == ["from real captions"]
@@ -2461,7 +2687,7 @@ def test_a_silent_claude_gives_a_504_and_its_slot_back(srv, monkeypatch):
     monkeypatch.setattr(server, "REQUEST_TIMEOUT", 0.5)
     monkeypatch.setattr(server, "_start_seg_prefetch", lambda *a, **k: None)
     body = {"url": "https://youtu.be/dQw4w9WgXcQ", "refresh": True,
-            "page": {"cues": [{"start_ms": 0, "text": "hello"}], "title": "T",
+            "page": {**PV, "cues": [{"start_ms": 0, "text": "hello"}], "title": "T",
                      "channel": "C", "duration_ms": 60_000}}
     with _filled(server._claude_slots, server.CLAUDE_LIMIT - 1):
         for _ in range(2):
