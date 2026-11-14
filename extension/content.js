@@ -3,10 +3,30 @@
 // styles can't leak in (and ours can't leak out). All model text is escaped.
 
 (() => {
-  if (window.__tldwInit) return;
+  // === true, not truthiness: a page element with id="__tldwInit" is visible here
+  // through named access, and would otherwise switch TL;DW off on that page.
+  if (window.__tldwInit === true) return;
   window.__tldwInit = true;
 
   const api = globalThis.browser ?? globalThis.chrome;  // Firefox/Chrome shim
+  // Automatic summaries' shared helpers (channels.js, injected first). Missing or
+  // broken means every auto feature is off and everything else works as before.
+  const CH = (() => {
+    const ch = globalThis.TLDW_CHANNELS;
+    return ch && typeof ch.channelKey === "function" ? ch : null;
+  })();
+
+  // --- automatic summaries: state --------------------------------------------------
+  let autoRun = false;          // the owner's option (and the permission it needs)
+  let autoChannels = [];        // sanitized; written only by the worker
+  const autoHandled = new Set();  // videos already auto-checked on this page
+  let autoRunVid = null;        // the video an *automatic* run in flight is for
+  let autoTimer = null;         // the one pending auto-check step; clearing it retires the check
+  let currentRun = null;        // { url, videoId, auto, sent, port } of the live run
+  const drains = new Map();     // port -> { ping, cap, url }: runs left behind
+  const autoLogged = new Set(); // "video|decision", so each is logged once
+  let pausedShown = false;      // the budget notice, once per page
+  let lastCached = false;       // whether lastPayload came from a cache
 
   let host = null;
   let root = null;
@@ -151,6 +171,16 @@
         }
         h1 { font-size: 19px; margin: 0 6px 2px 0; }
         .meta { font-size: 13px; color: #666; margin-bottom: 14px; }
+        .autorow { font-size: 13px; color: #666; margin: -6px 0 14px;
+          overflow-wrap: anywhere; }
+        .autorow button { font: inherit; background: none; border: 0; padding: 0;
+          color: #065fd4; cursor: pointer; text-decoration: underline; }
+        .autorow button[disabled] { opacity: .6; cursor: default; }
+        .autostatus { display: block; }
+        @media (prefers-color-scheme: dark) {
+          .autorow { color: #a8a8ad; }
+          .autorow button { color: #8ab4f8; }
+        }
         h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em;
           opacity: .8; margin: 18px 0 8px; }
         .points { margin: 0; padding-left: 20px; }
@@ -260,6 +290,12 @@
       </div>`;
     (document.fullscreenElement || document.body).appendChild(host);
 
+    // The shadow root is open, so the page's own scripts can reach our buttons and
+    // .click() them -- adding a channel, accepting minutes of transcription. Only a
+    // real click gets past this. (This file never .click()s its own controls.)
+    root.addEventListener("click", (e) => {
+      if (!e.isTrusted) e.stopImmediatePropagation();
+    }, true);
     root.querySelector(".close").addEventListener("click", close);
     root.querySelector(".backdrop").addEventListener("mousedown", (e) => {
       if (e.target === e.currentTarget) close();
@@ -294,7 +330,10 @@
   }
 
   function onKey(e) {
-    if (!host) return;
+    // Real keys only. This listens on `window`, so the page's own scripts could
+    // otherwise type into the (open) shadow root and press Enter -- sending a
+    // question, an unbudgeted model call, without the user.
+    if (!host || !e.isTrusted) return;
     const mine = fromModal(e);
     if (mine) e.stopPropagation();
     if (e.key === "Escape") { e.stopPropagation(); close(); return; }
@@ -639,7 +678,10 @@
       : null;
   }
 
-  function startSummarize(url, videoId, refresh, transcribe) {
+  // `opts.auto`: started by the page, not a click -- no panel, a quiet run whose
+  // only sign is a notice when it's done, counted against the worker's budget.
+  function startSummarize(url, videoId, refresh, transcribe, opts) {
+    const auto = !!(opts && opts.auto === true);
     // A new run abandons whatever the last one left connected (mount() no longer
     // does this, and it must not — see the comment there).
     clearTimers();
@@ -647,11 +689,19 @@
     lastProgress = null;
     partialState = null;
     txLive = null;
-    showLoading();
+    pendingOffer = null;      // an old offer must not answer this run's notice
+    progressPct = 0;          // only showLoading reset it, and a quiet run skips that
+    if (!auto) showLoading();
     requestActive = true;
     currentVideoId = videoId;
     backgrounded = false;
+    if (auto) backgrounded = true;
+    autoRunVid = auto ? videoId : null;
     const myPort = port = api.runtime.connect({ name: "tldw" });
+    const run = currentRun = { url, videoId, auto, sent: false, port: myPort };
+    // The automatic wording, only while this is still an automatic run: clicking
+    // the toolbar mid-run makes it the user's own.
+    const autoWording = () => auto && run.auto && autoRunVid === videoId;
     // Read the page's transcript, then ask for a summary: the flow as it has
     // always been, and what every miss falls back to.
     // This run's own video and liveness -- never currentVideoId, which a newer run
@@ -662,11 +712,38 @@
       // were reading. Checking requestActive alone isn't enough: a newer run sets
       // it again, and this video's transcript would go out on that run's request.
       if (!requestActive || port !== myPort) return;
-      myPort.postMessage({ type: "summarize", url, videoId, refresh: !!refresh,
-                           page, transcribe: !!transcribe });
+      run.sent = true;
+      const msg = { type: "summarize", url, videoId, refresh: !!refresh,
+                    page, transcribe: !!transcribe };
+      // run.auto, not auto: a toolbar click before this point made the run the
+      // user's, and the user's runs are never counted against the budget.
+      if (run.auto) msg.auto = true;
+      myPort.postMessage(msg);
     });
-    port.onMessage.addListener((m) => {
+    const finished = () => {
+      if (currentRun === run) currentRun = null;
+      if (autoRunVid === videoId) autoRunVid = null;
+    };
+    myPort.onMessage.addListener((m) => {
+      // A port that is no longer the live one is either draining (see
+      // leaveAutoRun) or abandoned. Either way it never touches this panel.
+      if (port !== myPort) { onDrainMessage(myPort, m); return; }
       if (!requestActive) return;
+      if (m.type === "autoPaused") {
+        requestActive = false;
+        clearTimers();
+        try { myPort.disconnect(); } catch (_) {}
+        port = null;
+        const watching = !backgrounded && host;
+        backgrounded = false;
+        finished();
+        // Re-attached in the moment between the send and the refusal: the open
+        // panel must not sit on "Starting…".
+        if (watching) showError("Automatic summaries are paused for now. "
+          + "Click TL;DW again to summarize this video.");
+        else showPausedNotice(m.limit);
+        return;
+      }
       if (m.type === "probe") {
         const hit = probeOutcome(m);
         if (!hit) { summarizeFromPage(); return; }
@@ -688,10 +765,13 @@
         safetyTimer = setTimeout(() => {
           if (!requestActive) return;
           requestActive = false;
+          const automatic = autoWording();
+          finished();
           const msg = "Transcribing is taking longer than expected. It may still "
             + "finish on the server — try again in a few minutes.";
-          if (backgrounded) endBackground(msg, true);
-          else showError(msg);
+          if (backgrounded) {
+            endBackground((automatic ? "Automatic summary failed: " : "") + msg, "error");
+          } else showError(msg);
         }, 2460000);
         return;
       }
@@ -699,11 +779,13 @@
         requestActive = false;
         partialState = null;
         txLive = null;
+        finished();
         pendingOffer = { offer: m.offer, url, videoId };
         if (backgrounded) {
           // The panel was closed deliberately. Say there's something to decide and
           // let them come back to it, rather than reopening over the video.
-          endBackground("TL;DW needs an answer about this video");
+          endBackground("TL;DW needs your answer about this video — click to see it",
+                        "offer");
           return;
         }
         showTranscribeOffer(m.offer, url, videoId);
@@ -712,19 +794,31 @@
       requestActive = false;
       partialState = null;
       txLive = null;
+      const automatic = autoWording();
+      finished();
       if (m.type === "result") {
-        if (backgrounded) { lastPayload = m.payload; endBackground("TL;DW summary ready"); }
-        else showResult(m.payload, m.cached);
+        if (backgrounded) {
+          lastPayload = m.payload;
+          lastCached = !!m.cached;
+          endBackground(automatic
+            ? "TL;DW summarized this video for you — click to read"
+            : "TL;DW summary ready — click to read", "ready");
+        } else showResult(m.payload, m.cached);
       } else if (m.type === "error") {
-        if (backgrounded) endBackground(m.error, true);
-        else showError(m.error);
+        if (backgrounded) {
+          endBackground((automatic ? "Automatic summary failed: " : "") + m.error, "error");
+        } else showError(m.error);
       }
     });
-    port.onDisconnect.addListener(() => {
+    myPort.onDisconnect.addListener(() => {
+      if (port !== myPort) { endDrain(myPort); return; }
       if (!requestActive) return;
       requestActive = false;
+      const automatic = autoWording();
+      finished();
       const msg = "Lost connection to the extension worker. Click TL;DW to try again.";
-      if (backgrounded) endBackground(msg, true);
+      if (backgrounded) endBackground((automatic ? "Automatic summary failed: " : "") + msg,
+                                      "error");
       else showError(msg);
     });
     // Ask whether a summary already exists before reading the page. Reading it
@@ -733,21 +827,92 @@
     // refresh or an accepted transcription wants new work, so those go straight
     // to the page as before.
     if (refresh || transcribe) summarizeFromPage();
-    else port.postMessage({ type: "probeCache", url, videoId });
+    else myPort.postMessage({ type: "probeCache", url, videoId });
     // Heartbeat: the page never suspends, so pinging every 20s keeps the MV3 service
     // worker alive through a long (60s+) summarize that would otherwise be killed.
     pingTimer = setInterval(() => {
-      try { port.postMessage({ type: "ping" }); } catch (_) {}
+      try { myPort.postMessage({ type: "ping" }); } catch (_) {}
     }, 20000);
     // Transcribing audio legitimately runs for many minutes; the ordinary ceiling
     // would fire part-way through a wait the user has already agreed to.
     safetyTimer = setTimeout(() => {
-      if (!requestActive) return;
+      if (!requestActive || port !== myPort) return;
       requestActive = false;
+      const automatic = autoWording();
+      finished();
       const msg = "This is taking too long. Make sure `tldw serve` is running, then try again.";
-      if (backgrounded) endBackground(msg, true);
+      if (backgrounded) endBackground((automatic ? "Automatic summary failed: " : "") + msg,
+                                      "error");
       else showError(msg);
     }, transcribe ? 2460000 : 160000);
+  }
+
+  // --- leaving a video while its automatic run is still going ----------------------
+  //
+  // Dropping the port would let the MV3 worker be suspended mid-fetch (the ping is
+  // the only thing keeping it alive), and a summary already paid for would never be
+  // cached. So a run whose summarize has gone out is *drained*: its port keeps its
+  // own ping until it finishes, and nothing is shown. One that hasn't sent yet is
+  // just dropped. One that is transcribing is stopped -- that is up to 40 minutes
+  // of CPU for a video the user left, with no Stop button anywhere.
+  const DRAIN_CAP_MS = 160000;
+  const DRAIN_TERMINAL = ["result", "error", "needsTranscription", "autoPaused"];
+
+  function leaveAutoRun() {
+    const run = currentRun;
+    autoRunVid = null;
+    if (!run || !run.auto || port !== run.port) return;
+    // The old run's timers first: its ping and safety timer act on `port`/
+    // `requestActive`, which are about to belong to the next run.
+    clearTimers();
+    requestActive = false;
+    backgrounded = false;
+    partialState = null;
+    lastProgress = null;
+    port = null;
+    currentRun = null;
+    if (txLive) {
+      stopTranscribe(txLive.url, run.port);
+      txLive = null;
+      try { run.port.disconnect(); } catch (_) {}
+      logAuto(run.videoId, "stopped transcription");
+      return;
+    }
+    if (!run.sent) {
+      try { run.port.disconnect(); } catch (_) {}
+      logAuto(run.videoId, "dropped");
+      return;
+    }
+    startDrain(run.port, run.url);
+    logAuto(run.videoId, "drained");
+  }
+
+  function startDrain(p, url) {
+    const ping = setInterval(() => {
+      try { p.postMessage({ type: "ping" }); } catch (_) {}
+    }, 20000);
+    const cap = setTimeout(() => endDrain(p), DRAIN_CAP_MS);
+    drains.set(p, { ping, cap, url });
+  }
+
+  function onDrainMessage(p, m) {
+    const d = drains.get(p);
+    if (!d || !m) return;
+    if (m.type === "transcribing") {
+      stopTranscribe(d.url, p);
+      endDrain(p);
+    } else if (DRAIN_TERMINAL.includes(m.type)) {
+      endDrain(p);
+    }
+  }
+
+  function endDrain(p) {
+    const d = drains.get(p);
+    if (!d) return;
+    clearInterval(d.ping);
+    clearTimeout(d.cap);
+    drains.delete(p);
+    try { p.disconnect(); } catch (_) {}
   }
 
   function showLoading() {
@@ -822,38 +987,64 @@
 
   // A summary that finished while the panel was closed. Don't yank the modal back
   // open over whatever they're watching — stash it, say so, and let them choose.
-  function endBackground(message, isError) {
+  function endBackground(message, kind) {
     clearTimers();
     if (port) { try { port.disconnect(); } catch (_) {} port = null; }
     backgrounded = false;
     requestActive = false;
-    toast(message, isError);
+    toast(message, kind);
   }
 
-  function toast(message, isError) {
+  // kind: "ready" (opens the summary), "offer" (opens the transcription question),
+  // "error", or "notice" (just information: no click action). Mounted where the
+  // panel and the pill go, so it shows in fullscreen too.
+  function toast(message, kind) {
     const old = document.getElementById("tldw-toast");
     if (old && old.parentNode) old.parentNode.removeChild(old);
     const el = document.createElement("div");
     el.id = "tldw-toast";
     el.setAttribute("role", "status");
+    const isError = kind === "error";
+    const opens = kind === "ready" || kind === "offer";
     el.style.cssText =
       "position:fixed;z-index:2147483647;bottom:84px;right:24px;max-width:320px;" +
       "background:" + (isError ? "#4a1f1f" : "#1e1f24") + ";color:#e9e9ea;" +
       "font:14px system-ui,-apple-system,sans-serif;padding:10px 14px;border-radius:10px;" +
-      "box-shadow:0 6px 24px rgba(0,0,0,.45);cursor:pointer;line-height:1.4;";
-    el.textContent = message + (isError ? "" : " — click to read");
+      "box-shadow:0 6px 24px rgba(0,0,0,.45);line-height:1.4;" +
+      "cursor:" + (opens || isError ? "pointer" : "default") + ";";
+    el.textContent = message;
     const dismiss = () => { if (el.parentNode) el.parentNode.removeChild(el); };
-    el.onclick = () => {
-      dismiss();
-      if (pendingOffer) {
-        const p = pendingOffer;
-        showTranscribeOffer(p.offer, p.url, p.videoId);
-        return;
+    // It lives in the page's own DOM, so the page could click it: only a real
+    // click opens anything.
+    el.addEventListener("click", (e) => {
+      if (!e.isTrusted) return;
+      if (kind === "offer") {
+        dismiss();
+        if (pendingOffer) {
+          const p = pendingOffer;
+          showTranscribeOffer(p.offer, p.url, p.videoId);
+        }
+      } else if (kind === "ready") {
+        dismiss();
+        if (lastPayload) showResult(lastPayload, lastCached);
+      } else if (isError) {
+        dismiss();
       }
-      if (!isError && lastPayload) showResult(lastPayload, true);
-    };
-    document.body.appendChild(el);
+    });
+    (document.fullscreenElement || document.body).appendChild(el);
     setTimeout(dismiss, isError ? 12000 : 20000);
+  }
+
+  // The worker refused an automatic run: the hourly or daily cap. Once per page.
+  function showPausedNotice(limit) {
+    if (pausedShown) return;
+    pausedShown = true;
+    const day = limit === "day";
+    const n = CH ? (day ? CH.DAY_LIMIT : CH.HOUR_LIMIT) : (day ? 40 : 10);
+    logAuto(currentVideoId || "", "paused (" + (day ? "day" : "hour") + ")");
+    toast("TL;DW paused automatic summaries: " + n + " already "
+      + (day ? "today" : "this hour") + ". Click the TL;DW button to summarize this one.",
+      "notice");
   }
 
   // "" means the server couldn't size this video, which is different from "quick".
@@ -915,8 +1106,9 @@
   // Stop a transcription that is already running. Unlike closing the panel -- which
   // deliberately leaves work going -- this is an explicit cancel, and it travels
   // over the live port the worker is already listening on.
-  function stopTranscribe(url) {
-    try { if (port) port.postMessage({ type: "stopTranscribe", url }); } catch (_) {}
+  function stopTranscribe(url, via) {
+    const p = via || port;
+    try { if (p) p.postMessage({ type: "stopTranscribe", url }); } catch (_) {}
   }
 
   function showError(msg) {
@@ -1007,6 +1199,7 @@
     if (!host) mount();
     clearTimers();
     lastPayload = p;
+    lastCached = !!cached;
     root.querySelector("#tldw-h").textContent = "TL;DW" + (cached ? " (cached)" : "");
     const c = root.querySelector(".content");
     const points = (p.key_points || []).map((k) => `<li>${esc(k)}</li>`).join("");
@@ -1014,6 +1207,7 @@
       <div class="meta">${esc(p.channel)} · ${esc(p.original_length)} → ~${esc(p.length_label)} read${esc(trimmedNote())} ·
         <a href="${esc(p.source_url)}" target="_blank" rel="noopener noreferrer">original</a>${
           transcribedNote(p) ? ` · <span class="txsrc">${esc(transcribedNote(p))}</span>` : ""}</div>
+      <div class="autorow" hidden></div>
       <h1 style="margin-bottom:10px">${esc(p.title)}</h1>
       ${audioRowHtml(false)}
       ${points ? `<h2>Key points</h2><ul class="points">${points}</ul>` : ""}
@@ -1074,6 +1268,7 @@
       }
     }
     root.querySelector(".playkey").onclick = requestSegments;
+    settingsReady.then(renderAutoRow);
     // Restore a previously generated clip for this video this session.
     if (lastAudio && lastAudio.videoId === p.video_id && lastAudio.dataUrl) {
       renderAudio(lastAudio.dataUrl, true);
@@ -1985,11 +2180,239 @@
       `Source: ${p.source_url}\n\n## Key points\n${kp}\n\n## Summary\n${p.summary_md}\n`;
   }
 
+  // --- automatic summaries ----------------------------------------------------------
+
+  // Settings the first check and the panel row wait for: before they arrive,
+  // autoRun reads false, and a full page load would never auto-run.
+  const settingsReady = CH
+    ? Promise.resolve(api.storage.local.get({ autoRun: false, autoChannels: [] }))
+        .then((s) => {
+          autoRun = s.autoRun === true;
+          autoChannels = CH.sanitizeChannels(s.autoChannels);
+        }).catch(() => {})
+    : Promise.resolve();
+  if (CH && api.storage.onChanged) {
+    api.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local" || !(changes.autoRun || changes.autoChannels)) return;
+      if (changes.autoRun) autoRun = changes.autoRun.newValue === true;
+      if (changes.autoChannels) autoChannels = CH.sanitizeChannels(changes.autoChannels.newValue);
+      if (root) renderAutoRow();
+    });
+  }
+
+  const AUTO_POLL_MS = 250;
+  const AUTO_POLL_LIMIT_MS = 15000;
+  const AUTO_DWELL_MS = 3000;
+
+  function urlVideoId() {
+    try {
+      const u = new URL(location.href);
+      return u.pathname === "/watch" ? (u.searchParams.get("v") || "") : "";
+    } catch (_) { return ""; }
+  }
+
+  // One line per video per decision, never per poll tick.
+  function logAuto(videoId, what) {
+    const k = videoId + "|" + what;
+    if (autoLogged.has(k)) return;
+    autoLogged.add(k);
+    console.info("[TL;DW auto]", what, videoId);
+  }
+
+  // The channel of the video the page is *currently* about, or null. Only from
+  // the metadata block whose own video-id is this video (it lags the URL by up to
+  // a second after an in-page navigation), and only a single owner: a video with
+  // several channels has no one channel to match.
+  function channelFromPage(videoId, doc) {
+    if (!CH) return null;
+    const block = watchMetadataFor(videoId, doc);
+    if (!block) return null;
+    const links = Array.from(block.querySelectorAll("#owner ytd-channel-name a"));
+    const hrefs = Array.from(new Set(links.map((a) => a.getAttribute("href"))));
+    if (hrefs.length !== 1) return null;
+    const key = CH.channelKey(hrefs[0]);
+    const name = (links[0].textContent || "").trim().slice(0, CH.MAX_NAME);
+    // Only a key the worker will accept: otherwise the panel would offer an add
+    // that can only fail.
+    return key && CH.isValidKey(key) && name ? { key, name, href: hrefs[0] } : null;
+  }
+
+  function cancelAutoCheck() {
+    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+  }
+
+  // Callback steps through one timer, so clearing it retires the whole check:
+  // wait for the page to be about this video, for the tab to be visible, then for
+  // 3s on it, then decide. A new navigation, a hidden tab or a click cancels
+  // whatever is pending. The steps must stay synchronous: if one ever awaits,
+  // clearing the timer no longer stops it, and it needs a generation token.
+  function scheduleAutoCheck() {
+    cancelAutoCheck();
+    if (!CH || !autoRun || !autoChannels.length) return;
+    const v = urlVideoId();
+    if (!VIDEO_ID.test(v)) return;
+    const started = Date.now();
+    const later = (fn, ms) => {
+      autoTimer = setTimeout(() => {
+        autoTimer = null;
+        fn();
+      }, ms);
+    };
+    const poll = () => {
+      if (urlVideoId() !== v) return;
+      const channel = channelFromPage(v);
+      if (channel) { dwell(channel); return; }
+      if (Date.now() - started >= AUTO_POLL_LIMIT_MS) { logAuto(v, "timeout"); return; }
+      later(poll, AUTO_POLL_MS);
+    };
+    // Hidden: stop here. onVisibility starts a fresh check -- and so a fresh 3s --
+    // when the tab is shown.
+    const dwell = (channel) => {
+      if (document.visibilityState !== "visible") return;
+      later(() => decide(channel), AUTO_DWELL_MS);
+    };
+    const decide = (channel) => {
+      if (urlVideoId() !== v || document.visibilityState !== "visible") return;
+      const verdict = CH.autoRunDecision({
+        channel, channels: autoChannels, handled: autoHandled.has(v),
+        requestActive, panelOpen: !!host,
+        haveSummary: !!(lastPayload && lastPayload.video_id === v),
+      });
+      logAuto(v, verdict);
+      if (verdict !== "run") return;
+      autoHandled.add(v);
+      startSummarize("https://www.youtube.com/watch?v=" + v, v, false, false,
+                     { auto: true });
+    };
+    poll();
+  }
+
+  function onNavigated() {
+    const v = urlVideoId();
+    // The URL, never the event's detail: that may not cross into this world.
+    if (autoRunVid && v !== autoRunVid) leaveAutoRun();
+    if (pendingOffer && pendingOffer.videoId !== v) pendingOffer = null;
+    scheduleAutoCheck();
+  }
+
+  function onVisibility() {
+    if (document.visibilityState === "visible") scheduleAutoCheck();
+    else cancelAutoCheck();
+  }
+
+  function initAutoRun() {
+    if (!CH) return;
+    document.addEventListener("yt-navigate-finish", onNavigated);
+    document.addEventListener("visibilitychange", onVisibility);
+    settingsReady.then(() => scheduleAutoCheck());
+  }
+
+  // The "⚡ Always summarize" row under a result: built with createElement and
+  // textContent (a channel name is page data), and its live status node is created
+  // once and never replaced, so what it announces is actually read out.
+  function renderAutoRow() {
+    const slot = root && root.querySelector(".autorow");
+    if (!slot) return;
+    const p = lastPayload;
+    const channel = CH && autoRun && p ? channelFromPage(p.video_id) : null;
+    if (!channel) { slot.hidden = true; return; }
+    slot.hidden = false;
+    let status = slot.querySelector(".autostatus");
+    if (!status) {
+      status = document.createElement("span");
+      status.className = "autostatus";
+      status.setAttribute("role", "status");
+      status.setAttribute("aria-live", "polite");
+      slot.appendChild(status);
+    }
+    const listed = autoChannels.some((c) => c.key === channel.key);
+    const old = slot.querySelector(".autoctl");
+    // The worker's write arrives here as a storage change, sometimes after the add
+    // has already moved focus to Manage: rebuilding the same row would drop that
+    // focus out of the modal. Same row, same nodes; a changed row keeps focus.
+    const state = channel.key + "|" + (listed ? "listed" : "not-listed");
+    if (old && old.getAttribute("data-state") === state) return;
+    const hadFocus = !!(old && root.activeElement && old.contains(root.activeElement));
+    if (old) slot.removeChild(old);
+    const ctl = document.createElement("span");
+    ctl.className = "autoctl";
+    ctl.setAttribute("data-state", state);
+    const words = CH.autoRowText({ listed, name: channel.name });
+    if (listed) {
+      const label = document.createElement("span");
+      label.textContent = words.label + " · ";
+      label.setAttribute("title", channel.name);
+      const manage = document.createElement("button");
+      manage.className = "automanage";
+      manage.textContent = words.manage;
+      manage.addEventListener("click", () => {
+        Promise.resolve(api.runtime.sendMessage({ type: "openOptions" })).catch(() => {});
+      });
+      ctl.appendChild(label);
+      ctl.appendChild(manage);
+    } else {
+      const add = document.createElement("button");
+      add.className = "autoadd";
+      add.textContent = words.label;
+      add.setAttribute("title", words.title);
+      add.addEventListener("click", () => addAutoChannel(channel, add, status));
+      ctl.appendChild(add);
+    }
+    slot.insertBefore(ctl, status);
+    if (hadFocus) {
+      const target = ctl.querySelector("button");
+      if (target) target.focus();
+    }
+  }
+
+  function addAutoChannel(channel, button, status) {
+    button.disabled = true;
+    const failed = () => {
+      button.disabled = false;
+      button.focus();
+      status.textContent = "Couldn't add " + channel.name + ". Try again.";
+    };
+    let reply;
+    try {
+      reply = api.runtime.sendMessage({ type: "channels:add", key: channel.key,
+                                        name: channel.name, href: channel.href });
+    } catch (_) { failed(); return; }
+    Promise.resolve(reply).then((r) => {
+      if (r && r.ok && (r.result === "ok" || r.result === "exists")) {
+        if (!autoChannels.some((c) => c.key === channel.key)) {
+          autoChannels = [...autoChannels, { key: channel.key, name: channel.name }];
+        }
+        renderAutoRow();
+        const manage = root && root.querySelector(".automanage");
+        if (manage) manage.focus();
+        status.textContent = r.result === "ok"
+          ? "Added. " + channel.name + "'s videos will be summarized when you open them."
+          : channel.name + " is already on your list.";
+      } else if (r && r.ok && r.result === "full") {
+        button.disabled = false;
+        button.focus();
+        status.textContent = "Your list is full (500 channels). Remove some in Settings.";
+      } else {
+        failed();
+      }
+    }, failed);
+  }
+
+  initAutoRun();
+
   api.runtime.onMessage.addListener((msg) => {
     if (msg.type === "TLDW_INVOKE") {
+      // A click decides for this video: no automatic run on top of it, now or
+      // after a later navigation back to it.
+      cancelAutoCheck();
+      if (msg.videoId) autoHandled.add(msg.videoId);
       // Re-open instantly if we already summarized this video this page-session.
-      if (lastPayload && lastPayload.video_id === msg.videoId) showResult(lastPayload, true);
+      if (lastPayload && lastPayload.video_id === msg.videoId) showResult(lastPayload, lastCached);
       else if (requestActive && currentVideoId === msg.videoId) {
+        // The user has chosen this run: it is theirs now, not an automatic one, so
+        // leaving the video won't silently drop it and its notices read as theirs.
+        autoRunVid = null;
+        if (currentRun) currentRun.auto = false;
         // Re-attach to the run already in flight. Restore where it had got to:
         // the long Claude step sends ONE progress event and then goes quiet for a
         // minute, so without this the bar sits at "Starting… 0%" until the result.

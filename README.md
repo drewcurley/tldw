@@ -429,6 +429,10 @@ later. From there you can also:
   segments.
 - **💬 Ask about this video** — follow-up questions answered from the transcript, citing
   `[12:34]` moments you can click to jump the player there.
+- **Automatic summaries** (off by default) — turn it on in Options, then pick
+  channels from the panel ("⚡ Always summarize"), and their videos are summarized in the background when you
+  open them, with a notice when each is ready. Capped at 10 an hour; details in
+  [`extension/README.md`](extension/README.md#automatic-summaries-for-channels-you-choose).
 
 Powered by a small local server:
 

@@ -21,6 +21,23 @@
     #preview { margin-top: 0; flex: 0 0 auto; background: #444; }
     #preview[disabled] { opacity: .6; cursor: default; }
     #previewStatus { color: #c00; }
+    /* "Automatic summaries" saves as you change it, so it sits apart from the form
+       above and its own controls override the page-wide input/label/button rules. */
+    #auto { margin-top: 28px; padding-top: 18px; border-top: 1px solid #ddd; }
+    #auto h3 { margin: 0 0 4px; font-size: 17px; }
+    #auto h3:focus { outline: 2px solid #065fd4; outline-offset: 2px; }
+    #auto .autotoggle { display: flex; gap: 8px; align-items: flex-start;
+      font-weight: 600; margin: 12px 0 4px; }
+    #auto .autotoggle input { width: auto; margin-top: 4px; }
+    #autoChannels { list-style: none; padding: 0; margin: 10px 0 0; }
+    #autoChannels li { display: flex; gap: 10px; align-items: center;
+      padding: 6px 0; border-bottom: 1px solid #eee; overflow-wrap: anywhere; }
+    #autoChannels .cname { flex: 1; min-width: 0; }
+    #autoChannels .ckey { display: block; font: 12px ui-monospace, monospace; color: #666; }
+    #autoChannels button { margin: 0; padding: 4px 12px; background: #fff; color: #333;
+      border: 1px solid #bbb; border-radius: 8px; flex: 0 0 auto; }
+    #autoStatus { min-height: 1.5em; color: #333; font-size: 14px; }
+    #autoUnsupported { color: #666; }
   </style>
 </head>
 <body>
@@ -80,6 +97,27 @@
     machine, on your own Claude plan. If it saves you time,
     <a href="https://github.com/sponsors/drewcurley" target="_blank"
        rel="noopener noreferrer">sponsoring it on GitHub</a> is welcome — never required.</p>
+  <section id="auto" aria-labelledby="autoHeading">
+    <h3 id="autoHeading" tabindex="-1">Automatic summaries</h3>
+    <p class="hint">Changes here apply immediately.</p>
+    <p id="autoUnsupported" hidden>Automatic summaries aren't supported in this browser.</p>
+    <div id="autoControls">
+      <div id="autoToggle">
+      <label class="autotoggle"><input id="autoRun" type="checkbox" />
+        Summarize videos from chosen channels automatically</label>
+      <p class="hint">When you open a video from a channel on your list, TL;DW summarizes
+        it in the background and shows a notice when it's ready. That uses your Claude
+        plan, up to 10 videos an hour, and only for the tab you're looking at. Chrome
+        will ask to let TL;DW read youtube.com pages; this applies to YouTube tabs you
+        open or reload afterwards.</p>
+      </div>
+      <p id="autoStatus" role="status" aria-live="polite"></p>
+      <ul id="autoChannels"></ul>
+      <p id="autoEmpty" class="hint" hidden>No channels yet. Summarize a video with
+        TL;DW, then choose ⚡ Always summarize.</p>
+    </div>
+  </section>
+  <script src="channels.js"></script>
   <script src="options.js"></script>
 </body>
 </html>
