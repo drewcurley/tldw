@@ -400,6 +400,17 @@
   const PANEL_WAIT_MS = 8000;      // for the panel's first row to appear
   const PANEL_SETTLE_MS = 5000;    // ...and for the last one, once they're arriving
   const PANEL_POLL_MS = 200;
+  // YouTube is a single-page app. Clicking from video A to B leaves A's metadata
+  // tags in <head> for good, and A's transcript rows in the DOM for ~2.3s, until
+  // ytd-watch-metadata's own video-id flips to B -- at which instant its title and
+  // owner are already B's and the old rows are gone (measured live, 3/3). So nothing
+  // is read until that flip; this is how long to wait for it before letting the
+  // server fetch instead.
+  const PAGE_SYNC_MS = 5000;
+  // Sent with every page object, so the server can tell this extension from one
+  // that predates the sync check (whose metadata after a navigation is stale).
+  const PAGE_V = 2;
+  const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -474,28 +485,73 @@
       || null;
   }
 
-  // Title, channel and duration are all in the page's own metadata tags, so none of
-  // this costs a request. Duration matters: the last cue's timestamp is where the
-  // final sentence *starts*, not where the video ends.
-  function pageMeta(doc) {
+  // The live metadata block for this video, or null. An attribute comparison, never
+  // a selector built from the id, and every block is considered -- not just the
+  // first, which may be a stale one.
+  function watchMetadataFor(videoId, doc) {
+    if (typeof videoId !== "string" || !VIDEO_ID.test(videoId)) return null;
+    const blocks = (doc || document).querySelectorAll("ytd-watch-metadata");
+    for (const el of blocks) {
+      if (el.getAttribute("video-id") === videoId) return el;
+    }
+    return null;
+  }
+
+  // Are the page's <head> tags about this video? They're written once per full
+  // load, so after an in-page navigation they describe the first video.
+  function tagsAreFor(videoId, doc) {
+    const el = (doc || document).querySelector('meta[itemprop="identifier"]');
+    return !!el && VIDEO_ID.test(videoId || "")
+      && (el.getAttribute("content") || "").trim() === videoId;
+  }
+
+  // "synced": the live block is this video's. "fresh-load": a layout with no
+  // video-id'd block at all, on a full page load of this video -- read as before,
+  // without waiting. "waiting": anything else, including a missing or bad id.
+  function pageSync(videoId, doc) {
     const d = doc || document;
-    const attr = (sel, name) => {
-      const el = d.querySelector(sel);
-      return el ? (el.getAttribute(name) || "").trim() : "";
-    };
-    const text = (sel) => {
-      const el = d.querySelector(sel);
+    if (watchMetadataFor(videoId, d)) return "synced";
+    const anyBlock = Array.prototype.some.call(
+      d.querySelectorAll("ytd-watch-metadata"),
+      (el) => el.getAttribute("video-id") !== null);
+    if (!anyBlock && tagsAreFor(videoId, d)) return "fresh-load";
+    return "waiting";
+  }
+
+  // Title, channel and duration. From the page's own metadata tags when they are
+  // about this video (no request, and the duration matters: the last cue's
+  // timestamp is where the final sentence *starts*). Otherwise from the live block
+  // for this video, with no duration -- the player's own clock reads the ad's
+  // length during an ad, and a missing duration only makes the server end the last
+  // cue a little early, never wrongly.
+  function pageMeta(doc, videoId) {
+    const d = doc || document;
+    if (tagsAreFor(videoId, d)) {
+      const attr = (sel, name) => {
+        const el = d.querySelector(sel);
+        return el ? (el.getAttribute(name) || "").trim() : "";
+      };
+      const text = (sel) => {
+        const el = d.querySelector(sel);
+        return el ? (el.textContent || "").trim() : "";
+      };
+      const out = {
+        title: attr('meta[name="title"]', "content")
+          || text("#above-the-fold h1, ytd-watch-metadata h1"),
+        channel: attr('span[itemprop="author"] link[itemprop="name"]', "content")
+          || text("#owner #channel-name a, ytd-channel-name a"),
+      };
+      const ms = isoDurationMs(attr('meta[itemprop="duration"]', "content"));
+      if (ms) out.duration_ms = ms;
+      return out;
+    }
+    const block = watchMetadataFor(videoId, d);
+    if (!block) return {};
+    const inner = (sel) => {
+      const el = block.querySelector(sel);
       return el ? (el.textContent || "").trim() : "";
     };
-    const out = {
-      title: attr('meta[name="title"]', "content")
-        || text("#above-the-fold h1, ytd-watch-metadata h1"),
-      channel: attr('span[itemprop="author"] link[itemprop="name"]', "content")
-        || text("#owner #channel-name a, ytd-channel-name a"),
-    };
-    const ms = isoDurationMs(attr('meta[itemprop="duration"]', "content"));
-    if (ms) out.duration_ms = ms;
-    return out;
+    return { title: inner("#title h1"), channel: inner("#owner ytd-channel-name a") };
   }
 
   // Wait for the row count to stop growing: the panel streams its segments in, so
@@ -514,13 +570,33 @@
 
   // Always resolves. A failure here just means the server fetches instead, and the
   // status says which failure it was -- silence made the first version undiagnosable.
-  async function collectPageTranscript() {
+  // Every result carries page_v, failures included: a current extension's failure
+  // must not be logged as an out-of-date one.
+  //
+  // `isCurrent` says whether the run that asked is still wanted; a cancelled run
+  // must not open YouTube's panel on its way out.
+  async function collectPageTranscript(videoId, isCurrent) {
+    const stillWanted = () => typeof isCurrent !== "function" || isCurrent();
     try {
-      const meta = pageMeta();
+      // Nothing is read -- not the metadata, not "is the panel already open?" --
+      // until the page is about this video. The first check costs no wait.
+      const started = Date.now();
+      let sync = pageSync(videoId);
+      while (sync === "waiting") {
+        if (!stillWanted()) return { page_v: PAGE_V, status: "cancelled" };
+        if (Date.now() - started >= PAGE_SYNC_MS) {
+          return { page_v: PAGE_V, status: "page-not-synced" };
+        }
+        await sleep(PANEL_POLL_MS);
+        sync = pageSync(videoId);
+      }
+      const syncedMs = Date.now() - started;
+      const meta = { ...pageMeta(document, videoId), page_v: PAGE_V };
       const already = readTranscriptRows().length > 0;
       if (!already) {
         const button = document.querySelector(TRANSCRIPT_BUTTON);
         if (!button) return { ...meta, status: "no-transcript-button" };
+        if (!stillWanted()) return { page_v: PAGE_V, status: "cancelled" };
         // The button lives in the collapsed description; it doesn't need to be
         // on screen to be clicked, but the panel it opens takes a moment to fill.
         button.click();
@@ -537,9 +613,10 @@
         // call. Seen on videos whose captions aren't auto-generated.
         return { ...meta, status: "panel-empty" };
       }
-      return { ...meta, cues, status: "ok-panel (" + cues.length + " cues)" };
+      return { ...meta, cues, status: "ok-panel (" + cues.length + " cues, synced "
+        + syncedMs + "ms)" };
     } catch (e) {
-      return { status: "error-" + ((e && e.name) || "unknown") };
+      return { page_v: PAGE_V, status: "error-" + ((e && e.name) || "unknown") };
     }
   }
 
@@ -577,7 +654,10 @@
     const myPort = port = api.runtime.connect({ name: "tldw" });
     // Read the page's transcript, then ask for a summary: the flow as it has
     // always been, and what every miss falls back to.
-    const summarizeFromPage = () => collectPageTranscript().then((page) => {
+    // This run's own video and liveness -- never currentVideoId, which a newer run
+    // for another video may already have replaced.
+    const isCurrent = () => requestActive && port === myPort;
+    const summarizeFromPage = () => collectPageTranscript(videoId, isCurrent).then((page) => {
       // Cancelled -- or superseded by a newer run, for another video -- while we
       // were reading. Checking requestActive alone isn't enough: a newer run sets
       // it again, and this video's transcript would go out on that run's request.

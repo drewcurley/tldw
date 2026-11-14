@@ -47,6 +47,8 @@ _ask_sessions: dict = {}
 # "duration_ms": total}. Published by a running selection so a waiter can show real
 # progress instead of a clock.
 _seg_progress: dict = {}
+# Videos whose stale-generation cache miss has been logged this process.
+_stale_gen_logged: set = set()
 
 
 # --- transcribing a captionless video -----------------------------------------
@@ -340,7 +342,22 @@ def _cache_get(video_id: str, *, touch: bool = False):
         with _cache_lock:
             _transcript_cache[video_id] = (time.monotonic() + _CACHE_TTL, *on_disk)
         return on_disk[0], on_disk[1]
+    _note_stale_generation(video_id)
     return None
+
+
+def _note_stale_generation(video_id: str) -> None:
+    """Say so when a cached transcript was set aside for its generation -- otherwise
+    an invalidated entry and an empty cache look the same in the log. Once per video
+    per process: the miss repeats on every lookup until the entry is rewritten."""
+    if txcache.get_status(video_id) != "stale-gen":
+        return
+    with _cache_lock:
+        if video_id in _stale_gen_logged:
+            return
+        _stale_gen_logged.add(video_id)
+    print(f"  cached transcript for {video_id} invalidated "
+          f"(gen < {txcache.META_GENERATION})", flush=True)
 
 
 def _cache_source(video_id: str) -> str:
@@ -391,7 +408,10 @@ def _seg_key(video_id: str, ratio, source: str | None = None) -> tuple:
             round(ratio, 3) if isinstance(ratio, (int, float)) else None,
             core.SEGMENT_FINGERPRINT,
             claude_client.backend_fingerprint(),
-            source or txcache.CAPTIONS)
+            source or txcache.CAPTIONS,
+            # Selections made from a transcript of an older generation were made
+            # from data we no longer trust (see txcache.META_GENERATION).
+            txcache.META_GENERATION)
 
 
 def _seg_file(key: tuple) -> str:
@@ -766,6 +786,9 @@ def _summary_key(video_id: str, ratio, source: str | None = None) -> str:
         str(round(ratio, 3)) if isinstance(ratio, (int, float)) else "auto",
         summarize.PROMPT_FINGERPRINT,
         source or txcache.CAPTIONS,
+        # A summary written before the page-sync fix may carry another video's
+        # title -- in its metadata and in the prompt it was written from.
+        f"gen{txcache.META_GENERATION}",
     ))
     return f"{video_id}-{hashlib.sha256(shape.encode()).hexdigest()[:16]}"
 
@@ -794,9 +817,14 @@ def _page_transcript(body, url: str):
     Everything here is untrusted input. So is yt-dlp's output, and it flows to the
     same places (a prompt, a sanitized filename), but this arrives over HTTP and is
     checked before it's believed.
+
+    Only a page from an extension with the sync check (page_v >= 2) is believed at
+    all. Older ones read YouTube's <head> tags, which after an in-page navigation
+    still describe the *previous* video -- and whatever is believed here is cached
+    for a fortnight. Such a request gets the server's own fetch instead.
     """
     page = body.get("page") if isinstance(body, dict) else None
-    if not isinstance(page, dict):
+    if not isinstance(page, dict) or not _page_version_ok(page):
         return None
     try:
         vid = canonical_video_id(url)
@@ -807,18 +835,12 @@ def _page_transcript(body, url: str):
         and not isinstance(raw_duration, bool) \
         and 0 < raw_duration < 24 * 3600 * 1000 else None
     rows = page.get("cues")
+    if not isinstance(rows, list):
+        return None
     try:
-        if isinstance(rows, list):
-            # What the page's own transcript panel rendered -- the only copy of the
-            # captions YouTube still hands out (see the extension for why).
-            cues = transcript.parse_panel_rows(rows, duration_ms)
-        else:
-            # An extension older than the panel change still sends a caption track.
-            vtt = page.get("captions")
-            if not isinstance(vtt, str) or not vtt.strip():
-                return None
-            fmt = page.get("captions_format")
-            cues = transcript.parse_captions(vtt, fmt if isinstance(fmt, str) else None)
+        # What the page's own transcript panel rendered -- the only copy of the
+        # captions YouTube still hands out (see the extension for why).
+        cues = transcript.parse_panel_rows(rows, duration_ms)
     except TldrError:
         return None                      # unparseable: fall back to fetching it
     if not cues:
@@ -832,6 +854,13 @@ def _page_transcript(body, url: str):
                         text(page.get("channel"), 200) or "(unknown)",
                         duration, {}, {})
     return meta, cues
+
+
+def _page_version_ok(page: dict) -> bool:
+    """Is this page object from an extension with the sync check? An int (not a
+    bool, which Python counts as one) of at least 2."""
+    v = page.get("page_v")
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 2
 
 
 def _preferred_transcript(body, url: str):
@@ -1244,7 +1273,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return
 
         page = body.get("page") if isinstance(body, dict) else None
-        if isinstance(page, dict) and page.get("status"):
+        if isinstance(page, dict) and not _page_version_ok(page):
+            # Logged every time, not once: each of these is a yt-dlp call that can
+            # draw a 429, and the repetition is what makes the cause obvious.
+            tlog("page transcript ignored: extension predates the sync check")
+            progress("Your TL;DW extension is out of date. Reload it and this tab.")
+        elif isinstance(page, dict) and page.get("status"):
             tlog(f"page transcript: {str(page['status'])[:200]}")
         elif page is None:
             tlog("page transcript: not offered (old extension, or non-page request)")

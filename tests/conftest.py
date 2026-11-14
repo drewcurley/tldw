@@ -107,7 +107,7 @@ def _fresh_server_state(_isolated_home, monkeypatch):
     registries = [getattr(server, name) for name in (
         "_transcript_cache", "_seg_cache", "_ask_sessions", "_tx_jobs",
         "_seg_prefetch_events", "_seg_progress", "_captionless_meta",
-        "_preview_cache",
+        "_preview_cache", "_stale_gen_logged",
     ) if hasattr(server, name)]
     for reg in registries:
         reg.clear()

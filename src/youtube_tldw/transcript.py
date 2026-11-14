@@ -8,8 +8,6 @@ Handles two shapes:
 
 from __future__ import annotations
 
-import json
-
 import html
 import re
 from dataclasses import dataclass
@@ -57,45 +55,6 @@ def _raw_blocks(content: str) -> list[tuple[int, int, list[str]]]:
     return blocks
 
 
-def parse_json3(content: str) -> list[Cue]:
-    """Parse YouTube's json3 caption format into cues.
-
-    It's what the player itself requests, so it's the format most reliably served
-    when the page fetches its own captions. Shape:
-    {"events":[{"tStartMs":0,"dDurationMs":1200,"segs":[{"utf8":"text"}]}, ...]}
-    """
-    try:
-        data = json.loads(content)
-        events = data["events"]
-    except (ValueError, KeyError, TypeError) as exc:
-        raise NoTranscriptError("Caption data was not valid json3.") from exc
-    cues = []
-    for event in events if isinstance(events, list) else []:
-        if not isinstance(event, dict):
-            continue
-        text = "".join(
-            seg.get("utf8", "") for seg in event.get("segs") or []
-            if isinstance(seg, dict)
-        ).strip()
-        start = event.get("tStartMs")
-        if not text or not isinstance(start, (int, float)):
-            continue                      # timing-only or empty events
-        duration = event.get("dDurationMs")
-        duration = int(duration) if isinstance(duration, (int, float)) else 0
-        cues.append(Cue(int(start), int(start) + max(duration, 1), text))
-    if not cues:
-        raise NoTranscriptError("Caption data contained no readable cues.")
-    # json3 repeats rolling text the same way auto-captions do in VTT.
-    deduped, last = [], None
-    for cue in cues:
-        if cue.text == last and deduped:
-            deduped[-1].end_ms = max(deduped[-1].end_ms, cue.end_ms)
-            continue
-        deduped.append(cue)
-        last = cue.text
-    return _normalize(deduped)
-
-
 MAX_PANEL_ROWS = 20_000        # a 10-hour video is ~5,000 panel rows
 MAX_CUE_CHARS = 1_000
 _TAIL_MS = 5_000               # how long the closing line runs when nothing says
@@ -138,13 +97,6 @@ def parse_panel_rows(rows, duration_ms: int | None = None) -> list[Cue]:
             end = start + _TAIL_MS
         cues.append(Cue(start, max(end, start + 1), text))
     return _normalize(cues)
-
-
-def parse_captions(content: str, fmt: str | None = None) -> list[Cue]:
-    """Parse a caption track in whichever format the page managed to fetch."""
-    if fmt == "json3" or content.lstrip().startswith("{"):
-        return parse_json3(content)
-    return parse_subtitles(content)
 
 
 def parse_subtitles(content: str) -> list[Cue]:

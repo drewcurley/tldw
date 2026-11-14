@@ -5,6 +5,7 @@ output into page HTML â€” an escaping or regex slip there is an injection bug â€
 they get real coverage rather than none.
 """
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -29,6 +30,13 @@ def test_answer_rendering_escaping_and_citations():
 
 
 PAGE_CHECKS_JS = Path(__file__).parent / "js" / "page_transcript_checks.js"
+PAGE_CHECKS_FLOOR = 68
+
+
+def _checks_run(stdout: str) -> int:
+    """The count a node check script reports on its last line: "ok <n> checks"."""
+    m = re.search(r"^ok (\d+) checks$", stdout.strip().splitlines()[-1] if stdout.strip() else "")
+    return int(m.group(1)) if m else -1
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
@@ -40,6 +48,8 @@ def test_reading_the_transcript_from_the_page():
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    # One pytest test stands for many node checks; deleting checks must still fail.
+    assert _checks_run(proc.stdout) >= PAGE_CHECKS_FLOOR, proc.stdout
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
@@ -51,6 +61,7 @@ def test_extension_scripts_parse(script):
 
 
 PROBE_CHECKS_JS = Path(__file__).parent / "js" / "probe_checks.js"
+PROBE_CHECKS_FLOOR = 41
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
@@ -63,3 +74,4 @@ def test_the_cache_check_before_reading_the_page():
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _checks_run(proc.stdout) >= PROBE_CHECKS_FLOOR, proc.stdout

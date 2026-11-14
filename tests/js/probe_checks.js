@@ -12,7 +12,9 @@ const content = fs.readFileSync(process.argv[2], "utf8");
 const worker = fs.readFileSync(process.argv[3], "utf8");
 
 const failures = [];
+const CHECKS = { n: 0 };
 const check = (name, got, want) => {
+  CHECKS.n++;
   const ok = typeof want === "function" ? want(got) : got === want;
   if (!ok) failures.push(`${name} -> ${JSON.stringify(got)}`);
 };
@@ -33,8 +35,10 @@ function panel() {
     ports: [], shown: [], pageReads: 0, pendingReads: [],
     page: { cues: [{ start_ms: 0, text: "hi" }], status: "ok-panel (1 cues)" },
     holdPageRead: false,
-    collectPageTranscript() {
+    readArgs: [],
+    collectPageTranscript(videoId, isCurrent) {
       ctx.pageReads++;
+      ctx.readArgs.push({ videoId, isCurrent });
       if (!ctx.holdPageRead) return Promise.resolve(ctx.page);
       return new Promise((resolve) => ctx.pendingReads.push(() => resolve(ctx.page)));
     },
@@ -148,6 +152,28 @@ const okJson = (body) => () => ({ ok: true, json: async () => body });
     .filter((m) => m.type === "summarize" && m.videoId === "AAAAAAAAAAA");
   check("a superseded run's transcript is never sent", leaked.length, 0);
   check("the newer run is untouched", JSON.stringify(types(c.ports[1])), '["probeCache"]');
+  // The page read is for the run's own video -- not currentVideoId, which B has
+  // already replaced -- and it can tell it has been superseded.
+  check("the page read was asked for A's own video", c.readArgs[0].videoId, "AAAAAAAAAAA");
+  check("...and knows A is no longer current", c.readArgs[0].isCurrent(), false);
+
+  c = panel();
+  c.startSummarize(...A, false, false);
+  c.ports[0].deliver({ type: "probe", hit: false });
+  await tick();
+  check("a live run's page read is current", c.readArgs[0].isCurrent(), true);
+
+  // The order that tells the run's own id from currentVideoId: B starts *before*
+  // A's probe answer arrives, so by the time A reads the page, currentVideoId is B.
+  c = panel();
+  c.startSummarize(...A, false, false);
+  c.startSummarize(...B, false, false);
+  c.ports[0].deliver({ type: "probe", hit: false });
+  await tick();
+  check("a late answer for A never reads the page for B",
+    c.readArgs.filter((r) => r.videoId !== "AAAAAAAAAAA").length, 0);
+  check("...nor for no video at all",
+    c.readArgs.filter((r) => r.videoId === undefined).length, 0);
 
   // ------------------------------------------------------------ the worker ----
   // An older server answers 404: that is a miss, never an error -- otherwise a new
@@ -206,5 +232,5 @@ const okJson = (body) => () => ({ ok: true, json: async () => body });
     console.log("FAILURES:\n" + failures.join("\n"));
     process.exit(1);
   }
-  console.log("ok");
+  console.log("ok " + CHECKS.n + " checks");
 })().catch((e) => { console.log("CRASH: " + (e && e.stack || e)); process.exit(1); });
